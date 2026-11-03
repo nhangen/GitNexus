@@ -9,6 +9,7 @@ import {
   sanitizeLaunchArgs,
   resolveSecureBrowserLaunchOptions,
   validateProcessTreeSandbox,
+  checkProcessSeatbeltSandboxed,
   MIN_CHROMIUM_SECURITY_VERSION,
   PINNED_CFT_VERSION,
   CRITICAL_CHROME_CNA_RECORDS,
@@ -343,6 +344,44 @@ describe('Browser Security Baseline — Process Tree Sandbox Validation & Mutati
   });
 });
 
+describe('Browser Security Baseline — macOS Seatbelt Kernel Sandbox Verification', () => {
+  it('returns true when sandbox_check outputs 1 (sandboxed)', () => {
+    const mockExec = () => '1\n';
+    expect(checkProcessSeatbeltSandboxed(1234, mockExec)).toBe(true);
+  });
+
+  it('returns false when sandbox_check outputs 0 (unsandboxed)', () => {
+    const mockExec = () => '0\n';
+    expect(checkProcessSeatbeltSandboxed(1234, mockExec)).toBe(false);
+  });
+
+  it('throws on invalid PID input', () => {
+    expect(() => checkProcessSeatbeltSandboxed(-1)).toThrow(/Invalid PID/);
+    expect(() => checkProcessSeatbeltSandboxed('abc')).toThrow(/Invalid PID/);
+  });
+
+  it('throws on unexpected sandbox_check output', () => {
+    const mockExec = () => 'unexpected output\n';
+    expect(() => checkProcessSeatbeltSandboxed(1234, mockExec)).toThrow(
+      /Unexpected sandbox_check output/,
+    );
+  });
+
+  it('throws on sandbox_check execution failure', () => {
+    const mockExec = () => {
+      throw new Error('Command failed');
+    };
+    expect(() => checkProcessSeatbeltSandboxed(1234, mockExec)).toThrow(/sandbox_check failed/);
+  });
+
+  it('validates that test runner harness process itself is NOT sandboxed (avoids self-check false positives)', () => {
+    if (process.platform === 'darwin') {
+      const isHarnessSandboxed = checkProcessSeatbeltSandboxed(process.pid);
+      expect(isHarnessSandboxed).toBe(false);
+    }
+  });
+});
+
 describe('Browser Security Baseline — Real Environment Sandboxing & Isolation', () => {
   it('resolves the real system Chrome on this host meeting security baseline', () => {
     const resolution = resolveSecureBrowserLaunchOptions();
@@ -387,6 +426,19 @@ describe('Browser Security Baseline — Real Environment Sandboxing & Isolation'
       const validation = validateProcessTreeSandbox(processLines, runId);
       expect(validation.childCount).toBeGreaterThan(0);
       expect(validation.rendererCount).toBeGreaterThan(0);
+      expect(validation.rendererPids.length).toBeGreaterThan(0);
+
+      // 4. On macOS Darwin: verify actual OS Seatbelt kernel sandbox on owned renderer processes
+      if (process.platform === 'darwin') {
+        // Assert broker process is unsandboxed coordinator (0)
+        expect(checkProcessSeatbeltSandboxed(validation.browserPid)).toBe(false);
+
+        // Assert all observed renderer processes are confined by macOS Seatbelt sandbox (1)
+        for (const rendererPid of validation.rendererPids) {
+          const isRendererSandboxed = checkProcessSeatbeltSandboxed(rendererPid);
+          expect(isRendererSandboxed).toBe(true);
+        }
+      }
 
       // Set cookie in Context A
       await contextA.addCookies([

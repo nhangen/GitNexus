@@ -1,4 +1,4 @@
-import { execFileSync } from 'child_process';
+import { execFileSync, execSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -236,6 +236,7 @@ export interface ProcessTreeValidationResult {
   browserPid: string;
   childCount: number;
   rendererCount: number;
+  rendererPids: string[];
   allPids: string[];
 }
 
@@ -280,6 +281,7 @@ export function validateProcessTreeSandbox(
   }
 
   let rendererCount = 0;
+  const rendererPids: string[] = [];
   const childPids: string[] = [];
 
   for (const child of children) {
@@ -295,6 +297,7 @@ export function validateProcessTreeSandbox(
 
     if (child.includes('--type=renderer')) {
       rendererCount++;
+      rendererPids.push(pid);
     }
   }
 
@@ -302,8 +305,44 @@ export function validateProcessTreeSandbox(
     browserPid,
     childCount: children.length,
     rendererCount,
+    rendererPids,
     allPids: [browserPid, ...childPids],
   };
+}
+
+/**
+ * Query macOS kernel Seatbelt sandbox state for a specific process ID using
+ * system `sandbox_check(pid, NULL, SANDBOX_FILTER_NONE)`.
+ *
+ * Primary source reference:
+ * Chromium sandbox/mac/seatbelt.cc (sandbox_check(pid, NULL, 0) returns 1 if sandboxed, 0 if not).
+ *
+ * Implemented using Python 3 stdlib ctypes loading macOS libSystem (zero external packages or FFI installs).
+ * Returns true if the target PID is confined by the OS Seatbelt sandbox, false if unconfined.
+ */
+export function checkProcessSeatbeltSandboxed(
+  pid: number | string,
+  execCommand: (cmd: string) => string = (cmd) =>
+    execSync(cmd, { encoding: 'utf8', timeout: 5000 }),
+): boolean {
+  const numericPid = Number(pid);
+  if (!Number.isInteger(numericPid) || numericPid <= 0) {
+    throw new Error(`Invalid PID "${pid}" for sandbox_check`);
+  }
+
+  const script = `import ctypes; lib = ctypes.CDLL(None); print(lib.sandbox_check(${numericPid}, None, 0))`;
+  let output: string;
+  try {
+    output = execCommand(`python3 -c "${script}"`).trim();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(`sandbox_check failed for PID ${numericPid}: ${msg}`);
+  }
+
+  if (output === '1') return true;
+  if (output === '0') return false;
+
+  throw new Error(`Unexpected sandbox_check output for PID ${numericPid}: "${output}"`);
 }
 
 /**
