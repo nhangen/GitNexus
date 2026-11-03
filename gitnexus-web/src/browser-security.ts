@@ -232,6 +232,80 @@ export function sanitizeLaunchArgs(customArgs: string[] = []): string[] {
   return Array.from(sanitized);
 }
 
+export interface ProcessTreeValidationResult {
+  browserPid: string;
+  childCount: number;
+  rendererCount: number;
+  allPids: string[];
+}
+
+/**
+ * Validates a live process table snapshot to verify:
+ * 1. The target browser process exists.
+ * 2. Child/renderer processes exist (non-vacuous check).
+ * 3. None of the processes in the tree contain forbidden security flags (e.g. `--no-sandbox`).
+ * 4. Fails closed if the process list is empty (read failure) or child count is 0.
+ */
+export function validateProcessTreeSandbox(
+  processTableLines: string[],
+  identifier: string,
+): ProcessTreeValidationResult {
+  if (!processTableLines || processTableLines.length === 0) {
+    throw new Error('Process table read failure: process table snapshot is empty');
+  }
+
+  const browserLine = processTableLines.find((l) => l.includes(identifier));
+  if (!browserLine) {
+    throw new Error(`Target browser process not found for identifier "${identifier}"`);
+  }
+
+  const browserParts = browserLine.trim().split(/\s+/);
+  const browserPid = browserParts[0];
+
+  // Inspect the root browser command line
+  if (browserLine.includes('--no-sandbox')) {
+    throw new Error(
+      `Insecure flag detected: browser process (PID ${browserPid}) contains forbidden --no-sandbox`,
+    );
+  }
+
+  // Find all child processes where PPID == browserPid
+  const children = processTableLines.filter((l) => {
+    const parts = l.trim().split(/\s+/);
+    return parts.length >= 3 && parts[1] === browserPid;
+  });
+
+  if (children.length === 0) {
+    throw new Error(`Vacuous check: no child processes found for browser PID ${browserPid}`);
+  }
+
+  let rendererCount = 0;
+  const childPids: string[] = [];
+
+  for (const child of children) {
+    const parts = child.trim().split(/\s+/);
+    const pid = parts[0];
+    childPids.push(pid);
+
+    if (child.includes('--no-sandbox')) {
+      throw new Error(
+        `Insecure flag detected: child process (PID ${pid}) contains forbidden --no-sandbox`,
+      );
+    }
+
+    if (child.includes('--type=renderer')) {
+      rendererCount++;
+    }
+  }
+
+  return {
+    browserPid,
+    childCount: children.length,
+    rendererCount,
+    allPids: [browserPid, ...childPids],
+  };
+}
+
 /**
  * Get system candidate paths for Chromium/Chrome based on operating system.
  */

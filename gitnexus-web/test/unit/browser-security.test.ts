@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import * as path from 'path';
+import { execSync } from 'child_process';
 import {
   compareChromiumVersions,
   isSecureChromiumVersion,
@@ -7,6 +8,7 @@ import {
   probeBrowserVersion,
   sanitizeLaunchArgs,
   resolveSecureBrowserLaunchOptions,
+  validateProcessTreeSandbox,
   MIN_CHROMIUM_SECURITY_VERSION,
   PINNED_CFT_VERSION,
   CRITICAL_CHROME_CNA_RECORDS,
@@ -280,6 +282,67 @@ describe('Browser Security Baseline — Fail-Closed Acceptance Loop', () => {
   });
 });
 
+describe('Browser Security Baseline — Process Tree Sandbox Validation & Mutation Proof', () => {
+  const cleanProcessSnapshot = [
+    ' 1000     1 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --unique-id=test-session-123',
+    ' 1001  1000 /Applications/Google Chrome.app/Contents/Frameworks/.../Helpers/Google Chrome Helper.app/Contents/MacOS/Google Chrome Helper --type=gpu-process',
+    ' 1002  1000 /Applications/Google Chrome.app/Contents/Frameworks/.../Helpers/Google Chrome Helper (Renderer).app/Contents/MacOS/Google Chrome Helper (Renderer) --type=renderer --seatbelt-client=83',
+    ' 1003  1000 /Applications/Google Chrome.app/Contents/Frameworks/.../Helpers/Google Chrome Helper.app/Contents/MacOS/Google Chrome Helper --type=utility --utility-sub-type=network.mojom.NetworkService',
+  ];
+
+  it('validates a secure process tree snapshot returning non-vacuous child and renderer counts', () => {
+    const result = validateProcessTreeSandbox(cleanProcessSnapshot, 'test-session-123');
+    expect(result.browserPid).toBe('1000');
+    expect(result.childCount).toBe(3);
+    expect(result.rendererCount).toBe(1);
+    expect(result.allPids).toEqual(['1000', '1001', '1002', '1003']);
+  });
+
+  it('mutation proof: fails when root browser contains forbidden --no-sandbox flag', () => {
+    const mutant = [
+      ' 1000     1 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --no-sandbox --unique-id=test-session-123',
+      ' 1001  1000 /Applications/Google Chrome.app/Contents/.../Helpers/... --type=renderer',
+    ];
+
+    expect(() => validateProcessTreeSandbox(mutant, 'test-session-123')).toThrow(
+      /Insecure flag detected: browser process \(PID 1000\) contains forbidden --no-sandbox/,
+    );
+  });
+
+  it('mutation proof: fails when child renderer contains forbidden --no-sandbox flag', () => {
+    const mutant = [
+      ' 1000     1 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --unique-id=test-session-123',
+      ' 1002  1000 /Applications/Google Chrome.app/Contents/.../Helpers/... --type=renderer --no-sandbox',
+    ];
+
+    expect(() => validateProcessTreeSandbox(mutant, 'test-session-123')).toThrow(
+      /Insecure flag detected: child process \(PID 1002\) contains forbidden --no-sandbox/,
+    );
+  });
+
+  it('fails closed when process table read returns empty (all reads failing cannot pass)', () => {
+    expect(() => validateProcessTreeSandbox([], 'test-session-123')).toThrow(
+      /Process table read failure: process table snapshot is empty/,
+    );
+  });
+
+  it('fails closed when target browser process is not found in process table', () => {
+    expect(() => validateProcessTreeSandbox(cleanProcessSnapshot, 'missing-session-id')).toThrow(
+      /Target browser process not found for identifier "missing-session-id"/,
+    );
+  });
+
+  it('fails closed when child process count is 0 (vacuous check prevention)', () => {
+    const vacuous = [
+      ' 1000     1 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --unique-id=test-session-123',
+    ];
+
+    expect(() => validateProcessTreeSandbox(vacuous, 'test-session-123')).toThrow(
+      /Vacuous check: no child processes found for browser PID 1000/,
+    );
+  });
+});
+
 describe('Browser Security Baseline — Real Environment Sandboxing & Isolation', () => {
   it('resolves the real system Chrome on this host meeting security baseline', () => {
     const resolution = resolveSecureBrowserLaunchOptions();
@@ -289,13 +352,14 @@ describe('Browser Security Baseline — Real Environment Sandboxing & Isolation'
     expect(resolution.args).not.toContain('--no-sandbox');
   });
 
-  it('launches patched browser with Playwright verifying sandbox and profile isolation', async () => {
+  it('launches patched browser with Playwright verifying sandbox, live process tree, and profile isolation', async () => {
     const { chromium } = await import('@playwright/test');
     const resolution = resolveSecureBrowserLaunchOptions();
+    const runId = `gn-sec-test-${Date.now()}`;
 
     const browser = await chromium.launch({
       executablePath: resolution.executablePath,
-      args: resolution.args,
+      args: [...resolution.args, `--gitnexus-sec-id=${runId}`],
       chromiumSandbox: resolution.chromiumSandbox,
       headless: true,
     });
@@ -309,8 +373,20 @@ describe('Browser Security Baseline — Real Environment Sandboxing & Isolation'
       const contextA = await browser.newContext();
       const contextB = await browser.newContext();
 
-      const _pageA = await contextA.newPage();
+      const pageA = await contextA.newPage();
       const _pageB = await contextB.newPage();
+
+      // Open a live page to ensure renderer processes are actively spawned
+      await pageA.goto('data:text/html,<h1>GitNexus Security Baseline Test</h1>');
+
+      // 3. Inspect live OS process table for actual process hierarchy and absence of --no-sandbox
+      // Assertions are strictly outside any catch block to prevent swallowed failures.
+      const psOutput = execSync('ps -eo pid,ppid,command').toString();
+      const processLines = psOutput.split('\n');
+
+      const validation = validateProcessTreeSandbox(processLines, runId);
+      expect(validation.childCount).toBeGreaterThan(0);
+      expect(validation.rendererCount).toBeGreaterThan(0);
 
       // Set cookie in Context A
       await contextA.addCookies([
