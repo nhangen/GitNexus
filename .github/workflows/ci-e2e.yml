@@ -23,7 +23,7 @@ jobs:
               - 'gitnexus-web/**'
 
   e2e:
-    name: e2e (chromium)
+    name: e2e (chrome)
     needs: check-changes
     if: needs.check-changes.result == 'success' && needs.check-changes.outputs.web_changed == 'true'
     runs-on: ubuntu-latest
@@ -36,8 +36,12 @@ jobs:
 
       - uses: ./.github/actions/setup-gitnexus-web
 
-      - name: Install Playwright browsers
-        run: npx playwright install --with-deps chromium
+      - name: Install Google Chrome (patched baseline >= 156.0.8078.73)
+        run: npx playwright install --with-deps chrome
+        working-directory: gitnexus-web
+
+      - name: Verify patched Google Chrome baseline
+        run: /usr/bin/google-chrome --version
         working-directory: gitnexus-web
 
       - name: Install backend dependencies
@@ -82,6 +86,7 @@ jobs:
         working-directory: gitnexus-web
         env:
           E2E: '1'
+          CHROME_BIN: /usr/bin/google-chrome
 
       - name: Upload test results
         if: always()
