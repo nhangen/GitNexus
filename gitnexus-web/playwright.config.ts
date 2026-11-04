@@ -1,8 +1,8 @@
 import { defineConfig } from '@playwright/test';
-import { resolveSecureBrowserLaunchOptions } from './src/browser-security';
+import { resolveSecureBrowserLaunchOptions } from './e2e/support/browser-security';
 
 // Resolve patched Chromium browser baseline (>= 156.0.8078.73) with enforced
-// sandboxing, profile isolation, and verified executable integrity.
+// sandboxing, profile isolation, and verified executable.
 // Fails closed if the executable is missing, wrong, unverified, or below baseline.
 const secureBrowser = resolveSecureBrowserLaunchOptions();
 

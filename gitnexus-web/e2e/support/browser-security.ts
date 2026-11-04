@@ -1,6 +1,9 @@
-import { execFileSync, execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
+import { fileURLToPath } from 'url';
+
+const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
 
 /**
  * Chromium Security Baseline Configuration and Enforcement
@@ -8,8 +11,8 @@ import * as path from 'path';
  * Google Security Advisory:
  * https://chromereleases.googleblog.com/2026/10/stable-channel-update-for-desktop_0562499947.html
  *
- * Desktop Chromium releases prior to 156.0.8078.73 are vulnerable to four
- * Critical Chrome CNA security records:
+ * Desktop Chromium releases prior to 156.0.8078.73 (Linux/macOS) and 156.0.8078.74 (Windows)
+ * are vulnerable to four Critical Chrome CNA security records:
  *   - CNA-118306 (Potential code execution outside sandbox)
  *   - CNA-118331
  *   - CNA-118348
@@ -19,7 +22,15 @@ import * as path from 'path';
  * Bundled controller fallbacks (e.g. Playwright default Chromium bundles mapping to
  * older unpatched revisions) must fail closed.
  */
-export const MIN_CHROMIUM_SECURITY_VERSION = '156.0.8078.73';
+export const MIN_CHROMIUM_SECURITY_VERSION_POSIX = '156.0.8078.73';
+export const MIN_CHROMIUM_SECURITY_VERSION_WIN32 = '156.0.8078.74';
+export const MIN_CHROMIUM_SECURITY_VERSION = MIN_CHROMIUM_SECURITY_VERSION_POSIX;
+
+export function getMinimumSecurityBaseline(platform: NodeJS.Platform = process.platform): string {
+  return platform === 'win32'
+    ? MIN_CHROMIUM_SECURITY_VERSION_WIN32
+    : MIN_CHROMIUM_SECURITY_VERSION_POSIX;
+}
 
 /**
  * Official Google Chrome for Testing (CfT) Stable channel pinned release:
@@ -34,8 +45,8 @@ export const GOOGLE_SECURITY_ADVISORY_URL =
   'https://chromereleases.googleblog.com/2026/10/stable-channel-update-for-desktop_0562499947.html';
 
 /**
- * Published Google Cloud Storage metadata and official etag/MD5 hashes for
- * Chrome for Testing 156.0.8078.80 artifacts.
+ * Official Chrome for Testing (CfT) download URLs and GCS object metadata.
+ * Note: gcsEtagMd5 is Google Cloud Storage object metadata, not a publisher signature.
  */
 export const OFFICIAL_CFT_ARTIFACTS = {
   version: PINNED_CFT_VERSION,
@@ -76,6 +87,33 @@ export const DISALLOWED_SECURITY_FLAGS = [
   '--disable-site-isolation-trials',
   '--disable-setuid-sandbox',
   '--single-process',
+  '--no-zygote',
+  '--disable-gpu-sandbox',
+  '--disable-seccomp-filter-sandbox',
+  '--disable-namespace-sandbox',
+  '--disable-features=IsolateOrigins,site-per-process',
+  '--remote-debugging-address',
+  '--user-data-dir',
+] as const;
+
+/**
+ * Insecure flags that disable sandboxing or isolation in running process trees.
+ * Note: --user-data-dir is forbidden in user customArgs to prevent pointing to
+ * shared/unisolated profiles, but is legitimately passed by Playwright to point
+ * to its own isolated ephemeral temp profile.
+ */
+export const DISALLOWED_PROCESS_FLAGS = [
+  '--no-sandbox',
+  '--disable-web-security',
+  '--disable-site-isolation-trials',
+  '--disable-setuid-sandbox',
+  '--single-process',
+  '--no-zygote',
+  '--disable-gpu-sandbox',
+  '--disable-seccomp-filter-sandbox',
+  '--disable-namespace-sandbox',
+  '--disable-features=IsolateOrigins,site-per-process',
+  '--remote-debugging-address',
 ] as const;
 
 /**
@@ -91,7 +129,7 @@ export const REQUIRED_BASE_LAUNCH_ARGS = [
 export interface SecureBrowserResolution {
   executablePath: string;
   version: string;
-  source: 'env' | 'cft' | 'system';
+  source: 'option' | 'env' | 'cft' | 'system';
   args: string[];
   chromiumSandbox: boolean;
 }
@@ -149,34 +187,30 @@ export function compareChromiumVersions(v1: string, v2: string): number {
  */
 export function isSecureChromiumVersion(
   version: string,
-  baseline: string = MIN_CHROMIUM_SECURITY_VERSION,
+  baselineOrPlatform: string | NodeJS.Platform = MIN_CHROMIUM_SECURITY_VERSION,
 ): boolean {
+  const baseline =
+    baselineOrPlatform === 'win32' ||
+    baselineOrPlatform === 'linux' ||
+    baselineOrPlatform === 'darwin'
+      ? getMinimumSecurityBaseline(baselineOrPlatform)
+      : baselineOrPlatform;
   return compareChromiumVersions(version, baseline) >= 0;
 }
 
 /**
  * Extract Chromium version from `--version` command line output.
  * Matches standard output from Google Chrome, Chromium, Chrome for Testing, HeadlessChrome.
+ * Fails closed if the output does not explicitly identify a recognized Chromium binary.
  */
 export function parseChromiumVersion(output: string): string {
   const trimmed = output.trim();
-  // Standard formats:
-  // "Google Chrome 156.0.8078.80"
-  // "Chromium 156.0.8078.73"
-  // "Google Chrome for Testing 156.0.8078.80"
-  // "Chrome/156.0.8078.80"
   const match = trimmed.match(
     /(?:Google Chrome(?: for Testing)?|Chromium|HeadlessChrome)[ /]([0-9]+(?:\.[0-9]+){2,3})/,
   );
 
   if (match && match[1]) {
     return match[1];
-  }
-
-  // Fallback: four dotted integers anywhere in the output
-  const fallback = trimmed.match(/\b([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)\b/);
-  if (fallback && fallback[1]) {
-    return fallback[1];
   }
 
   throw new Error(
@@ -204,6 +238,31 @@ export function probeBrowserVersion(
   return parseChromiumVersion(output);
 }
 
+/**
+ * Verify live launched browser version from Playwright Browser object.
+ */
+export function verifyLiveBrowserVersion(
+  browser: { version(): string },
+  baselineOrPlatform?: string | NodeJS.Platform,
+): string {
+  const ver = browser.version();
+  if (!isSecureChromiumVersion(ver, baselineOrPlatform)) {
+    const targetBaseline =
+      typeof baselineOrPlatform === 'string' &&
+      !['win32', 'linux', 'darwin'].includes(baselineOrPlatform)
+        ? baselineOrPlatform
+        : getMinimumSecurityBaseline(
+            typeof baselineOrPlatform === 'string'
+              ? (baselineOrPlatform as NodeJS.Platform)
+              : undefined,
+          );
+    throw new Error(
+      `Live launched browser version ${ver} is below minimum secure baseline ${targetBaseline}.`,
+    );
+  }
+  return ver;
+}
+
 function defaultExecCommand(bin: string, args: string[]): string {
   return execFileSync(bin, args, {
     encoding: 'utf8',
@@ -214,19 +273,24 @@ function defaultExecCommand(bin: string, args: string[]): string {
 
 /**
  * Sanitize launch arguments:
- * - Strips any dangerous security-bypassing flags (e.g. `--no-sandbox`, `--disable-web-security`).
+ * - Rejects any dangerous security-bypassing flags (throws).
  * - Preserves required base rendering args without duplicates.
  */
 export function sanitizeLaunchArgs(customArgs: string[] = []): string[] {
-  const sanitized = new Set<string>(REQUIRED_BASE_LAUNCH_ARGS);
-
   for (const arg of customArgs) {
     const isDisallowed = (DISALLOWED_SECURITY_FLAGS as readonly string[]).some(
-      (flag) => arg === flag || arg.startsWith(`${flag}=`),
+      (flag) => arg === flag || arg.startsWith(`${flag}=`) || arg.startsWith(`${flag} `),
     );
-    if (!isDisallowed) {
-      sanitized.add(arg);
+    if (isDisallowed) {
+      throw new Error(
+        `Insecure launch argument rejected: "${arg}" violates Chromium security baseline. Insecure overrides are forbidden.`,
+      );
     }
+  }
+
+  const sanitized = new Set<string>(REQUIRED_BASE_LAUNCH_ARGS);
+  for (const arg of customArgs) {
+    sanitized.add(arg);
   }
 
   return Array.from(sanitized);
@@ -242,9 +306,9 @@ export interface ProcessTreeValidationResult {
 
 /**
  * Validates a live process table snapshot to verify:
- * 1. The target browser process exists.
- * 2. Child/renderer processes exist (non-vacuous check).
- * 3. None of the processes in the tree contain forbidden security flags (e.g. `--no-sandbox`).
+ * 1. The target browser process exists (matched via exact token `--gitnexus-sec-id=<id>`).
+ * 2. Child/renderer processes exist via recursive tree walk (non-vacuous check).
+ * 3. None of the processes in the tree contain forbidden security flags.
  * 4. Fails closed if the process list is empty (read failure) or child count is 0.
  */
 export function validateProcessTreeSandbox(
@@ -255,47 +319,87 @@ export function validateProcessTreeSandbox(
     throw new Error('Process table read failure: process table snapshot is empty');
   }
 
-  const browserLine = processTableLines.find((l) => l.includes(identifier));
-  if (!browserLine) {
+  // Parse lines into process table records
+  const processes: Array<{ pid: string; ppid: string; line: string }> = [];
+  for (const rawLine of processTableLines) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const parts = line.split(/\s+/);
+    if (parts.length >= 3) {
+      processes.push({
+        pid: parts[0],
+        ppid: parts[1],
+        line,
+      });
+    }
+  }
+
+  // Match root browser process via exact token --gitnexus-sec-id=<identifier>
+  const expectedToken = `--gitnexus-sec-id=${identifier}`;
+  const browserProc = processes.find((p) => {
+    const idx = p.line.indexOf(expectedToken);
+    if (idx === -1) return false;
+    const after = p.line.slice(idx + expectedToken.length);
+    return after.length === 0 || /^\s/.test(after);
+  });
+
+  if (!browserProc) {
     throw new Error(`Target browser process not found for identifier "${identifier}"`);
   }
 
-  const browserParts = browserLine.trim().split(/\s+/);
-  const browserPid = browserParts[0];
+  const browserPid = browserProc.pid;
 
-  // Inspect the root browser command line
-  if (browserLine.includes('--no-sandbox')) {
-    throw new Error(
-      `Insecure flag detected: browser process (PID ${browserPid}) contains forbidden --no-sandbox`,
-    );
+  // Build parent -> children map for recursive tree traversal
+  const childrenMap = new Map<string, string[]>();
+  for (const p of processes) {
+    const existing = childrenMap.get(p.ppid) || [];
+    existing.push(p.pid);
+    childrenMap.set(p.ppid, existing);
   }
 
-  // Find all child processes where PPID == browserPid
-  const children = processTableLines.filter((l) => {
-    const parts = l.trim().split(/\s+/);
-    return parts.length >= 3 && parts[1] === browserPid;
-  });
+  // Recursive walk to find all descendants (handling Linux zygote -> renderer hierarchy)
+  const descendantPids = new Set<string>();
+  const queue = [browserPid];
+  while (queue.length > 0) {
+    const curr = queue.shift();
+    if (!curr) continue;
+    const kids = childrenMap.get(curr) || [];
+    for (const kid of kids) {
+      if (!descendantPids.has(kid)) {
+        descendantPids.add(kid);
+        queue.push(kid);
+      }
+    }
+  }
 
-  if (children.length === 0) {
+  if (descendantPids.size === 0) {
     throw new Error(`Vacuous check: no child processes found for browser PID ${browserPid}`);
   }
 
+  const allPids = [browserPid, ...Array.from(descendantPids)];
+  const procByPid = new Map(processes.map((p) => [p.pid, p]));
+
   let rendererCount = 0;
   const rendererPids: string[] = [];
-  const childPids: string[] = [];
 
-  for (const child of children) {
-    const parts = child.trim().split(/\s+/);
-    const pid = parts[0];
-    childPids.push(pid);
+  // Check every process in the tree against all disallowed security flags
+  for (const pid of allPids) {
+    const proc = procByPid.get(pid);
+    if (!proc) continue;
 
-    if (child.includes('--no-sandbox')) {
-      throw new Error(
-        `Insecure flag detected: child process (PID ${pid}) contains forbidden --no-sandbox`,
-      );
+    for (const disallowed of DISALLOWED_PROCESS_FLAGS) {
+      if (
+        proc.line.includes(disallowed) ||
+        proc.line.includes(`${disallowed}=`) ||
+        proc.line.includes(`${disallowed} `)
+      ) {
+        throw new Error(
+          `Insecure flag detected: process (PID ${pid}) contains forbidden ${disallowed}`,
+        );
+      }
     }
 
-    if (child.includes('--type=renderer')) {
+    if (proc.line.includes('--type=renderer')) {
       rendererCount++;
       rendererPids.push(pid);
     }
@@ -303,10 +407,10 @@ export function validateProcessTreeSandbox(
 
   return {
     browserPid,
-    childCount: children.length,
+    childCount: descendantPids.size,
     rendererCount,
     rendererPids,
-    allPids: [browserPid, ...childPids],
+    allPids,
   };
 }
 
@@ -314,16 +418,11 @@ export function validateProcessTreeSandbox(
  * Query macOS kernel Seatbelt sandbox state for a specific process ID using
  * system `sandbox_check(pid, NULL, SANDBOX_FILTER_NONE)`.
  *
- * Primary source reference:
- * Chromium sandbox/mac/seatbelt.cc (sandbox_check(pid, NULL, 0) returns 1 if sandboxed, 0 if not).
- *
- * Implemented using Python 3 stdlib ctypes loading macOS libSystem (zero external packages or FFI installs).
- * Returns true if the target PID is confined by the OS Seatbelt sandbox, false if unconfined.
+ * Implemented using Python 3 `-I` (isolated mode) stdlib ctypes loading macOS libSystem.
  */
 export function checkProcessSeatbeltSandboxed(
   pid: number | string,
-  execCommand: (cmd: string) => string = (cmd) =>
-    execSync(cmd, { encoding: 'utf8', timeout: 5000 }),
+  execCommand?: (bin: string, args: string[]) => string,
 ): boolean {
   const numericPid = Number(pid);
   if (!Number.isInteger(numericPid) || numericPid <= 0) {
@@ -333,7 +432,23 @@ export function checkProcessSeatbeltSandboxed(
   const script = `import ctypes; lib = ctypes.CDLL(None); print(lib.sandbox_check(${numericPid}, None, 0))`;
   let output: string;
   try {
-    output = execCommand(`python3 -c "${script}"`).trim();
+    if (execCommand) {
+      output = execCommand('/usr/bin/python3', ['-I', '-c', script]).trim();
+    } else {
+      try {
+        output = execFileSync('/usr/bin/python3', ['-I', '-c', script], {
+          encoding: 'utf8',
+          timeout: 5000,
+          stdio: ['ignore', 'pipe', 'pipe'],
+        }).trim();
+      } catch {
+        output = execFileSync('python3', ['-I', '-c', script], {
+          encoding: 'utf8',
+          timeout: 5000,
+          stdio: ['ignore', 'pipe', 'pipe'],
+        }).trim();
+      }
+    }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     throw new Error(`sandbox_check failed for PID ${numericPid}: ${msg}`);
@@ -347,51 +462,58 @@ export function checkProcessSeatbeltSandboxed(
 
 /**
  * Get system candidate paths for Chromium/Chrome based on operating system.
+ * Avoids path planting by ensuring base directory variables are non-empty.
  */
 export function getSystemCandidatePaths(
   platform: NodeJS.Platform,
   env: Record<string, string | undefined> = process.env,
 ): string[] {
-  const home = env.HOME ?? '';
-  const localAppData = env.LOCALAPPDATA ?? '';
-  const programFiles = env['ProgramFiles'] ?? 'C:\\Program Files';
-  const programFilesX86 = env['ProgramFiles(x86)'] ?? 'C:\\Program Files (x86)';
+  const home = (env.HOME ?? '').trim();
+  const localAppData = (env.LOCALAPPDATA ?? '').trim();
+  const programFiles = (env['ProgramFiles'] ?? 'C:\\Program Files').trim();
+  const programFilesX86 = (env['ProgramFiles(x86)'] ?? 'C:\\Program Files (x86)').trim();
+
+  const candidates: string[] = [];
 
   if (platform === 'darwin') {
-    return [
+    candidates.push(
       '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
       '/Applications/Google Chrome Beta.app/Contents/MacOS/Google Chrome Beta',
-      path.join(home, 'Applications/Google Chrome.app/Contents/MacOS/Google Chrome'),
-    ];
-  }
-
-  if (platform === 'linux') {
-    return [
+    );
+    if (home) {
+      candidates.push(
+        path.join(home, 'Applications/Google Chrome.app/Contents/MacOS/Google Chrome'),
+      );
+    }
+  } else if (platform === 'linux') {
+    candidates.push(
       '/usr/bin/google-chrome',
       '/usr/bin/google-chrome-stable',
       '/usr/bin/chromium',
       '/usr/bin/chromium-browser',
       '/snap/bin/chromium',
-    ];
+    );
+  } else if (platform === 'win32') {
+    if (programFiles) {
+      candidates.push(path.join(programFiles, 'Google\\Chrome\\Application\\chrome.exe'));
+    }
+    if (programFilesX86) {
+      candidates.push(path.join(programFilesX86, 'Google\\Chrome\\Application\\chrome.exe'));
+    }
+    if (localAppData) {
+      candidates.push(path.join(localAppData, 'Google\\Chrome\\Application\\chrome.exe'));
+    }
   }
 
-  if (platform === 'win32') {
-    return [
-      path.join(programFiles, 'Google\\Chrome\\Application\\chrome.exe'),
-      path.join(programFilesX86, 'Google\\Chrome\\Application\\chrome.exe'),
-      path.join(localAppData, 'Google\\Chrome\\Application\\chrome.exe'),
-    ];
-  }
-
-  return [];
+  return candidates;
 }
 
 /**
  * Resolve secure browser launch options, enforcing:
- * 1. Explicit verified executable (environment variable, pinned CfT, or validated system Chrome).
- * 2. Actual probed version >= 156.0.8078.73 (fails closed on older or unverified binaries).
+ * 1. Explicit verified executable (option, environment variable, pinned CfT, or validated system Chrome).
+ * 2. Actual probed version >= security baseline (156.0.8078.73 on POSIX, 156.0.8078.74 on Win32).
  * 3. Enforced sandboxing (chromiumSandbox: true; no --no-sandbox flag).
- * 4. Origin restrictions and profile isolation (no --disable-web-security or --disable-site-isolation-trials).
+ * 4. Origin restrictions and profile isolation.
  */
 export function resolveSecureBrowserLaunchOptions(
   options: ResolveOptions = {},
@@ -401,6 +523,9 @@ export function resolveSecureBrowserLaunchOptions(
   const fsExists = options.fsExists ?? fs.existsSync;
   const execCommand = options.execCommand ?? defaultExecCommand;
   const sanitizedArgs = sanitizeLaunchArgs(options.customArgs);
+  const baseline = getMinimumSecurityBaseline(platform);
+
+  const rejectionReasons: string[] = [];
 
   // 1. Explicit path from options
   if (options.customExecutablePath) {
@@ -411,9 +536,9 @@ export function resolveSecureBrowserLaunchOptions(
       );
     }
     const version = probeBrowserVersion(candidate, execCommand);
-    if (!isSecureChromiumVersion(version)) {
+    if (!isSecureChromiumVersion(version, baseline)) {
       throw new Error(
-        `Refusing browser executable at "${candidate}": version ${version} is below minimum secure baseline ${MIN_CHROMIUM_SECURITY_VERSION} ` +
+        `Refusing browser executable at "${candidate}": version ${version} is below minimum secure baseline ${baseline} ` +
           `(vulnerable to Critical Chrome CNA records: ${CRITICAL_CHROME_CNA_RECORDS.join(', ')}). ` +
           `See ${GOOGLE_SECURITY_ADVISORY_URL}. Stale cache or bundled fallback must fail closed.`,
       );
@@ -421,7 +546,7 @@ export function resolveSecureBrowserLaunchOptions(
     return {
       executablePath: candidate,
       version,
-      source: 'env',
+      source: 'option',
       args: sanitizedArgs,
       chromiumSandbox: true,
     };
@@ -442,9 +567,9 @@ export function resolveSecureBrowserLaunchOptions(
       );
     }
     const version = probeBrowserVersion(candidate, execCommand);
-    if (!isSecureChromiumVersion(version)) {
+    if (!isSecureChromiumVersion(version, baseline)) {
       throw new Error(
-        `Refusing browser executable at "${candidate}": version ${version} is below minimum secure baseline ${MIN_CHROMIUM_SECURITY_VERSION} ` +
+        `Refusing browser executable at "${candidate}": version ${version} is below minimum secure baseline ${baseline} ` +
           `(vulnerable to Critical Chrome CNA records: ${CRITICAL_CHROME_CNA_RECORDS.join(', ')}). ` +
           `See ${GOOGLE_SECURITY_ADVISORY_URL}. Stale cache or bundled fallback must fail closed.`,
       );
@@ -458,46 +583,54 @@ export function resolveSecureBrowserLaunchOptions(
     };
   }
 
-  // 3. Pinned local Chrome for Testing candidates (if downloaded to .browsers)
+  // 3. Pinned local Chrome for Testing candidates (anchored to repository directory, not CWD)
   const localCftCandidates: string[] = [
     path.resolve(
-      process.cwd(),
+      MODULE_DIR,
+      '../..',
       '.browsers',
       OFFICIAL_CFT_ARTIFACTS.downloads.linux64.executableSubpath,
     ),
     path.resolve(
-      process.cwd(),
+      MODULE_DIR,
+      '../..',
       '.browsers',
       OFFICIAL_CFT_ARTIFACTS.downloads['mac-arm64'].executableSubpath,
     ),
     path.resolve(
-      process.cwd(),
+      MODULE_DIR,
+      '../..',
       '.browsers',
       OFFICIAL_CFT_ARTIFACTS.downloads['mac-x64'].executableSubpath,
     ),
     path.resolve(
-      process.cwd(),
+      MODULE_DIR,
+      '../..',
       '.browsers',
       OFFICIAL_CFT_ARTIFACTS.downloads.win64.executableSubpath,
     ),
     path.resolve(
-      __dirname,
-      '../.browsers',
+      MODULE_DIR,
+      '../../..',
+      '.browsers',
       OFFICIAL_CFT_ARTIFACTS.downloads.linux64.executableSubpath,
     ),
     path.resolve(
-      __dirname,
-      '../.browsers',
+      MODULE_DIR,
+      '../../..',
+      '.browsers',
       OFFICIAL_CFT_ARTIFACTS.downloads['mac-arm64'].executableSubpath,
     ),
     path.resolve(
-      __dirname,
-      '../.browsers',
+      MODULE_DIR,
+      '../../..',
+      '.browsers',
       OFFICIAL_CFT_ARTIFACTS.downloads['mac-x64'].executableSubpath,
     ),
     path.resolve(
-      __dirname,
-      '../.browsers',
+      MODULE_DIR,
+      '../../..',
+      '.browsers',
       OFFICIAL_CFT_ARTIFACTS.downloads.win64.executableSubpath,
     ),
   ];
@@ -506,7 +639,7 @@ export function resolveSecureBrowserLaunchOptions(
     if (fsExists(candidate)) {
       try {
         const version = probeBrowserVersion(candidate, execCommand);
-        if (isSecureChromiumVersion(version)) {
+        if (isSecureChromiumVersion(version, baseline)) {
           return {
             executablePath: candidate,
             version,
@@ -514,9 +647,12 @@ export function resolveSecureBrowserLaunchOptions(
             args: sanitizedArgs,
             chromiumSandbox: true,
           };
+        } else {
+          rejectionReasons.push(`[cft ${candidate}]: version ${version} < ${baseline}`);
         }
-      } catch {
-        // Continue searching other candidates
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        rejectionReasons.push(`[cft ${candidate}]: ${msg}`);
       }
     }
   }
@@ -527,7 +663,7 @@ export function resolveSecureBrowserLaunchOptions(
     if (fsExists(candidate)) {
       try {
         const version = probeBrowserVersion(candidate, execCommand);
-        if (isSecureChromiumVersion(version)) {
+        if (isSecureChromiumVersion(version, baseline)) {
           return {
             executablePath: candidate,
             version,
@@ -535,19 +671,29 @@ export function resolveSecureBrowserLaunchOptions(
             args: sanitizedArgs,
             chromiumSandbox: true,
           };
+        } else {
+          rejectionReasons.push(`[system ${candidate}]: version ${version} < ${baseline}`);
         }
-      } catch {
-        // Continue searching other candidates
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        rejectionReasons.push(`[system ${candidate}]: ${msg}`);
       }
+    } else {
+      rejectionReasons.push(`[system ${candidate}]: file not found`);
     }
   }
 
   // 5. Fail closed if no secure browser could be verified
+  const diagnosticSummary =
+    rejectionReasons.length > 0
+      ? `\nDiagnostic scan results:\n  - ${rejectionReasons.join('\n  - ')}`
+      : '';
+
   throw new Error(
-    `No secure Chromium browser executable resolved (minimum baseline: ${MIN_CHROMIUM_SECURITY_VERSION}). ` +
-      `Bundled Playwright chromium fallback is disallowed because bundled versions (<156.0.8078.73) ` +
+    `No secure Chromium browser executable resolved (minimum baseline: ${baseline}). ` +
+      `Bundled Playwright chromium fallback is disallowed because bundled versions (<${baseline}) ` +
       `are vulnerable to Critical Chrome CNA records: ${CRITICAL_CHROME_CNA_RECORDS.join(', ')}. ` +
       `Please provide an explicit patched executable via CHROME_BIN / PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH ` +
-      `or install Google Chrome >= ${MIN_CHROMIUM_SECURITY_VERSION}.`,
+      `or install Google Chrome >= ${baseline}.${diagnosticSummary}`,
   );
 }

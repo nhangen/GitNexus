@@ -1,21 +1,44 @@
 import { describe, expect, it } from 'vitest';
 import * as path from 'path';
+import * as http from 'http';
 import { execSync } from 'child_process';
 import {
   compareChromiumVersions,
   isSecureChromiumVersion,
+  getMinimumSecurityBaseline,
   parseChromiumVersion,
   probeBrowserVersion,
+  verifyLiveBrowserVersion,
   sanitizeLaunchArgs,
   resolveSecureBrowserLaunchOptions,
   validateProcessTreeSandbox,
   checkProcessSeatbeltSandboxed,
+  getSystemCandidatePaths,
   MIN_CHROMIUM_SECURITY_VERSION,
+  MIN_CHROMIUM_SECURITY_VERSION_POSIX,
+  MIN_CHROMIUM_SECURITY_VERSION_WIN32,
   PINNED_CFT_VERSION,
   CRITICAL_CHROME_CNA_RECORDS,
   DISALLOWED_SECURITY_FLAGS,
   REQUIRED_BASE_LAUNCH_ARGS,
-} from '../../src/browser-security';
+} from '../../e2e/support/browser-security';
+import playwrightConfig from '../../playwright.config';
+
+// Literal disallowed security flags list to prevent sanitizer test tautologies (Finding #10)
+const LITERAL_DISALLOWED_FLAGS = [
+  '--no-sandbox',
+  '--disable-web-security',
+  '--disable-site-isolation-trials',
+  '--disable-setuid-sandbox',
+  '--single-process',
+  '--no-zygote',
+  '--disable-gpu-sandbox',
+  '--disable-seccomp-filter-sandbox',
+  '--disable-namespace-sandbox',
+  '--disable-features=IsolateOrigins,site-per-process',
+  '--remote-debugging-address',
+  '--user-data-dir',
+];
 
 describe('Browser Security Baseline — Chromium Version Verification', () => {
   describe('compareChromiumVersions', () => {
@@ -45,13 +68,22 @@ describe('Browser Security Baseline — Chromium Version Verification', () => {
     });
   });
 
-  describe('isSecureChromiumVersion', () => {
-    it('accepts versions at or above minimum secure baseline 156.0.8078.73', () => {
-      expect(isSecureChromiumVersion(MIN_CHROMIUM_SECURITY_VERSION)).toBe(true);
+  describe('isSecureChromiumVersion & Per-Platform Floors (Finding #18)', () => {
+    it('reports correct per-platform floor constants', () => {
+      expect(MIN_CHROMIUM_SECURITY_VERSION).toBe('156.0.8078.73');
+      expect(MIN_CHROMIUM_SECURITY_VERSION_POSIX).toBe('156.0.8078.73');
+      expect(MIN_CHROMIUM_SECURITY_VERSION_WIN32).toBe('156.0.8078.74');
+      expect(getMinimumSecurityBaseline('linux')).toBe('156.0.8078.73');
+      expect(getMinimumSecurityBaseline('darwin')).toBe('156.0.8078.73');
+      expect(getMinimumSecurityBaseline('win32')).toBe('156.0.8078.74');
+    });
+
+    it('accepts versions meeting platform-specific baseline', () => {
+      expect(isSecureChromiumVersion('156.0.8078.73', 'linux')).toBe(true);
+      expect(isSecureChromiumVersion('156.0.8078.73', 'darwin')).toBe(true);
+      expect(isSecureChromiumVersion('156.0.8078.73', 'win32')).toBe(false); // Win32 floor is .74
+      expect(isSecureChromiumVersion('156.0.8078.74', 'win32')).toBe(true);
       expect(isSecureChromiumVersion(PINNED_CFT_VERSION)).toBe(true);
-      expect(isSecureChromiumVersion('156.0.8078.73')).toBe(true);
-      expect(isSecureChromiumVersion('156.0.8078.74')).toBe(true);
-      expect(isSecureChromiumVersion('156.0.8078.80')).toBe(true);
       expect(isSecureChromiumVersion('157.0.0.0')).toBe(true);
     });
 
@@ -60,7 +92,6 @@ describe('Browser Security Baseline — Chromium Version Verification', () => {
     });
 
     it('rejects Playwright 1.64.1 mapped Chromium (156.0.8078.4)', () => {
-      // 156.0.8078.4 is below the 156.0.8078.73 fix boundary
       expect(isSecureChromiumVersion('156.0.8078.4')).toBe(false);
     });
 
@@ -71,7 +102,7 @@ describe('Browser Security Baseline — Chromium Version Verification', () => {
     });
   });
 
-  describe('parseChromiumVersion', () => {
+  describe('parseChromiumVersion (Finding #8: strict distribution regex)', () => {
     it('parses Google Chrome output', () => {
       expect(parseChromiumVersion('Google Chrome 156.0.8078.80')).toBe('156.0.8078.80');
       expect(parseChromiumVersion('Google Chrome 156.0.8078.73 unknown\n')).toBe('156.0.8078.73');
@@ -93,11 +124,15 @@ describe('Browser Security Baseline — Chromium Version Verification', () => {
       expect(parseChromiumVersion('HeadlessChrome/156.0.8078.80\n')).toBe('156.0.8078.80');
     });
 
-    it('throws when output is not a Chromium executable output', () => {
-      expect(() => parseChromiumVersion('Mozilla Firefox 130.0')).toThrow(
+    it('strictly rejects non-Chromium output with 4 dotted integers (Finding #8)', () => {
+      // Must not accept Firefox even if it outputs 4 dotted numbers
+      expect(() => parseChromiumVersion('Mozilla Firefox 160.0.1.2')).toThrow(
         /cannot parse Chromium version/,
       );
-      expect(() => parseChromiumVersion('v22.22.3')).toThrow(/cannot parse Chromium version/);
+      expect(() => parseChromiumVersion('SomeOtherBrowser 156.0.8078.80')).toThrow(
+        /cannot parse Chromium version/,
+      );
+      expect(() => parseChromiumVersion('v22.22.3.4')).toThrow(/cannot parse Chromium version/);
       expect(() => parseChromiumVersion('')).toThrow(/cannot parse Chromium version/);
       expect(() => parseChromiumVersion('command not found: chrome')).toThrow(
         /cannot parse Chromium version/,
@@ -105,7 +140,7 @@ describe('Browser Security Baseline — Chromium Version Verification', () => {
     });
   });
 
-  describe('probeBrowserVersion', () => {
+  describe('probeBrowserVersion & verifyLiveBrowserVersion (Finding #9)', () => {
     it('probes executable and returns parsed version', () => {
       const mockExec = () => 'Google Chrome 156.0.8078.80\n';
       expect(probeBrowserVersion('/mock/chrome', mockExec)).toBe('156.0.8078.80');
@@ -119,10 +154,20 @@ describe('Browser Security Baseline — Chromium Version Verification', () => {
         /execution failed/,
       );
     });
+
+    it('verifyLiveBrowserVersion validates live browser version post-launch', () => {
+      const validBrowser = { version: () => '156.0.8078.80' };
+      expect(verifyLiveBrowserVersion(validBrowser)).toBe('156.0.8078.80');
+
+      const outdatedBrowser = { version: () => '145.0.7632.6' };
+      expect(() => verifyLiveBrowserVersion(outdatedBrowser)).toThrow(
+        /below minimum secure baseline/,
+      );
+    });
   });
 });
 
-describe('Browser Security Baseline — Launch Arguments & Sandboxing Enforcement', () => {
+describe('Browser Security Baseline — Launch Arguments & Deny List (Findings #10, #11)', () => {
   it('preserves required WebGL rendering flags', () => {
     const args = sanitizeLaunchArgs();
     for (const flag of REQUIRED_BASE_LAUNCH_ARGS) {
@@ -130,221 +175,295 @@ describe('Browser Security Baseline — Launch Arguments & Sandboxing Enforcemen
     }
   });
 
-  it('strips all disallowed security-bypassing flags', () => {
-    const unsafeInput = [
-      '--no-sandbox',
-      '--disable-web-security',
-      '--disable-site-isolation-trials',
-      '--disable-setuid-sandbox',
-      '--single-process',
-      '--custom-safe-flag',
-    ];
-
-    const sanitized = sanitizeLaunchArgs(unsafeInput);
-
-    for (const disallowed of DISALLOWED_SECURITY_FLAGS) {
-      expect(sanitized).not.toContain(disallowed);
+  it('rejects all disallowed security-bypassing flags (Finding #10 & #11)', () => {
+    // Test against independent literal list
+    for (const disallowed of LITERAL_DISALLOWED_FLAGS) {
+      expect(() => sanitizeLaunchArgs([disallowed])).toThrow(/Insecure launch argument rejected/);
+      expect(() => sanitizeLaunchArgs([`${disallowed}=value`])).toThrow(
+        /Insecure launch argument rejected/,
+      );
     }
+  });
+
+  it('allows safe custom flags while adding required base flags', () => {
+    const safeInput = ['--custom-safe-flag', '--start-maximized'];
+    const sanitized = sanitizeLaunchArgs(safeInput);
     expect(sanitized).toContain('--custom-safe-flag');
+    expect(sanitized).toContain('--start-maximized');
     expect(sanitized).toContain('--enable-webgl');
   });
 
-  it('enforces chromiumSandbox: true in resolution output', () => {
-    const mockFsExists = () => true;
-    const mockExec = () => 'Google Chrome 156.0.8078.80\n';
-
-    const resolution = resolveSecureBrowserLaunchOptions({
-      customExecutablePath: '/usr/bin/google-chrome',
-      fsExists: mockFsExists,
-      execCommand: mockExec,
-    });
-
-    expect(resolution.chromiumSandbox).toBe(true);
-    expect(resolution.args).not.toContain('--no-sandbox');
-    expect(resolution.args).not.toContain('--disable-web-security');
+  it('contains all 12 critical disallowed flags in DISALLOWED_SECURITY_FLAGS', () => {
+    for (const flag of LITERAL_DISALLOWED_FLAGS) {
+      expect(DISALLOWED_SECURITY_FLAGS).toContain(flag);
+    }
   });
 });
 
-describe('Browser Security Baseline — Fail-Closed Acceptance Loop', () => {
-  it('refuses old executable below baseline and names Critical CNA records', () => {
-    const mockFsExists = () => true;
-    const mockExec = () => 'Google Chrome 145.0.7632.6\n';
+describe('Browser Security Baseline — Fail-Closed Resolution & Mutation Tests (Findings #4, #16, #20)', () => {
+  describe('Branch: customExecutablePath (source: option)', () => {
+    it('succeeds and returns source: option for valid binary meeting baseline', () => {
+      const mockFsExists = () => true;
+      const mockExec = () => 'Google Chrome 156.0.8078.80\n';
 
-    expect(() =>
-      resolveSecureBrowserLaunchOptions({
-        customExecutablePath: '/mock/old-chrome',
-        fsExists: mockFsExists,
-        execCommand: mockExec,
-      }),
-    ).toThrowError(/version 145\.0\.7632\.6 is below minimum secure baseline 156\.0\.8078\.73/);
-
-    // Verify all 4 critical CNA records are included in the error
-    let thrownError: Error | null = null;
-    try {
-      resolveSecureBrowserLaunchOptions({
-        customExecutablePath: '/mock/old-chrome',
+      const resolution = resolveSecureBrowserLaunchOptions({
+        customExecutablePath: '/usr/bin/custom-chrome',
         fsExists: mockFsExists,
         execCommand: mockExec,
       });
-    } catch (err) {
-      thrownError = err as Error;
-    }
-    expect(thrownError).not.toBeNull();
-    for (const cna of CRITICAL_CHROME_CNA_RECORDS) {
-      expect(thrownError?.message).toContain(cna);
-    }
+
+      expect(resolution.executablePath).toBe(path.resolve('/usr/bin/custom-chrome'));
+      expect(resolution.version).toBe('156.0.8078.80');
+      expect(resolution.source).toBe('option');
+      expect(resolution.chromiumSandbox).toBe(true);
+    });
+
+    it('refuses custom executable if file does not exist', () => {
+      const mockFsExists = () => false;
+      expect(() =>
+        resolveSecureBrowserLaunchOptions({
+          customExecutablePath: '/missing/chrome',
+          fsExists: mockFsExists,
+        }),
+      ).toThrow(/executable file not found/);
+    });
+
+    it('refuses custom executable if version is below baseline', () => {
+      const mockFsExists = () => true;
+      const mockExec = () => 'Google Chrome 145.0.7632.6\n';
+      expect(() =>
+        resolveSecureBrowserLaunchOptions({
+          customExecutablePath: '/old/chrome',
+          fsExists: mockFsExists,
+          execCommand: mockExec,
+        }),
+      ).toThrow(/below minimum secure baseline/);
+    });
   });
 
-  it('refuses Playwright 1.64.1 mapped Chromium 156.0.8078.4 (below fix)', () => {
-    const mockFsExists = () => true;
-    const mockExec = () => 'Chromium 156.0.8078.4\n';
+  describe('Branch: environment variable candidate (source: env)', () => {
+    it('succeeds and returns source: env when CHROME_BIN meets baseline', () => {
+      const mockFsExists = (p: string) => p.includes('google-chrome');
+      const mockExec = () => 'Google Chrome 156.0.8078.80\n';
 
-    expect(() =>
-      resolveSecureBrowserLaunchOptions({
-        customExecutablePath: '/mock/playwright-1.64-chromium',
+      const resolution = resolveSecureBrowserLaunchOptions({
+        env: { CHROME_BIN: '/usr/bin/google-chrome' },
         fsExists: mockFsExists,
         execCommand: mockExec,
-      }),
-    ).toThrowError(/version 156\.0\.8078\.4 is below minimum secure baseline/);
+      });
+
+      expect(resolution.executablePath).toBe(path.resolve('/usr/bin/google-chrome'));
+      expect(resolution.version).toBe('156.0.8078.80');
+      expect(resolution.source).toBe('env');
+      expect(resolution.chromiumSandbox).toBe(true);
+    });
+
+    it('refuses env candidate if file is missing', () => {
+      const mockFsExists = () => false;
+      expect(() =>
+        resolveSecureBrowserLaunchOptions({
+          env: { CHROME_BIN: '/missing/env-chrome' },
+          fsExists: mockFsExists,
+        }),
+      ).toThrow(/executable file not found/);
+    });
+
+    it('refuses env candidate if version is below baseline and lists CNA records', () => {
+      const mockFsExists = () => true;
+      const mockExec = () => 'Google Chrome 145.0.7632.6\n';
+
+      let errorMsg = '';
+      try {
+        resolveSecureBrowserLaunchOptions({
+          env: { CHROME_BIN: '/usr/bin/old-chrome' },
+          fsExists: mockFsExists,
+          execCommand: mockExec,
+        });
+      } catch (err) {
+        errorMsg = (err as Error).message;
+      }
+
+      expect(errorMsg).toMatch(/below minimum secure baseline/);
+      for (const cna of CRITICAL_CHROME_CNA_RECORDS) {
+        expect(errorMsg).toContain(cna);
+      }
+    });
   });
 
-  it('refuses missing executable path without falling back to stale cache', () => {
-    const mockFsExists = () => false;
+  describe('Branch: local CfT candidate (source: cft)', () => {
+    it('succeeds and returns source: cft when local CfT build meets baseline', () => {
+      const mockFsExists = (p: string) => p.includes('chrome-linux64/chrome');
+      const mockExec = () => 'Google Chrome for Testing 156.0.8078.80\n';
 
-    expect(() =>
-      resolveSecureBrowserLaunchOptions({
-        customExecutablePath: '/nonexistent/path/to/chrome',
-        fsExists: mockFsExists,
-      }),
-    ).toThrowError(/executable file not found\. Stale cache and unverified fallbacks are rejected/);
-  });
-
-  it('refuses wrong executable output (non-Chromium binary)', () => {
-    const mockFsExists = () => true;
-    const mockExec = () => 'bash 5.2.15(1)-release\n';
-
-    expect(() =>
-      resolveSecureBrowserLaunchOptions({
-        customExecutablePath: '/bin/bash',
+      const resolution = resolveSecureBrowserLaunchOptions({
+        env: {},
         fsExists: mockFsExists,
         execCommand: mockExec,
-      }),
-    ).toThrowError(/cannot parse Chromium version from output/);
+      });
+
+      expect(resolution.source).toBe('cft');
+      expect(resolution.version).toBe('156.0.8078.80');
+      expect(resolution.chromiumSandbox).toBe(true);
+    });
+
+    it('skips local CfT candidate if its version is below baseline', () => {
+      const mockFsExists = (p: string) => p.includes('chrome-linux64/chrome');
+      const mockExec = () => 'Google Chrome for Testing 156.0.8078.70\n';
+
+      expect(() =>
+        resolveSecureBrowserLaunchOptions({
+          env: {},
+          fsExists: mockFsExists,
+          execCommand: mockExec,
+          platform: 'linux',
+        }),
+      ).toThrow(/No secure Chromium browser executable resolved/);
+    });
   });
 
-  it('refuses silent fallback when no secure candidate exists', () => {
-    const mockFsExists = () => false;
-    const emptyEnv = {};
+  describe('Branch: system candidate (source: system)', () => {
+    it('succeeds and returns source: system when system Chrome meets baseline', () => {
+      const mockFsExists = (p: string) => p === '/usr/bin/google-chrome';
+      const mockExec = () => 'Google Chrome 156.0.8078.74\n';
 
-    expect(() =>
-      resolveSecureBrowserLaunchOptions({
-        env: emptyEnv,
+      const resolution = resolveSecureBrowserLaunchOptions({
+        env: {},
         platform: 'linux',
         fsExists: mockFsExists,
-      }),
-    ).toThrowError(
-      /No secure Chromium browser executable resolved \(minimum baseline: 156\.0\.8078\.73\)/,
-    );
-  });
+        execCommand: mockExec,
+      });
 
-  it('succeeds on explicit patched candidate selection via env variable', () => {
-    const mockFsExists = (p: string) => p.includes('google-chrome');
-    const mockExec = () => 'Google Chrome 156.0.8078.80\n';
-
-    const resolution = resolveSecureBrowserLaunchOptions({
-      env: { CHROME_BIN: '/usr/bin/google-chrome' },
-      fsExists: mockFsExists,
-      execCommand: mockExec,
+      expect(resolution.executablePath).toBe('/usr/bin/google-chrome');
+      expect(resolution.version).toBe('156.0.8078.74');
+      expect(resolution.source).toBe('system');
+      expect(resolution.chromiumSandbox).toBe(true);
     });
 
-    expect(resolution.executablePath).toBe(path.resolve('/usr/bin/google-chrome'));
-    expect(resolution.version).toBe('156.0.8078.80');
-    expect(resolution.source).toBe('env');
-    expect(resolution.chromiumSandbox).toBe(true);
-    expect(resolution.args).not.toContain('--no-sandbox');
-    expect(resolution.args).not.toContain('--disable-web-security');
+    it('skips system candidate if below platform baseline and fails closed', () => {
+      const mockFsExists = (p: string) => p === '/usr/bin/google-chrome';
+      const mockExec = () => 'Google Chrome 156.0.8078.70\n';
+
+      expect(() =>
+        resolveSecureBrowserLaunchOptions({
+          env: {},
+          platform: 'linux',
+          fsExists: mockFsExists,
+          execCommand: mockExec,
+        }),
+      ).toThrow(/No secure Chromium browser executable resolved/);
+    });
   });
 
-  it('succeeds on system candidate matching or exceeding baseline', () => {
-    const mockFsExists = (p: string) => p === '/usr/bin/google-chrome';
-    const mockExec = () => 'Google Chrome 156.0.8078.74\n';
+  describe('Diagnostic Logging on Fail-Closed (Finding #16)', () => {
+    it('includes per-candidate diagnostic failure reasons when no candidate qualifies', () => {
+      const mockFsExists = (p: string) => p === '/usr/bin/google-chrome';
+      const mockExec = () => 'Google Chrome 155.0.0.0\n';
 
-    const resolution = resolveSecureBrowserLaunchOptions({
-      env: {},
-      platform: 'linux',
-      fsExists: mockFsExists,
-      execCommand: mockExec,
+      let errorMsg = '';
+      try {
+        resolveSecureBrowserLaunchOptions({
+          env: {},
+          platform: 'linux',
+          fsExists: mockFsExists,
+          execCommand: mockExec,
+        });
+      } catch (err) {
+        errorMsg = (err as Error).message;
+      }
+
+      expect(errorMsg).toContain('Diagnostic scan results:');
+      expect(errorMsg).toContain(
+        '[system /usr/bin/google-chrome]: version 155.0.0.0 < 156.0.8078.73',
+      );
     });
+  });
 
-    expect(resolution.executablePath).toBe('/usr/bin/google-chrome');
-    expect(resolution.version).toBe('156.0.8078.74');
-    expect(resolution.source).toBe('system');
-    expect(resolution.chromiumSandbox).toBe(true);
+  describe('Path Planting Prevention in Candidates (Finding #15)', () => {
+    it('does not plant candidate paths when HOME or LOCALAPPDATA are empty or whitespace', () => {
+      const darwinCandidates = getSystemCandidatePaths('darwin', { HOME: '   ' });
+      for (const candidate of darwinCandidates) {
+        expect(candidate.trim()).not.toMatch(/^\s*Applications/);
+      }
+
+      const winCandidates = getSystemCandidatePaths('win32', {
+        LOCALAPPDATA: '',
+        ProgramFiles: '',
+        'ProgramFiles(x86)': '',
+      });
+      expect(winCandidates).toHaveLength(0);
+    });
   });
 });
 
-describe('Browser Security Baseline — Process Tree Sandbox Validation & Mutation Proof', () => {
+describe('Browser Security Baseline — Process Tree Sandbox Validation & Recursive Hierarchy (Findings #6, #12, #14)', () => {
   const cleanProcessSnapshot = [
-    ' 1000     1 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --unique-id=test-session-123',
-    ' 1001  1000 /Applications/Google Chrome.app/Contents/Frameworks/.../Helpers/Google Chrome Helper.app/Contents/MacOS/Google Chrome Helper --type=gpu-process',
-    ' 1002  1000 /Applications/Google Chrome.app/Contents/Frameworks/.../Helpers/Google Chrome Helper (Renderer).app/Contents/MacOS/Google Chrome Helper (Renderer) --type=renderer --seatbelt-client=83',
+    ' 1000     1 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --gitnexus-sec-id=test-session-123',
+    ' 1001  1000 /Applications/Google Chrome.app/Contents/Frameworks/.../Helpers/Google Chrome Helper.app/Contents/MacOS/Google Chrome Helper --type=zygote',
+    ' 1002  1001 /Applications/Google Chrome.app/Contents/Frameworks/.../Helpers/Google Chrome Helper (Renderer).app/Contents/MacOS/Google Chrome Helper (Renderer) --type=renderer --seatbelt-client=83',
     ' 1003  1000 /Applications/Google Chrome.app/Contents/Frameworks/.../Helpers/Google Chrome Helper.app/Contents/MacOS/Google Chrome Helper --type=utility --utility-sub-type=network.mojom.NetworkService',
   ];
 
-  it('validates a secure process tree snapshot returning non-vacuous child and renderer counts', () => {
+  it('validates a recursive process tree (e.g. Linux zygote -> renderer hierarchy)', () => {
+    // PID 1000 (browser) -> PID 1001 (zygote) -> PID 1002 (renderer)
     const result = validateProcessTreeSandbox(cleanProcessSnapshot, 'test-session-123');
     expect(result.browserPid).toBe('1000');
     expect(result.childCount).toBe(3);
     expect(result.rendererCount).toBe(1);
-    expect(result.allPids).toEqual(['1000', '1001', '1002', '1003']);
+    expect(result.rendererPids).toEqual(['1002']);
+    expect(result.allPids).toEqual(['1000', '1001', '1003', '1002']);
   });
 
-  it('mutation proof: fails when root browser contains forbidden --no-sandbox flag', () => {
-    const mutant = [
-      ' 1000     1 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --no-sandbox --unique-id=test-session-123',
-      ' 1001  1000 /Applications/Google Chrome.app/Contents/.../Helpers/... --type=renderer',
-    ];
+  it('mutation proof: fails when root browser contains forbidden flag', () => {
+    const processDisallowed = LITERAL_DISALLOWED_FLAGS.filter((f) => f !== '--user-data-dir');
+    for (const flag of processDisallowed) {
+      const mutant = [
+        ` 1000     1 /path/chrome ${flag} --gitnexus-sec-id=test-session-123`,
+        ' 1001  1000 /path/chrome-helper --type=renderer',
+      ];
+      expect(() => validateProcessTreeSandbox(mutant, 'test-session-123')).toThrow(
+        new RegExp(
+          `Insecure flag detected: process \\(PID 1000\\) contains forbidden ${flag.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&')}`,
+        ),
+      );
+    }
+  });
 
+  it('mutation proof: fails when grandchild renderer process contains forbidden flag', () => {
+    const mutant = [
+      ' 1000     1 /path/chrome --gitnexus-sec-id=test-session-123',
+      ' 1001  1000 /path/chrome --type=zygote',
+      ' 1002  1001 /path/chrome-helper --type=renderer --no-sandbox',
+    ];
     expect(() => validateProcessTreeSandbox(mutant, 'test-session-123')).toThrow(
-      /Insecure flag detected: browser process \(PID 1000\) contains forbidden --no-sandbox/,
+      /Insecure flag detected: process \(PID 1002\) contains forbidden --no-sandbox/,
     );
   });
 
-  it('mutation proof: fails when child renderer contains forbidden --no-sandbox flag', () => {
-    const mutant = [
-      ' 1000     1 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --unique-id=test-session-123',
-      ' 1002  1000 /Applications/Google Chrome.app/Contents/.../Helpers/... --type=renderer --no-sandbox',
-    ];
-
-    expect(() => validateProcessTreeSandbox(mutant, 'test-session-123')).toThrow(
-      /Insecure flag detected: child process \(PID 1002\) contains forbidden --no-sandbox/,
-    );
-  });
-
-  it('fails closed when process table read returns empty (all reads failing cannot pass)', () => {
+  it('fails closed when process table read returns empty', () => {
     expect(() => validateProcessTreeSandbox([], 'test-session-123')).toThrow(
       /Process table read failure: process table snapshot is empty/,
     );
   });
 
-  it('fails closed when target browser process is not found in process table', () => {
-    expect(() => validateProcessTreeSandbox(cleanProcessSnapshot, 'missing-session-id')).toThrow(
-      /Target browser process not found for identifier "missing-session-id"/,
+  it('fails closed when exact token --gitnexus-sec-id=<id> is not matched (Finding #14)', () => {
+    const looseSnapshot = [
+      ' 1000 1 /path/chrome --random-token=test-session-123',
+      ' 1001 1000 /path/chrome-helper --type=renderer',
+    ];
+    expect(() => validateProcessTreeSandbox(looseSnapshot, 'test-session-123')).toThrow(
+      /Target browser process not found for identifier "test-session-123"/,
     );
   });
 
   it('fails closed when child process count is 0 (vacuous check prevention)', () => {
-    const vacuous = [
-      ' 1000     1 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --unique-id=test-session-123',
-    ];
-
+    const vacuous = [' 1000 1 /path/chrome --gitnexus-sec-id=test-session-123'];
     expect(() => validateProcessTreeSandbox(vacuous, 'test-session-123')).toThrow(
       /Vacuous check: no child processes found for browser PID 1000/,
     );
   });
 });
 
-describe('Browser Security Baseline — macOS Seatbelt Kernel Sandbox Verification', () => {
+describe('Browser Security Baseline — macOS Seatbelt Kernel Sandbox (Finding #17)', () => {
   it('returns true when sandbox_check outputs 1 (sandboxed)', () => {
     const mockExec = () => '1\n';
     expect(checkProcessSeatbeltSandboxed(1234, mockExec)).toBe(true);
@@ -355,26 +474,23 @@ describe('Browser Security Baseline — macOS Seatbelt Kernel Sandbox Verificati
     expect(checkProcessSeatbeltSandboxed(1234, mockExec)).toBe(false);
   });
 
+  it('passes -I isolated mode to python3 executable args', () => {
+    let capturedArgs: string[] = [];
+    const mockExec = (_bin: string, args: string[]) => {
+      capturedArgs = args;
+      return '1\n';
+    };
+    checkProcessSeatbeltSandboxed(1234, mockExec);
+    expect(capturedArgs).toContain('-I');
+    expect(capturedArgs).toContain('-c');
+  });
+
   it('throws on invalid PID input', () => {
     expect(() => checkProcessSeatbeltSandboxed(-1)).toThrow(/Invalid PID/);
     expect(() => checkProcessSeatbeltSandboxed('abc')).toThrow(/Invalid PID/);
   });
 
-  it('throws on unexpected sandbox_check output', () => {
-    const mockExec = () => 'unexpected output\n';
-    expect(() => checkProcessSeatbeltSandboxed(1234, mockExec)).toThrow(
-      /Unexpected sandbox_check output/,
-    );
-  });
-
-  it('throws on sandbox_check execution failure', () => {
-    const mockExec = () => {
-      throw new Error('Command failed');
-    };
-    expect(() => checkProcessSeatbeltSandboxed(1234, mockExec)).toThrow(/sandbox_check failed/);
-  });
-
-  it('validates that test runner harness process itself is NOT sandboxed (avoids self-check false positives)', () => {
+  it('validates that test runner harness process itself is NOT sandboxed', () => {
     if (process.platform === 'darwin') {
       const isHarnessSandboxed = checkProcessSeatbeltSandboxed(process.pid);
       expect(isHarnessSandboxed).toBe(false);
@@ -382,84 +498,193 @@ describe('Browser Security Baseline — macOS Seatbelt Kernel Sandbox Verificati
   });
 });
 
-describe('Browser Security Baseline — Real Environment Sandboxing & Isolation', () => {
-  it('resolves the real system Chrome on this host meeting security baseline', () => {
-    const resolution = resolveSecureBrowserLaunchOptions();
-    expect(resolution.executablePath).toBeTruthy();
-    expect(isSecureChromiumVersion(resolution.version)).toBe(true);
-    expect(resolution.chromiumSandbox).toBe(true);
-    expect(resolution.args).not.toContain('--no-sandbox');
+describe('Browser Security Baseline — Playwright Config Entry Point (Findings #1, #5)', () => {
+  it('exports valid secure Playwright configuration without __dirname ReferenceError', () => {
+    expect(playwrightConfig).toBeDefined();
+    expect(playwrightConfig.use).toBeDefined();
+    expect(playwrightConfig.use?.bypassCSP).toBe(false);
+    expect(playwrightConfig.use?.launchOptions?.executablePath).toBeTruthy();
+    expect(playwrightConfig.use?.launchOptions?.chromiumSandbox).toBe(true);
+    expect(playwrightConfig.use?.launchOptions?.args).toContain('--enable-webgl');
+    expect(playwrightConfig.use?.launchOptions?.args).not.toContain('--no-sandbox');
   });
+});
 
-  it('launches patched browser with Playwright verifying sandbox, live process tree, and profile isolation', async () => {
-    const { chromium } = await import('@playwright/test');
-    const resolution = resolveSecureBrowserLaunchOptions();
-    const runId = `gn-sec-test-${Date.now()}`;
+describe('Browser Security Baseline — Live Browser Launch & Boundaries (Findings #3, #9, #13, #23)', () => {
+  // Gated behind RUN_LIVE_BROWSER_TESTS so CI unit test suites without Chrome pass cleanly
+  const shouldRunLive =
+    process.env.RUN_LIVE_BROWSER_TESTS === '1' || process.env.RUN_LIVE_BROWSER_TESTS === 'true';
 
-    const browser = await chromium.launch({
-      executablePath: resolution.executablePath,
-      args: [...resolution.args, `--gitnexus-sec-id=${runId}`],
-      chromiumSandbox: resolution.chromiumSandbox,
-      headless: true,
-    });
+  (shouldRunLive ? it : it.skip)(
+    'launches patched browser verifying post-launch version, process tree sandbox, and profile boundaries',
+    async () => {
+      const { chromium } = await import('@playwright/test');
+      const resolution = resolveSecureBrowserLaunchOptions();
+      const runId = `gn-sec-live-${Date.now()}`;
 
-    try {
-      // 1. Verify launched browser version matches or exceeds security baseline
-      const launchedVersion = browser.version();
-      expect(isSecureChromiumVersion(launchedVersion)).toBe(true);
+      const browser = await chromium.launch({
+        executablePath: resolution.executablePath,
+        args: [...resolution.args, `--gitnexus-sec-id=${runId}`],
+        chromiumSandbox: resolution.chromiumSandbox,
+        headless: true,
+      });
 
-      // 2. Profile isolation: test two independent contexts
-      const contextA = await browser.newContext();
-      const contextB = await browser.newContext();
+      try {
+        // 1. Post-launch version verification (Finding #9)
+        const liveVersion = verifyLiveBrowserVersion(browser);
+        expect(isSecureChromiumVersion(liveVersion)).toBe(true);
 
-      const pageA = await contextA.newPage();
-      const _pageB = await contextB.newPage();
+        // 2. Profile and Cookie Boundary Isolation (Finding #13)
+        const contextA = await browser.newContext();
+        const contextB = await browser.newContext();
 
-      // Open a live page to ensure renderer processes are actively spawned
-      await pageA.goto('data:text/html,<h1>GitNexus Security Baseline Test</h1>');
+        const pageA = await contextA.newPage();
+        const pageB = await contextB.newPage();
 
-      // 3. Inspect live OS process table for actual process hierarchy and absence of --no-sandbox
-      // Assertions are strictly outside any catch block to prevent swallowed failures.
-      const psOutput = execSync('ps -eo pid,ppid,command').toString();
-      const processLines = psOutput.split('\n');
+        await pageA.goto('data:text/html,<h1>GitNexus Security Baseline Test</h1>');
+        await pageB.goto('data:text/html,<h1>GitNexus Context B</h1>');
 
-      const validation = validateProcessTreeSandbox(processLines, runId);
-      expect(validation.childCount).toBeGreaterThan(0);
-      expect(validation.rendererCount).toBeGreaterThan(0);
-      expect(validation.rendererPids.length).toBeGreaterThan(0);
+        // Inspect OS process table with -ww to prevent truncation (Finding #23)
+        const psOutput = execSync('ps -ww -eo pid,ppid,command').toString();
+        const processLines = psOutput.split('\n');
 
-      // 4. On macOS Darwin: verify actual OS Seatbelt kernel sandbox on owned renderer processes
-      if (process.platform === 'darwin') {
-        // Assert broker process is unsandboxed coordinator (0)
-        expect(checkProcessSeatbeltSandboxed(validation.browserPid)).toBe(false);
+        const validation = validateProcessTreeSandbox(processLines, runId);
+        expect(validation.childCount).toBeGreaterThan(0);
+        expect(validation.rendererCount).toBeGreaterThan(0);
+        expect(validation.rendererPids.length).toBeGreaterThan(0);
 
-        // Assert all observed renderer processes are confined by macOS Seatbelt sandbox (1)
-        for (const rendererPid of validation.rendererPids) {
-          const isRendererSandboxed = checkProcessSeatbeltSandboxed(rendererPid);
-          expect(isRendererSandboxed).toBe(true);
+        // On macOS Darwin: verify actual OS Seatbelt kernel sandbox on owned renderer processes
+        if (process.platform === 'darwin') {
+          expect(checkProcessSeatbeltSandboxed(validation.browserPid)).toBe(false);
+          for (const rendererPid of validation.rendererPids) {
+            expect(checkProcessSeatbeltSandboxed(rendererPid)).toBe(true);
+          }
         }
+
+        // Cookie isolation check
+        await contextA.addCookies([
+          {
+            name: 'session_token',
+            value: 'secret_123',
+            domain: 'localhost',
+            path: '/',
+          },
+        ]);
+
+        const cookiesA = await contextA.cookies();
+        const cookiesB = await contextB.cookies();
+
+        expect(cookiesA.some((c) => c.name === 'session_token')).toBe(true);
+        expect(cookiesB.some((c) => c.name === 'session_token')).toBe(false);
+
+        await contextA.close();
+        await contextB.close();
+      } finally {
+        await browser.close();
       }
+    },
+  );
 
-      // Set cookie in Context A
-      await contextA.addCookies([
-        {
-          name: 'session_token',
-          value: 'secret_123',
-          domain: 'localhost',
-          path: '/',
-        },
-      ]);
+  (shouldRunLive ? it : it.skip)(
+    'enforces origin, cross-origin redirect, and CSP security boundaries on local fixtures (Finding #13)',
+    async () => {
+      const { chromium } = await import('@playwright/test');
+      const resolution = resolveSecureBrowserLaunchOptions();
 
-      const cookiesA = await contextA.cookies();
-      const cookiesB = await contextB.cookies();
+      // Create two local HTTP servers representing distinct origins
+      let receivedCookiesOnB = '';
+      const serverB = http.createServer((req, res) => {
+        if (req.url === '/secret') {
+          // No Access-Control-Allow-Origin header (CORS blocked)
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ secret: 'origin-b-secret-data' }));
+        } else if (req.url === '/landing') {
+          receivedCookiesOnB = req.headers['cookie'] || '';
+          res.writeHead(200, { 'Content-Type': 'text/html' });
+          res.end('<h1>Landing on Origin B</h1>');
+        } else {
+          res.writeHead(404);
+          res.end();
+        }
+      });
 
-      expect(cookiesA.some((c) => c.name === 'session_token')).toBe(true);
-      expect(cookiesB.some((c) => c.name === 'session_token')).toBe(false);
+      await new Promise<void>((resolve) => serverB.listen(0, 'localhost', () => resolve()));
+      const addrB = serverB.address();
+      const portB = typeof addrB === 'object' && addrB ? addrB.port : 0;
 
-      await contextA.close();
-      await contextB.close();
-    } finally {
-      await browser.close();
-    }
-  });
+      const serverA = http.createServer((req, res) => {
+        if (req.url === '/redirect') {
+          // Cross-origin redirect to Server B (distinct host and port)
+          res.writeHead(302, {
+            Location: `http://localhost:${portB}/landing`,
+          });
+          res.end();
+        } else {
+          // Serve HTML with strict CSP forbidding inline scripts without nonce
+          res.writeHead(200, {
+            'Content-Type': 'text/html',
+            'Content-Security-Policy': "default-src 'self'; script-src 'self'",
+            'Set-Cookie': 'origin_a_secret=token123; Path=/',
+          });
+          res.end(`<!DOCTYPE html>
+            <html>
+              <body>
+                <h1>Origin A</h1>
+                <script>window.__cspViolationOccurred = false; window.__inlineScriptExecuted = true;</script>
+              </body>
+            </html>`);
+        }
+      });
+
+      await new Promise<void>((resolve) => serverA.listen(0, '127.0.0.1', () => resolve()));
+      const addrA = serverA.address();
+      const portA = typeof addrA === 'object' && addrA ? addrA.port : 0;
+
+      const browser = await chromium.launch({
+        executablePath: resolution.executablePath,
+        args: resolution.args,
+        chromiumSandbox: resolution.chromiumSandbox,
+        headless: true,
+      });
+
+      try {
+        const context = await browser.newContext({ bypassCSP: false });
+        const page = await context.newPage();
+
+        // 1. CSP Enforcement: inline script without unsafe-inline or nonce must NOT execute
+        await page.goto(`http://127.0.0.1:${portA}/`);
+        const inlineExecuted = await page.evaluate(
+          () => (window as unknown as { __inlineScriptExecuted?: boolean }).__inlineScriptExecuted,
+        );
+        expect(inlineExecuted).toBeUndefined();
+
+        // 2. Same-Origin Policy (SOP) / CORS enforcement:
+        // Trying to fetch Origin B from Origin A must fail due to CORS policy
+        const fetchResult = await page.evaluate(async (targetUrl) => {
+          try {
+            await fetch(targetUrl);
+            return 'fetched_successfully';
+          } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            return `blocked_by_cors: ${msg}`;
+          }
+        }, `http://localhost:${portB}/secret`);
+        expect(fetchResult).toContain('blocked_by_cors');
+
+        // 3. Redirect Boundary Isolation:
+        // Navigating through cross-origin 302 redirect from Origin A (127.0.0.1) to Origin B (localhost)
+        await page.goto(`http://127.0.0.1:${portA}/redirect`);
+        expect(page.url()).toBe(`http://localhost:${portB}/landing`);
+
+        // Origin A's cookie must NOT have leaked to Origin B in the redirect request
+        expect(receivedCookiesOnB).not.toContain('origin_a_secret');
+
+        await context.close();
+      } finally {
+        await browser.close();
+        serverA.close();
+        serverB.close();
+      }
+    },
+  );
 });

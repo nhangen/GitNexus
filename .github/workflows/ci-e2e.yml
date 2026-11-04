@@ -40,8 +40,23 @@ jobs:
         run: npx playwright install --with-deps chrome
         working-directory: gitnexus-web
 
-      - name: Verify patched Google Chrome baseline
-        run: /usr/bin/google-chrome --version
+      - name: Verify patched Google Chrome meets security baseline (>= 156.0.8078.73)
+        run: |
+          VERSION=$(/usr/bin/google-chrome --version)
+          echo "Installed Chrome: $VERSION"
+          node -e "
+            const v = '$VERSION'.match(/([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)/)?.[1];
+            if (!v) { console.error('Cannot parse Chrome version from: $VERSION'); process.exit(1); }
+            const parts = v.split('.').map(Number);
+            const min = [156, 0, 8078, 73];
+            for (let i = 0; i < 4; i++) {
+              if (parts[i] > min[i]) process.exit(0);
+              if (parts[i] < min[i]) {
+                console.error('Installed Chrome ' + v + ' is below baseline 156.0.8078.73');
+                process.exit(1);
+              }
+            }
+          "
         working-directory: gitnexus-web
 
       - name: Install backend dependencies
