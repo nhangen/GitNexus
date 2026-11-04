@@ -8,6 +8,7 @@ const secureBrowser = resolveSecureBrowserLaunchOptions();
 
 export default defineConfig({
   testDir: './e2e',
+  globalSetup: './e2e/support/global-setup.ts',
   testIgnore: ['**/manual-record.spec.ts', '**/debug-issues.spec.ts'],
   timeout: 60_000,
   retries: process.env.CI ? 1 : 0,

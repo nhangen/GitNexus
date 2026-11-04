@@ -36,27 +36,50 @@ jobs:
 
       - uses: ./.github/actions/setup-gitnexus-web
 
-      - name: Install Google Chrome (patched baseline >= 156.0.8078.73)
-        run: npx playwright install --with-deps chrome
+      - name: Install browser system dependencies
+        run: npx playwright install-deps chrome
         working-directory: gitnexus-web
 
-      - name: Verify patched Google Chrome meets security baseline (>= 156.0.8078.73)
+      - name: Install pinned Chrome for Testing (156.0.8078.80) with verified integrity
         run: |
-          VERSION=$(/usr/bin/google-chrome --version)
-          echo "Installed Chrome: $VERSION"
-          node -e "
-            const v = '$VERSION'.match(/([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)/)?.[1];
-            if (!v) { console.error('Cannot parse Chrome version from: $VERSION'); process.exit(1); }
-            const parts = v.split('.').map(Number);
-            const min = [156, 0, 8078, 73];
-            for (let i = 0; i < 4; i++) {
-              if (parts[i] > min[i]) process.exit(0);
-              if (parts[i] < min[i]) {
-                console.error('Installed Chrome ' + v + ' is below baseline 156.0.8078.73');
-                process.exit(1);
-              }
-            }
-          "
+          CFT_VERSION="156.0.8078.80"
+          CFT_URL="https://storage.googleapis.com/chrome-for-testing-public/${CFT_VERSION}/linux64/chrome-linux64.zip"
+          EXPECTED_MD5="6a158ba7e01da016f1988bae0643d9e5"
+          EXPECTED_SIZE="201329937"
+          DEST_DIR="${RUNNER_TEMP}/chrome-for-testing"
+
+          mkdir -p "${DEST_DIR}"
+          cd "${DEST_DIR}"
+
+          echo "Downloading official Chrome for Testing ${CFT_VERSION}..."
+          curl -sSL --retry 3 --retry-delay 5 -o chrome-linux64.zip "${CFT_URL}"
+
+          # Verify exact archive file size
+          ACTUAL_SIZE=$(wc -c < chrome-linux64.zip | tr -d ' ')
+          if [ "${ACTUAL_SIZE}" != "${EXPECTED_SIZE}" ]; then
+            echo "::error::CfT archive size mismatch: expected ${EXPECTED_SIZE}, got ${ACTUAL_SIZE}"
+            exit 1
+          fi
+
+          # Verify exact published GCS MD5 hash
+          echo "${EXPECTED_MD5}  chrome-linux64.zip" | md5sum -c - || {
+            echo "::error::CfT archive MD5 checksum verification failed!"
+            exit 1
+          }
+
+          echo "Archive integrity verified. Extracting..."
+          unzip -q chrome-linux64.zip
+          chmod +x chrome-linux64/chrome
+
+          # Verify exact probed executable version
+          PROBED_VERSION=$(./chrome-linux64/chrome --version)
+          echo "Probed executable: ${PROBED_VERSION}"
+          case "${PROBED_VERSION}" in
+            *"${CFT_VERSION}"*) echo "Version verified: matches pinned ${CFT_VERSION}" ;;
+            *) echo "::error::Executable version '${PROBED_VERSION}' does not match pinned ${CFT_VERSION}"; exit 1 ;;
+          esac
+
+          echo "CHROME_BIN=${DEST_DIR}/chrome-linux64/chrome" >> "$GITHUB_ENV"
         working-directory: gitnexus-web
 
       - name: Install backend dependencies
@@ -101,7 +124,7 @@ jobs:
         working-directory: gitnexus-web
         env:
           E2E: '1'
-          CHROME_BIN: /usr/bin/google-chrome
+          CHROME_BIN: ${{ env.CHROME_BIN }}
 
       - name: Upload test results
         if: always()

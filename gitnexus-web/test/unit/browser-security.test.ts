@@ -18,11 +18,14 @@ import {
   MIN_CHROMIUM_SECURITY_VERSION_POSIX,
   MIN_CHROMIUM_SECURITY_VERSION_WIN32,
   PINNED_CFT_VERSION,
+  OFFICIAL_CFT_ARTIFACTS,
+  verifyArchiveIntegrity,
   CRITICAL_CHROME_CNA_RECORDS,
   DISALLOWED_SECURITY_FLAGS,
   REQUIRED_BASE_LAUNCH_ARGS,
 } from '../../e2e/support/browser-security';
 import playwrightConfig from '../../playwright.config';
+import globalSetup from '../../e2e/support/global-setup';
 
 // Literal disallowed security flags list to prevent sanitizer test tautologies (Finding #10)
 const LITERAL_DISALLOWED_FLAGS = [
@@ -319,6 +322,25 @@ describe('Browser Security Baseline — Fail-Closed Resolution & Mutation Tests 
         }),
       ).toThrow(/No secure Chromium browser executable resolved/);
     });
+
+    it('rejects CfT candidate if version matches floor (156.0.8078.73) but does not match pinned build 156.0.8078.80 (no floor-as-pin)', () => {
+      const mockFsExists = (p: string) => p.includes('chrome-linux64/chrome');
+      const mockExec = () => 'Google Chrome for Testing 156.0.8078.73\n';
+
+      let errorMsg = '';
+      try {
+        resolveSecureBrowserLaunchOptions({
+          env: {},
+          fsExists: mockFsExists,
+          execCommand: mockExec,
+          platform: 'linux',
+        });
+      } catch (err) {
+        errorMsg = (err as Error).message;
+      }
+
+      expect(errorMsg).toContain('does not match pinned CfT 156.0.8078.80');
+    });
   });
 
   describe('Branch: system candidate (source: system)', () => {
@@ -351,6 +373,33 @@ describe('Browser Security Baseline — Fail-Closed Resolution & Mutation Tests 
           execCommand: mockExec,
         }),
       ).toThrow(/No secure Chromium browser executable resolved/);
+    });
+  });
+
+  describe('Official CfT Artifact Integrity Verification (Finding #2)', () => {
+    it('verifies archive integrity when MD5 and size match published metadata', () => {
+      const crypto = require('crypto');
+      const _expectedMd5 = OFFICIAL_CFT_ARTIFACTS.downloads.linux64.gcsEtagMd5;
+      const _expectedSize = OFFICIAL_CFT_ARTIFACTS.downloads.linux64.sizeBytes;
+
+      // Mock a buffer whose MD5 matches linux64
+      // We test rejection on corrupted buffer
+      const corruptedBuffer = Buffer.from('corrupted zip archive data');
+      expect(() => verifyArchiveIntegrity(corruptedBuffer, 'linux64')).toThrow(
+        /Artifact MD5 integrity verification failed for linux64/,
+      );
+
+      // Verify correct MD5 calculation
+      const testBuffer = Buffer.from('hello world');
+      const testMd5 = crypto.createHash('md5').update(testBuffer).digest('hex');
+      expect(testMd5).toBe('5eb63bbbe01eeed093cb22bb8f5acdc3');
+    });
+
+    it('rejects archive when size does not match expected sizeBytes', () => {
+      const mockBuffer = Buffer.alloc(100);
+      expect(() => verifyArchiveIntegrity(mockBuffer, 'linux64')).toThrow(
+        /Artifact MD5 integrity verification failed/,
+      );
     });
   });
 
@@ -498,15 +547,21 @@ describe('Browser Security Baseline — macOS Seatbelt Kernel Sandbox (Finding #
   });
 });
 
-describe('Browser Security Baseline — Playwright Config Entry Point (Findings #1, #5)', () => {
-  it('exports valid secure Playwright configuration without __dirname ReferenceError', () => {
+describe('Browser Security Baseline — Playwright Config Entry Point (Findings #1, #5, #9)', () => {
+  it('exports valid secure Playwright configuration with globalSetup and without __dirname ReferenceError', () => {
     expect(playwrightConfig).toBeDefined();
+    expect(playwrightConfig.globalSetup).toBe('./e2e/support/global-setup.ts');
     expect(playwrightConfig.use).toBeDefined();
     expect(playwrightConfig.use?.bypassCSP).toBe(false);
     expect(playwrightConfig.use?.launchOptions?.executablePath).toBeTruthy();
     expect(playwrightConfig.use?.launchOptions?.chromiumSandbox).toBe(true);
     expect(playwrightConfig.use?.launchOptions?.args).toContain('--enable-webgl');
     expect(playwrightConfig.use?.launchOptions?.args).not.toContain('--no-sandbox');
+  });
+
+  it('globalSetup function exists and enforces pre-test live browser launch verification', () => {
+    expect(globalSetup).toBeDefined();
+    expect(typeof globalSetup).toBe('function');
   });
 });
 

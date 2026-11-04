@@ -1,4 +1,5 @@
 import { execFileSync } from 'child_process';
+import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { fileURLToPath } from 'url';
@@ -55,11 +56,13 @@ export const OFFICIAL_CFT_ARTIFACTS = {
     linux64: {
       url: 'https://storage.googleapis.com/chrome-for-testing-public/156.0.8078.80/linux64/chrome-linux64.zip',
       gcsEtagMd5: '6a158ba7e01da016f1988bae0643d9e5',
+      sizeBytes: 201329937,
       executableSubpath: 'chrome-linux64/chrome',
     },
     'mac-arm64': {
       url: 'https://storage.googleapis.com/chrome-for-testing-public/156.0.8078.80/mac-arm64/chrome-mac-arm64.zip',
       gcsEtagMd5: '3b89133432e118660a79f59d3141cc09',
+      sizeBytes: 195027080,
       executableSubpath:
         'chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing',
     },
@@ -76,6 +79,44 @@ export const OFFICIAL_CFT_ARTIFACTS = {
     },
   },
 } as const;
+
+export interface ArtifactVerificationResult {
+  valid: boolean;
+  platformKey: 'linux64' | 'mac-arm64' | 'mac-x64' | 'win64';
+  expectedMd5: string;
+  actualMd5: string;
+  expectedSize?: number;
+  actualSize: number;
+}
+
+/**
+ * Verify downloaded archive integrity against official published Google Cloud Storage metadata.
+ */
+export function verifyArchiveIntegrity(
+  archiveBuffer: Buffer,
+  platformKey: 'linux64' | 'mac-arm64' | 'mac-x64' | 'win64',
+): ArtifactVerificationResult {
+  const meta = OFFICIAL_CFT_ARTIFACTS.downloads[platformKey];
+  const hash = crypto.createHash('md5').update(archiveBuffer).digest('hex');
+  if (hash !== meta.gcsEtagMd5) {
+    throw new Error(
+      `Artifact MD5 integrity verification failed for ${platformKey}: expected ${meta.gcsEtagMd5}, got ${hash}. Untrusted or corrupted archive rejected.`,
+    );
+  }
+  if ('sizeBytes' in meta && meta.sizeBytes && archiveBuffer.length !== meta.sizeBytes) {
+    throw new Error(
+      `Artifact size verification failed for ${platformKey}: expected ${meta.sizeBytes} bytes, got ${archiveBuffer.length} bytes. Incomplete archive rejected.`,
+    );
+  }
+  return {
+    valid: true,
+    platformKey,
+    expectedMd5: meta.gcsEtagMd5,
+    actualMd5: hash,
+    expectedSize: 'sizeBytes' in meta ? meta.sizeBytes : undefined,
+    actualSize: archiveBuffer.length,
+  };
+}
 
 /**
  * Dangerous security flags that disable origin isolation, sandboxing, or CSP.
@@ -639,7 +680,7 @@ export function resolveSecureBrowserLaunchOptions(
     if (fsExists(candidate)) {
       try {
         const version = probeBrowserVersion(candidate, execCommand);
-        if (isSecureChromiumVersion(version, baseline)) {
+        if (compareChromiumVersions(version, PINNED_CFT_VERSION) === 0) {
           return {
             executablePath: candidate,
             version,
@@ -648,7 +689,9 @@ export function resolveSecureBrowserLaunchOptions(
             chromiumSandbox: true,
           };
         } else {
-          rejectionReasons.push(`[cft ${candidate}]: version ${version} < ${baseline}`);
+          rejectionReasons.push(
+            `[cft ${candidate}]: version ${version} does not match pinned CfT ${PINNED_CFT_VERSION}`,
+          );
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
