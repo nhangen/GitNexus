@@ -1,9 +1,8 @@
 import { defineConfig } from '@playwright/test';
 import { resolveSecureBrowserLaunchOptions } from './e2e/support/browser-security';
 
-// Resolve patched Chromium browser baseline (>= 156.0.8078.73) with enforced
-// sandboxing, profile isolation, and verified executable.
-// Fails closed if the executable is missing, wrong, unverified, or below baseline.
+// Resolves an explicit Chromium executable at or above the advisory floor and fails closed
+// otherwise; Playwright's bundled Chromium is never used. See e2e/support/browser-security.ts.
 const secureBrowser = resolveSecureBrowserLaunchOptions();
 
 export default defineConfig({
@@ -15,14 +14,14 @@ export default defineConfig({
   use: {
     baseURL: 'http://localhost:5173',
     trace: 'retain-on-failure',
-    screenshot: 'retain-on-failure',
+    screenshot: 'only-on-failure',
     video: 'retain-on-failure',
     launchOptions: {
       executablePath: secureBrowser.executablePath,
       args: secureBrowser.args,
       chromiumSandbox: secureBrowser.chromiumSandbox,
     },
-    // Enforce strict CSP; bypass is forbidden to preserve origin boundaries.
+    // Page CSP stays enforced; bypassing it would weaken origin boundaries under test.
     bypassCSP: false,
   },
   projects: [

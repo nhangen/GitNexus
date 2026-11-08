@@ -21,6 +21,8 @@ jobs:
           filters: |
             web:
               - 'gitnexus-web/**'
+              - '.github/workflows/ci-e2e.yml'
+              - '.github/actions/setup-gitnexus-web/**'
 
   e2e:
     name: e2e (chrome)
@@ -36,11 +38,18 @@ jobs:
 
       - uses: ./.github/actions/setup-gitnexus-web
 
+      # The `chromium` target installs Chromium's shared-library packages from the distro's
+      # apt repositories without downloading a browser; `chrome` only installs the tools group.
       - name: Install browser system dependencies
-        run: npx playwright install-deps chrome
+        run: npx playwright install-deps chromium
         working-directory: gitnexus-web
 
-      - name: Install pinned Chrome for Testing (156.0.8078.80) with verified integrity
+      # EXPECTED_MD5/EXPECTED_SIZE are the GCS object metadata (md5Hash, size) of the archive
+      # below, recorded when the pin was chosen. They detect a changed or truncated download;
+      # they are storage metadata, not a publisher signature. Re-read them from
+      # https://storage.googleapis.com/storage/v1/b/chrome-for-testing-public/o/<version>%2Flinux64%2Fchrome-linux64.zip
+      # when bumping CFT_VERSION (PINNED_CFT_VERSION in gitnexus-web/e2e/support/browser-security.ts).
+      - name: Install pinned Chrome for Testing (GCS object size/MD5 check, not a signature)
         run: |
           CFT_VERSION="156.0.8078.80"
           CFT_URL="https://storage.googleapis.com/chrome-for-testing-public/${CFT_VERSION}/linux64/chrome-linux64.zip"
@@ -52,7 +61,8 @@ jobs:
           cd "${DEST_DIR}"
 
           echo "Downloading official Chrome for Testing ${CFT_VERSION}..."
-          curl -sSL --retry 3 --retry-delay 5 -o chrome-linux64.zip "${CFT_URL}"
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            --retry 3 --retry-delay 5 -o chrome-linux64.zip "${CFT_URL}"
 
           # Verify exact archive file size
           ACTUAL_SIZE=$(wc -c < chrome-linux64.zip | tr -d ' ')
@@ -61,26 +71,39 @@ jobs:
             exit 1
           fi
 
-          # Verify exact published GCS MD5 hash
           echo "${EXPECTED_MD5}  chrome-linux64.zip" | md5sum -c - || {
-            echo "::error::CfT archive MD5 checksum verification failed!"
+            echo "::error::CfT archive MD5 does not match recorded GCS object metadata"
             exit 1
           }
 
-          echo "Archive integrity verified. Extracting..."
+          echo "Archive matches recorded GCS object size and MD5. Extracting..."
           unzip -q chrome-linux64.zip
           chmod +x chrome-linux64/chrome
 
-          # Verify exact probed executable version
-          PROBED_VERSION=$(./chrome-linux64/chrome --version)
-          echo "Probed executable: ${PROBED_VERSION}"
-          case "${PROBED_VERSION}" in
-            *"${CFT_VERSION}"*) echo "Version verified: matches pinned ${CFT_VERSION}" ;;
-            *) echo "::error::Executable version '${PROBED_VERSION}' does not match pinned ${CFT_VERSION}"; exit 1 ;;
-          esac
+          PROBED_OUTPUT=$(./chrome-linux64/chrome --version | tr -d '\r' | sed -e 's/[[:space:]]*$//')
+          echo "Probed executable: ${PROBED_OUTPUT}"
+          if [ "${PROBED_OUTPUT}" != "Google Chrome for Testing ${CFT_VERSION}" ]; then
+            echo "::error::Executable reports '${PROBED_OUTPUT}', expected 'Google Chrome for Testing ${CFT_VERSION}'"
+            exit 1
+          fi
 
           echo "CHROME_BIN=${DEST_DIR}/chrome-linux64/chrome" >> "$GITHUB_ENV"
+          echo "GITNEXUS_EXPECTED_CHROME_VERSION=${CFT_VERSION}" >> "$GITHUB_ENV"
         working-directory: gitnexus-web
+
+      # Launches the pinned build with chromiumSandbox: true and checks the live process tree,
+      # the kernel sandbox state of its renderers (/proc Seccomp and namespaces on Linux), and
+      # that the configured context enforces CSP and CORS. The results check fails unless every
+      # live test actually ran and passed; a skipped or excluded test file exits 0 otherwise.
+      - name: Verify live browser sandbox, CSP and CORS
+        run: |
+          npx vitest run test/unit/browser-security.test.ts --reporter=default --reporter=json --outputFile.json="${RUNNER_TEMP}/live-browser-results.json"
+          node e2e/support/assert-live-results.mjs "${RUNNER_TEMP}/live-browser-results.json"
+        working-directory: gitnexus-web
+        env:
+          RUN_LIVE_BROWSER_TESTS: '1'
+          CHROME_BIN: ${{ env.CHROME_BIN }}
+          GITNEXUS_EXPECTED_CHROME_VERSION: ${{ env.GITNEXUS_EXPECTED_CHROME_VERSION }}
 
       - name: Install backend dependencies
         run: npm ci
@@ -125,6 +148,7 @@ jobs:
         env:
           E2E: '1'
           CHROME_BIN: ${{ env.CHROME_BIN }}
+          GITNEXUS_EXPECTED_CHROME_VERSION: ${{ env.GITNEXUS_EXPECTED_CHROME_VERSION }}
 
       - name: Upload test results
         if: always()

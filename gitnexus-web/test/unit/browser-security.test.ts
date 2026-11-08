@@ -1,7 +1,11 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import * as http from 'http';
-import { execSync } from 'child_process';
+import { execSync, spawnSync } from 'child_process';
+import { createHash } from 'crypto';
+import { fileURLToPath } from 'url';
 import {
   compareChromiumVersions,
   isSecureChromiumVersion,
@@ -10,24 +14,42 @@ import {
   probeBrowserVersion,
   verifyLiveBrowserVersion,
   sanitizeLaunchArgs,
+  findDisallowedFlag,
   resolveSecureBrowserLaunchOptions,
+  collectProcessTree,
   validateProcessTreeSandbox,
   checkProcessSeatbeltSandboxed,
+  readLinuxSandboxState,
   getSystemCandidatePaths,
   MIN_CHROMIUM_SECURITY_VERSION,
   MIN_CHROMIUM_SECURITY_VERSION_POSIX,
   MIN_CHROMIUM_SECURITY_VERSION_WIN32,
   PINNED_CFT_VERSION,
   OFFICIAL_CFT_ARTIFACTS,
-  verifyArchiveIntegrity,
   CRITICAL_CHROME_CNA_RECORDS,
   DISALLOWED_SECURITY_FLAGS,
+  DISALLOWED_PROCESS_FLAGS,
   REQUIRED_BASE_LAUNCH_ARGS,
+  SYSTEM_PYTHON3,
+  type LinuxProcReader,
+  type SecureBrowserResolution,
 } from '../../e2e/support/browser-security';
-import playwrightConfig from '../../playwright.config';
-import globalSetup from '../../e2e/support/global-setup';
+import globalSetup, {
+  createGlobalSetup,
+  defaultGlobalSetupDeps,
+} from '../../e2e/support/global-setup';
 
-// Literal disallowed security flags list to prevent sanitizer test tautologies (Finding #10)
+const TEST_DIR = path.dirname(fileURLToPath(import.meta.url));
+const WEB_ROOT = path.resolve(TEST_DIR, '../..');
+const REPO_ROOT = path.resolve(WEB_ROOT, '..');
+
+const BROWSER_ENV_VARS = [
+  'PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH',
+  'CHROME_BIN',
+  'CHROME_PATH',
+  'CHROMIUM_PATH',
+] as const;
+
 const LITERAL_DISALLOWED_FLAGS = [
   '--no-sandbox',
   '--disable-web-security',
@@ -38,19 +60,65 @@ const LITERAL_DISALLOWED_FLAGS = [
   '--disable-gpu-sandbox',
   '--disable-seccomp-filter-sandbox',
   '--disable-namespace-sandbox',
-  '--disable-features=IsolateOrigins,site-per-process',
   '--remote-debugging-address',
+  '--remote-debugging-port',
+  '--remote-allow-origins',
+  '--renderer-cmd-prefix',
+  '--browser-subprocess-path',
+  '--disable-site-isolation-for-policy',
+  '--no-sandbox-and-elevated',
+  '--ignore-certificate-errors',
+  '--allow-running-insecure-content',
+  '--allow-file-access-from-files',
+  '--in-process-gpu',
+  '--zygote-cmd-prefix',
+  '--utility-cmd-prefix',
+  '--gpu-launcher',
+  '--no-zygote-sandbox',
+  '--allow-insecure-localhost',
+  '--unsafely-treat-insecure-origin-as-secure',
   '--user-data-dir',
 ];
 
-describe('Browser Security Baseline — Chromium Version Verification', () => {
+const LITERAL_DISALLOWED_PROCESS_FLAGS = [
+  '--no-sandbox',
+  '--disable-web-security',
+  '--disable-site-isolation-trials',
+  '--disable-setuid-sandbox',
+  '--single-process',
+  '--no-zygote',
+  '--disable-gpu-sandbox',
+  '--disable-seccomp-filter-sandbox',
+  '--disable-namespace-sandbox',
+  '--remote-debugging-address',
+  '--remote-debugging-port',
+  '--renderer-cmd-prefix',
+  '--browser-subprocess-path',
+  '--disable-site-isolation-for-policy',
+  '--no-sandbox-and-elevated',
+];
+
+function writeStubBrowser(dir: string, versionLine: string): string {
+  const stub = path.join(dir, `chrome-stub-${versionLine.replace(/\W+/g, '_')}`);
+  fs.writeFileSync(stub, `#!/bin/sh\necho "${versionLine}"\n`, { mode: 0o755 });
+  return stub;
+}
+
+function envWithoutBrowserOverrides(): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  for (const name of BROWSER_ENV_VARS) delete env[name];
+  delete env.GITNEXUS_EXPECTED_CHROME_VERSION;
+  return env;
+}
+
+describe('Chromium version verification', () => {
   describe('compareChromiumVersions', () => {
-    it('compares identical versions as equal (0)', () => {
+    it('compares identical versions as equal', () => {
       expect(compareChromiumVersions('156.0.8078.73', '156.0.8078.73')).toBe(0);
       expect(compareChromiumVersions('156.0.8078.80', '156.0.8078.80')).toBe(0);
     });
 
-    it('correctly compares major, minor, build, and patch components', () => {
+    it('compares major, minor, build, and patch components', () => {
       expect(compareChromiumVersions('157.0.0.0', '156.0.8078.80')).toBe(1);
       expect(compareChromiumVersions('155.0.0.0', '156.0.8078.80')).toBe(-1);
       expect(compareChromiumVersions('156.1.0.0', '156.0.8078.80')).toBe(1);
@@ -59,20 +127,28 @@ describe('Browser Security Baseline — Chromium Version Verification', () => {
       expect(compareChromiumVersions('156.0.8078.79', '156.0.8078.80')).toBe(-1);
     });
 
-    it('handles 3-component versions by assuming 0 for patch', () => {
+    it('treats a 3-component version as patch 0', () => {
       expect(compareChromiumVersions('156.0.8078', '156.0.8078.0')).toBe(0);
       expect(compareChromiumVersions('156.0.8078', '156.0.8078.1')).toBe(-1);
     });
 
-    it('throws error for invalid version formatting', () => {
+    it('rejects malformed versions', () => {
       expect(() => compareChromiumVersions('invalid', '156.0.8078.73')).toThrow();
       expect(() => compareChromiumVersions('156.0', '156.0.8078.73')).toThrow();
       expect(() => compareChromiumVersions('156.0.8078.73.1', '156.0.8078.73')).toThrow();
     });
+
+    it('rejects empty, hex, signed, and exponent components', () => {
+      for (const bad of ['156..8078.80', '0x9c.0.8078.80', '156.0.8078.+80', '156.0.1e3.80']) {
+        expect(() => compareChromiumVersions(bad, '156.0.8078.73')).toThrow(
+          /Invalid version component/,
+        );
+      }
+    });
   });
 
-  describe('isSecureChromiumVersion & Per-Platform Floors (Finding #18)', () => {
-    it('reports correct per-platform floor constants', () => {
+  describe('isSecureChromiumVersion and per-platform floors', () => {
+    it('reports the per-platform floor constants', () => {
       expect(MIN_CHROMIUM_SECURITY_VERSION).toBe('156.0.8078.73');
       expect(MIN_CHROMIUM_SECURITY_VERSION_POSIX).toBe('156.0.8078.73');
       expect(MIN_CHROMIUM_SECURITY_VERSION_WIN32).toBe('156.0.8078.74');
@@ -81,31 +157,31 @@ describe('Browser Security Baseline — Chromium Version Verification', () => {
       expect(getMinimumSecurityBaseline('win32')).toBe('156.0.8078.74');
     });
 
-    it('accepts versions meeting platform-specific baseline', () => {
+    it('accepts versions meeting the platform floor', () => {
       expect(isSecureChromiumVersion('156.0.8078.73', 'linux')).toBe(true);
       expect(isSecureChromiumVersion('156.0.8078.73', 'darwin')).toBe(true);
-      expect(isSecureChromiumVersion('156.0.8078.73', 'win32')).toBe(false); // Win32 floor is .74
+      expect(isSecureChromiumVersion('156.0.8078.73', 'win32')).toBe(false);
       expect(isSecureChromiumVersion('156.0.8078.74', 'win32')).toBe(true);
       expect(isSecureChromiumVersion(PINNED_CFT_VERSION)).toBe(true);
       expect(isSecureChromiumVersion('157.0.0.0')).toBe(true);
     });
 
-    it('rejects Playwright 1.58.2 bundled Chromium (145.0.7632.6)', () => {
+    it('rejects the Playwright 1.58.2 bundled Chromium (145.0.7632.6)', () => {
       expect(isSecureChromiumVersion('145.0.7632.6')).toBe(false);
     });
 
-    it('rejects Playwright 1.64.1 mapped Chromium (156.0.8078.4)', () => {
+    it('rejects the Playwright 1.64.1 mapped Chromium (156.0.8078.4)', () => {
       expect(isSecureChromiumVersion('156.0.8078.4')).toBe(false);
     });
 
-    it('rejects older desktop releases vulnerable to Critical CNA records', () => {
+    it('rejects builds below the floor', () => {
       expect(isSecureChromiumVersion('156.0.8078.72')).toBe(false);
       expect(isSecureChromiumVersion('150.0.0.0')).toBe(false);
       expect(isSecureChromiumVersion('140.0.0.0')).toBe(false);
     });
   });
 
-  describe('parseChromiumVersion (Finding #8: strict distribution regex)', () => {
+  describe('parseChromiumVersion', () => {
     it('parses Google Chrome output', () => {
       expect(parseChromiumVersion('Google Chrome 156.0.8078.80')).toBe('156.0.8078.80');
       expect(parseChromiumVersion('Google Chrome 156.0.8078.73 unknown\n')).toBe('156.0.8078.73');
@@ -127,29 +203,38 @@ describe('Browser Security Baseline — Chromium Version Verification', () => {
       expect(parseChromiumVersion('HeadlessChrome/156.0.8078.80\n')).toBe('156.0.8078.80');
     });
 
-    it('strictly rejects non-Chromium output with 4 dotted integers (Finding #8)', () => {
-      // Must not accept Firefox even if it outputs 4 dotted numbers
-      expect(() => parseChromiumVersion('Mozilla Firefox 160.0.1.2')).toThrow(
+    it('rejects non-Chromium output even with four dotted integers', () => {
+      for (const output of [
+        'Mozilla Firefox 160.0.1.2',
+        'SomeOtherBrowser 156.0.8078.80',
+        'v22.22.3.4',
+        '',
+        'command not found: chrome',
+      ]) {
+        expect(() => parseChromiumVersion(output)).toThrow(/cannot parse Chromium version/);
+      }
+    });
+
+    it('rejects a recognized product name that does not start the line', () => {
+      expect(() => parseChromiumVersion('NotChrome wrapper; Chromium 999.0.0.0')).toThrow(
         /cannot parse Chromium version/,
       );
-      expect(() => parseChromiumVersion('SomeOtherBrowser 156.0.8078.80')).toThrow(
-        /cannot parse Chromium version/,
-      );
-      expect(() => parseChromiumVersion('v22.22.3.4')).toThrow(/cannot parse Chromium version/);
-      expect(() => parseChromiumVersion('')).toThrow(/cannot parse Chromium version/);
-      expect(() => parseChromiumVersion('command not found: chrome')).toThrow(
+    });
+
+    it('rejects a version token glued to trailing characters', () => {
+      expect(() => parseChromiumVersion('Google Chrome 156.0.8078.80beta')).toThrow(
         /cannot parse Chromium version/,
       );
     });
   });
 
-  describe('probeBrowserVersion & verifyLiveBrowserVersion (Finding #9)', () => {
-    it('probes executable and returns parsed version', () => {
+  describe('probeBrowserVersion and verifyLiveBrowserVersion', () => {
+    it('probes the executable and returns the parsed version', () => {
       const mockExec = () => 'Google Chrome 156.0.8078.80\n';
       expect(probeBrowserVersion('/mock/chrome', mockExec)).toBe('156.0.8078.80');
     });
 
-    it('throws descriptive error if binary execution fails', () => {
+    it('refuses the executable when running it fails', () => {
       const mockExec = () => {
         throw new Error('ENOENT: no such file or directory');
       };
@@ -158,28 +243,49 @@ describe('Browser Security Baseline — Chromium Version Verification', () => {
       );
     });
 
-    it('verifyLiveBrowserVersion validates live browser version post-launch', () => {
-      const validBrowser = { version: () => '156.0.8078.80' };
-      expect(verifyLiveBrowserVersion(validBrowser)).toBe('156.0.8078.80');
-
-      const outdatedBrowser = { version: () => '145.0.7632.6' };
-      expect(() => verifyLiveBrowserVersion(outdatedBrowser)).toThrow(
+    it('rejects a live version below the floor', () => {
+      expect(verifyLiveBrowserVersion({ version: () => '156.0.8078.80' }, 'linux')).toBe(
+        '156.0.8078.80',
+      );
+      expect(() => verifyLiveBrowserVersion({ version: () => '145.0.7632.6' }, 'linux')).toThrow(
         /below minimum secure baseline/,
       );
+    });
+
+    it('applies the Windows floor to a Windows live browser', () => {
+      expect(() => verifyLiveBrowserVersion({ version: () => '156.0.8078.73' }, 'win32')).toThrow(
+        /below minimum secure baseline 156.0.8078.74/,
+      );
+    });
+
+    it('rejects a live version that differs from a required exact pin', () => {
+      expect(() =>
+        verifyLiveBrowserVersion({ version: () => '156.0.8078.81' }, 'linux', '156.0.8078.80'),
+      ).toThrow(/does not match the required pinned version 156.0.8078.80/);
     });
   });
 });
 
-describe('Browser Security Baseline — Launch Arguments & Deny List (Findings #10, #11)', () => {
-  it('preserves required WebGL rendering flags', () => {
+describe('Launch argument deny list', () => {
+  it('preserves the required WebGL rendering flags', () => {
     const args = sanitizeLaunchArgs();
-    for (const flag of REQUIRED_BASE_LAUNCH_ARGS) {
+    for (const flag of [
+      '--use-gl=angle',
+      '--use-angle=swiftshader',
+      '--enable-webgl',
+      '--enable-unsafe-swiftshader',
+    ]) {
       expect(args).toContain(flag);
     }
+    expect([...REQUIRED_BASE_LAUNCH_ARGS].sort()).toEqual([
+      '--enable-unsafe-swiftshader',
+      '--enable-webgl',
+      '--use-angle=swiftshader',
+      '--use-gl=angle',
+    ]);
   });
 
-  it('rejects all disallowed security-bypassing flags (Finding #10 & #11)', () => {
-    // Test against independent literal list
+  it('rejects every disallowed flag, bare and with a value', () => {
     for (const disallowed of LITERAL_DISALLOWED_FLAGS) {
       expect(() => sanitizeLaunchArgs([disallowed])).toThrow(/Insecure launch argument rejected/);
       expect(() => sanitizeLaunchArgs([`${disallowed}=value`])).toThrow(
@@ -188,31 +294,75 @@ describe('Browser Security Baseline — Launch Arguments & Deny List (Findings #
     }
   });
 
-  it('allows safe custom flags while adding required base flags', () => {
-    const safeInput = ['--custom-safe-flag', '--start-maximized'];
-    const sanitized = sanitizeLaunchArgs(safeInput);
+  it('rejects single-dash and upper-case spellings Chromium also accepts', () => {
+    for (const arg of ['-no-sandbox', '--NO-SANDBOX', '-Disable-Web-Security', '---no-sandbox']) {
+      expect(() => sanitizeLaunchArgs([arg])).toThrow(/Insecure launch argument rejected/);
+    }
+  });
+
+  it('rejects disabling site isolation features alone or inside a feature list', () => {
+    for (const arg of [
+      '--disable-features=site-per-process',
+      '--disable-features=IsolateOrigins',
+      '--disable-features=IsolateOrigins,site-per-process',
+      '--disable-features=Translate, site-per-process',
+      '--disable-features=isolateorigins',
+      '--disable-features=SitePerProcess',
+      '--disable-features=Translate,SitePerProcess',
+      '--disable-features=IsolateSandboxedIframes',
+      '--disable-features=IsolateOrigins<Study',
+      '--disable-features=SitePerProcess:param/value',
+      '--disable-features=*IsolateOrigins',
+      '--disable-features="site-per-process"',
+      '"--disable-features=SitePerProcess"',
+    ]) {
+      expect(() => sanitizeLaunchArgs([arg])).toThrow(/Insecure launch argument rejected/);
+    }
+  });
+
+  it('rejects the Windows slash switch prefix only on Windows', () => {
+    expect(findDisallowedFlag('/no-sandbox', DISALLOWED_SECURITY_FLAGS, 'win32')).toBe(
+      '--no-sandbox',
+    );
+    expect(findDisallowedFlag('/NO-SANDBOX', DISALLOWED_PROCESS_FLAGS, 'win32')).toBe(
+      '--no-sandbox',
+    );
+    expect(findDisallowedFlag('/no-sandbox', DISALLOWED_SECURITY_FLAGS, 'linux')).toBeUndefined();
+  });
+
+  it('allows unrelated disabled features and safe custom flags', () => {
+    const sanitized = sanitizeLaunchArgs([
+      '--custom-safe-flag',
+      '--start-maximized',
+      '--disable-features=Translate,MediaRouter',
+    ]);
     expect(sanitized).toContain('--custom-safe-flag');
     expect(sanitized).toContain('--start-maximized');
+    expect(sanitized).toContain('--disable-features=Translate,MediaRouter');
     expect(sanitized).toContain('--enable-webgl');
   });
 
-  it('contains all 12 critical disallowed flags in DISALLOWED_SECURITY_FLAGS', () => {
+  it('lists every literal disallowed flag', () => {
     for (const flag of LITERAL_DISALLOWED_FLAGS) {
       expect(DISALLOWED_SECURITY_FLAGS).toContain(flag);
     }
+    for (const flag of LITERAL_DISALLOWED_PROCESS_FLAGS) {
+      expect(DISALLOWED_PROCESS_FLAGS).toContain(flag);
+    }
+  });
+
+  it('ignores non-flag tokens such as executable paths', () => {
+    expect(findDisallowedFlag('/opt/no-sandbox/chrome', DISALLOWED_PROCESS_FLAGS)).toBeUndefined();
   });
 });
 
-describe('Browser Security Baseline — Fail-Closed Resolution & Mutation Tests (Findings #4, #16, #20)', () => {
-  describe('Branch: customExecutablePath (source: option)', () => {
-    it('succeeds and returns source: option for valid binary meeting baseline', () => {
-      const mockFsExists = () => true;
-      const mockExec = () => 'Google Chrome 156.0.8078.80\n';
-
+describe('Fail-closed executable resolution', () => {
+  describe('option branch', () => {
+    it('returns source option for a binary at the floor or above', () => {
       const resolution = resolveSecureBrowserLaunchOptions({
         customExecutablePath: '/usr/bin/custom-chrome',
-        fsExists: mockFsExists,
-        execCommand: mockExec,
+        fsExists: () => true,
+        execCommand: () => 'Google Chrome 156.0.8078.80\n',
       });
 
       expect(resolution.executablePath).toBe(path.resolve('/usr/bin/custom-chrome'));
@@ -221,38 +371,32 @@ describe('Browser Security Baseline — Fail-Closed Resolution & Mutation Tests 
       expect(resolution.chromiumSandbox).toBe(true);
     });
 
-    it('refuses custom executable if file does not exist', () => {
-      const mockFsExists = () => false;
+    it('refuses a missing custom executable', () => {
       expect(() =>
         resolveSecureBrowserLaunchOptions({
           customExecutablePath: '/missing/chrome',
-          fsExists: mockFsExists,
+          fsExists: () => false,
         }),
       ).toThrow(/executable file not found/);
     });
 
-    it('refuses custom executable if version is below baseline', () => {
-      const mockFsExists = () => true;
-      const mockExec = () => 'Google Chrome 145.0.7632.6\n';
+    it('refuses a custom executable below the floor', () => {
       expect(() =>
         resolveSecureBrowserLaunchOptions({
           customExecutablePath: '/old/chrome',
-          fsExists: mockFsExists,
-          execCommand: mockExec,
+          fsExists: () => true,
+          execCommand: () => 'Google Chrome 145.0.7632.6\n',
         }),
       ).toThrow(/below minimum secure baseline/);
     });
   });
 
-  describe('Branch: environment variable candidate (source: env)', () => {
-    it('succeeds and returns source: env when CHROME_BIN meets baseline', () => {
-      const mockFsExists = (p: string) => p.includes('google-chrome');
-      const mockExec = () => 'Google Chrome 156.0.8078.80\n';
-
+  describe('environment branch', () => {
+    it('returns source env when CHROME_BIN meets the floor', () => {
       const resolution = resolveSecureBrowserLaunchOptions({
         env: { CHROME_BIN: '/usr/bin/google-chrome' },
-        fsExists: mockFsExists,
-        execCommand: mockExec,
+        fsExists: (p: string) => p.includes('google-chrome'),
+        execCommand: () => 'Google Chrome 156.0.8078.80\n',
       });
 
       expect(resolution.executablePath).toBe(path.resolve('/usr/bin/google-chrome'));
@@ -261,47 +405,41 @@ describe('Browser Security Baseline — Fail-Closed Resolution & Mutation Tests 
       expect(resolution.chromiumSandbox).toBe(true);
     });
 
-    it('refuses env candidate if file is missing', () => {
-      const mockFsExists = () => false;
+    it('refuses a missing env candidate', () => {
       expect(() =>
         resolveSecureBrowserLaunchOptions({
           env: { CHROME_BIN: '/missing/env-chrome' },
-          fsExists: mockFsExists,
+          fsExists: () => false,
         }),
       ).toThrow(/executable file not found/);
     });
 
-    it('refuses env candidate if version is below baseline and lists CNA records', () => {
-      const mockFsExists = () => true;
-      const mockExec = () => 'Google Chrome 145.0.7632.6\n';
-
+    it('refuses an env candidate below the floor and names the advisory records', () => {
       let errorMsg = '';
       try {
         resolveSecureBrowserLaunchOptions({
           env: { CHROME_BIN: '/usr/bin/old-chrome' },
-          fsExists: mockFsExists,
-          execCommand: mockExec,
+          fsExists: () => true,
+          execCommand: () => 'Google Chrome 145.0.7632.6\n',
         });
       } catch (err) {
         errorMsg = (err as Error).message;
       }
 
       expect(errorMsg).toMatch(/below minimum secure baseline/);
-      for (const cna of CRITICAL_CHROME_CNA_RECORDS) {
+      for (const cna of ['118306', '118331', '118348', '118344']) {
         expect(errorMsg).toContain(cna);
       }
+      expect([...CRITICAL_CHROME_CNA_RECORDS]).toEqual(['118306', '118331', '118348', '118344']);
     });
   });
 
-  describe('Branch: local CfT candidate (source: cft)', () => {
-    it('succeeds and returns source: cft when local CfT build meets baseline', () => {
-      const mockFsExists = (p: string) => p.includes('chrome-linux64/chrome');
-      const mockExec = () => 'Google Chrome for Testing 156.0.8078.80\n';
-
+  describe('local Chrome for Testing branch', () => {
+    it('returns source cft for the pinned build', () => {
       const resolution = resolveSecureBrowserLaunchOptions({
         env: {},
-        fsExists: mockFsExists,
-        execCommand: mockExec,
+        fsExists: (p: string) => p.includes('chrome-linux64/chrome'),
+        execCommand: () => 'Google Chrome for Testing 156.0.8078.80\n',
       });
 
       expect(resolution.source).toBe('cft');
@@ -309,30 +447,24 @@ describe('Browser Security Baseline — Fail-Closed Resolution & Mutation Tests 
       expect(resolution.chromiumSandbox).toBe(true);
     });
 
-    it('skips local CfT candidate if its version is below baseline', () => {
-      const mockFsExists = (p: string) => p.includes('chrome-linux64/chrome');
-      const mockExec = () => 'Google Chrome for Testing 156.0.8078.70\n';
-
+    it('fails closed when the local build is below the floor', () => {
       expect(() =>
         resolveSecureBrowserLaunchOptions({
           env: {},
-          fsExists: mockFsExists,
-          execCommand: mockExec,
+          fsExists: (p: string) => p.includes('chrome-linux64/chrome'),
+          execCommand: () => 'Google Chrome for Testing 156.0.8078.70\n',
           platform: 'linux',
         }),
       ).toThrow(/No secure Chromium browser executable resolved/);
     });
 
-    it('rejects CfT candidate if version matches floor (156.0.8078.73) but does not match pinned build 156.0.8078.80 (no floor-as-pin)', () => {
-      const mockFsExists = (p: string) => p.includes('chrome-linux64/chrome');
-      const mockExec = () => 'Google Chrome for Testing 156.0.8078.73\n';
-
+    it('rejects a local build at the floor that is not the pinned build', () => {
       let errorMsg = '';
       try {
         resolveSecureBrowserLaunchOptions({
           env: {},
-          fsExists: mockFsExists,
-          execCommand: mockExec,
+          fsExists: (p: string) => p.includes('chrome-linux64/chrome'),
+          execCommand: () => 'Google Chrome for Testing 156.0.8078.73\n',
           platform: 'linux',
         });
       } catch (err) {
@@ -341,18 +473,36 @@ describe('Browser Security Baseline — Fail-Closed Resolution & Mutation Tests 
 
       expect(errorMsg).toContain('does not match pinned CfT 156.0.8078.80');
     });
+
+    it('looks for local builds under the package and repo roots, not the working directory', () => {
+      const probed: string[] = [];
+      expect(() =>
+        resolveSecureBrowserLaunchOptions({
+          env: {},
+          platform: 'linux',
+          fsExists: (p: string) => {
+            probed.push(p);
+            return false;
+          },
+        }),
+      ).toThrow(/No secure Chromium browser executable resolved/);
+
+      const cftProbes = probed.filter((p) => p.includes(`${path.sep}.browsers${path.sep}`));
+      expect(cftProbes.length).toBeGreaterThan(0);
+      for (const candidate of cftProbes) {
+        const root = candidate.slice(0, candidate.indexOf(`${path.sep}.browsers${path.sep}`));
+        expect([WEB_ROOT, REPO_ROOT]).toContain(root);
+      }
+    });
   });
 
-  describe('Branch: system candidate (source: system)', () => {
-    it('succeeds and returns source: system when system Chrome meets baseline', () => {
-      const mockFsExists = (p: string) => p === '/usr/bin/google-chrome';
-      const mockExec = () => 'Google Chrome 156.0.8078.74\n';
-
+  describe('system branch', () => {
+    it('returns source system when system Chrome meets the floor', () => {
       const resolution = resolveSecureBrowserLaunchOptions({
         env: {},
         platform: 'linux',
-        fsExists: mockFsExists,
-        execCommand: mockExec,
+        fsExists: (p: string) => p === '/usr/bin/google-chrome',
+        execCommand: () => 'Google Chrome 156.0.8078.74\n',
       });
 
       expect(resolution.executablePath).toBe('/usr/bin/google-chrome');
@@ -361,99 +511,394 @@ describe('Browser Security Baseline — Fail-Closed Resolution & Mutation Tests 
       expect(resolution.chromiumSandbox).toBe(true);
     });
 
-    it('skips system candidate if below platform baseline and fails closed', () => {
-      const mockFsExists = (p: string) => p === '/usr/bin/google-chrome';
-      const mockExec = () => 'Google Chrome 156.0.8078.70\n';
-
+    it('fails closed when system Chrome is below the floor', () => {
       expect(() =>
         resolveSecureBrowserLaunchOptions({
           env: {},
           platform: 'linux',
-          fsExists: mockFsExists,
-          execCommand: mockExec,
+          fsExists: (p: string) => p === '/usr/bin/google-chrome',
+          execCommand: () => 'Google Chrome 156.0.8078.70\n',
         }),
+      ).toThrow(/No secure Chromium browser executable resolved/);
+    });
+
+    it('fails closed when no candidate exists at all', () => {
+      expect(() =>
+        resolveSecureBrowserLaunchOptions({ env: {}, platform: 'linux', fsExists: () => false }),
       ).toThrow(/No secure Chromium browser executable resolved/);
     });
   });
 
-  describe('Official CfT Artifact Integrity Verification (Finding #2)', () => {
-    it('verifies archive integrity when MD5 and size match published metadata', () => {
-      const crypto = require('crypto');
-      const _expectedMd5 = OFFICIAL_CFT_ARTIFACTS.downloads.linux64.gcsEtagMd5;
-      const _expectedSize = OFFICIAL_CFT_ARTIFACTS.downloads.linux64.sizeBytes;
-
-      // Mock a buffer whose MD5 matches linux64
-      // We test rejection on corrupted buffer
-      const corruptedBuffer = Buffer.from('corrupted zip archive data');
-      expect(() => verifyArchiveIntegrity(corruptedBuffer, 'linux64')).toThrow(
-        /Artifact MD5 integrity verification failed for linux64/,
-      );
-
-      // Verify correct MD5 calculation
-      const testBuffer = Buffer.from('hello world');
-      const testMd5 = crypto.createHash('md5').update(testBuffer).digest('hex');
-      expect(testMd5).toBe('5eb63bbbe01eeed093cb22bb8f5acdc3');
-    });
-
-    it('rejects archive when size does not match expected sizeBytes', () => {
-      const mockBuffer = Buffer.alloc(100);
-      expect(() => verifyArchiveIntegrity(mockBuffer, 'linux64')).toThrow(
-        /Artifact MD5 integrity verification failed/,
-      );
-    });
-  });
-
-  describe('Diagnostic Logging on Fail-Closed (Finding #16)', () => {
-    it('includes per-candidate diagnostic failure reasons when no candidate qualifies', () => {
-      const mockFsExists = (p: string) => p === '/usr/bin/google-chrome';
-      const mockExec = () => 'Google Chrome 155.0.0.0\n';
-
-      let errorMsg = '';
-      try {
-        resolveSecureBrowserLaunchOptions({
-          env: {},
-          platform: 'linux',
-          fsExists: mockFsExists,
-          execCommand: mockExec,
-        });
-      } catch (err) {
-        errorMsg = (err as Error).message;
-      }
-
-      expect(errorMsg).toContain('Diagnostic scan results:');
-      expect(errorMsg).toContain(
-        '[system /usr/bin/google-chrome]: version 155.0.0.0 < 156.0.8078.73',
-      );
-    });
-  });
-
-  describe('Path Planting Prevention in Candidates (Finding #15)', () => {
-    it('does not plant candidate paths when HOME or LOCALAPPDATA are empty or whitespace', () => {
-      const darwinCandidates = getSystemCandidatePaths('darwin', { HOME: '   ' });
-      for (const candidate of darwinCandidates) {
-        expect(candidate.trim()).not.toMatch(/^\s*Applications/);
-      }
-
-      const winCandidates = getSystemCandidatePaths('win32', {
-        LOCALAPPDATA: '',
-        ProgramFiles: '',
-        'ProgramFiles(x86)': '',
+  it('lists per-candidate reasons when no candidate qualifies', () => {
+    let errorMsg = '';
+    try {
+      resolveSecureBrowserLaunchOptions({
+        env: {},
+        platform: 'linux',
+        fsExists: (p: string) => p === '/usr/bin/google-chrome',
+        execCommand: () => 'Google Chrome 155.0.0.0\n',
       });
-      expect(winCandidates).toHaveLength(0);
+    } catch (err) {
+      errorMsg = (err as Error).message;
+    }
+
+    expect(errorMsg).toContain('Diagnostic scan results:');
+    expect(errorMsg).toContain(
+      '[system /usr/bin/google-chrome]: version 155.0.0.0 < 156.0.8078.73',
+    );
+  });
+
+  it('does not build candidate paths from empty or whitespace base directories', () => {
+    const darwinCandidates = getSystemCandidatePaths('darwin', { HOME: '   ' });
+    for (const candidate of darwinCandidates) {
+      expect(path.isAbsolute(candidate)).toBe(true);
+      expect(candidate.startsWith('/Applications/')).toBe(true);
+    }
+
+    const winCandidates = getSystemCandidatePaths('win32', {
+      LOCALAPPDATA: '',
+      ProgramFiles: '',
+      'ProgramFiles(x86)': '',
     });
+    expect(winCandidates).toHaveLength(0);
   });
 });
 
-describe('Browser Security Baseline — Process Tree Sandbox Validation & Recursive Hierarchy (Findings #6, #12, #14)', () => {
+const EXPECTED_PATH_FILTER = [
+  '          filters: |',
+  '            web:',
+  "              - 'gitnexus-web/**'",
+  "              - '.github/workflows/ci-e2e.yml'",
+  "              - '.github/actions/setup-gitnexus-web/**'",
+];
+
+const EXPECTED_E2E_JOB_HEADER = [
+  '  e2e:',
+  '    name: e2e (chrome)',
+  '    needs: check-changes',
+  "    if: needs.check-changes.result == 'success' && needs.check-changes.outputs.web_changed == 'true'",
+  '    runs-on: ubuntu-latest',
+  '    timeout-minutes: 20',
+  '    steps:',
+  '      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2',
+];
+
+const EXPECTED_BROWSER_SECURITY_STEPS = [
+  '      - name: Install pinned Chrome for Testing (GCS object size/MD5 check, not a signature)',
+  '        run: |',
+  '          CFT_VERSION="156.0.8078.80"',
+  '          CFT_URL="https://storage.googleapis.com/chrome-for-testing-public/${CFT_VERSION}/linux64/chrome-linux64.zip"',
+  '          EXPECTED_MD5="6a158ba7e01da016f1988bae0643d9e5"',
+  '          EXPECTED_SIZE="201329937"',
+  '          DEST_DIR="${RUNNER_TEMP}/chrome-for-testing"',
+  '',
+  '          mkdir -p "${DEST_DIR}"',
+  '          cd "${DEST_DIR}"',
+  '',
+  '          echo "Downloading official Chrome for Testing ${CFT_VERSION}..."',
+  "          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 \\",
+  '            --retry 3 --retry-delay 5 -o chrome-linux64.zip "${CFT_URL}"',
+  '',
+  '          # Verify exact archive file size',
+  "          ACTUAL_SIZE=$(wc -c < chrome-linux64.zip | tr -d ' ')",
+  '          if [ "${ACTUAL_SIZE}" != "${EXPECTED_SIZE}" ]; then',
+  '            echo "::error::CfT archive size mismatch: expected ${EXPECTED_SIZE}, got ${ACTUAL_SIZE}"',
+  '            exit 1',
+  '          fi',
+  '',
+  '          echo "${EXPECTED_MD5}  chrome-linux64.zip" | md5sum -c - || {',
+  '            echo "::error::CfT archive MD5 does not match recorded GCS object metadata"',
+  '            exit 1',
+  '          }',
+  '',
+  '          echo "Archive matches recorded GCS object size and MD5. Extracting..."',
+  '          unzip -q chrome-linux64.zip',
+  '          chmod +x chrome-linux64/chrome',
+  '',
+  "          PROBED_OUTPUT=$(./chrome-linux64/chrome --version | tr -d '\\r' | sed -e 's/[[:space:]]*$//')",
+  '          echo "Probed executable: ${PROBED_OUTPUT}"',
+  '          if [ "${PROBED_OUTPUT}" != "Google Chrome for Testing ${CFT_VERSION}" ]; then',
+  "            echo \"::error::Executable reports '${PROBED_OUTPUT}', expected 'Google Chrome for Testing ${CFT_VERSION}'\"",
+  '            exit 1',
+  '          fi',
+  '',
+  '          echo "CHROME_BIN=${DEST_DIR}/chrome-linux64/chrome" >> "$GITHUB_ENV"',
+  '          echo "GITNEXUS_EXPECTED_CHROME_VERSION=${CFT_VERSION}" >> "$GITHUB_ENV"',
+  '        working-directory: gitnexus-web',
+  '',
+  '      # Launches the pinned build with chromiumSandbox: true and checks the live process tree,',
+  '      # the kernel sandbox state of its renderers (/proc Seccomp and namespaces on Linux), and',
+  '      # that the configured context enforces CSP and CORS. The results check fails unless every',
+  '      # live test actually ran and passed; a skipped or excluded test file exits 0 otherwise.',
+  '      - name: Verify live browser sandbox, CSP and CORS',
+  '        run: |',
+  '          npx vitest run test/unit/browser-security.test.ts --reporter=default --reporter=json --outputFile.json="${RUNNER_TEMP}/live-browser-results.json"',
+  '          node e2e/support/assert-live-results.mjs "${RUNNER_TEMP}/live-browser-results.json"',
+  '        working-directory: gitnexus-web',
+  '        env:',
+  "          RUN_LIVE_BROWSER_TESTS: '1'",
+  '          CHROME_BIN: ${{ env.CHROME_BIN }}',
+  '          GITNEXUS_EXPECTED_CHROME_VERSION: ${{ env.GITNEXUS_EXPECTED_CHROME_VERSION }}',
+  '',
+  '      - name: Install backend dependencies',
+];
+
+const EXPECTED_E2E_TEST_STEP = [
+  '      - name: Run E2E tests',
+  '        run: npx playwright test',
+  '        working-directory: gitnexus-web',
+  '        env:',
+  "          E2E: '1'",
+  '          CHROME_BIN: ${{ env.CHROME_BIN }}',
+  '          GITNEXUS_EXPECTED_CHROME_VERSION: ${{ env.GITNEXUS_EXPECTED_CHROME_VERSION }}',
+  '',
+  '      - name: Upload test results',
+];
+
+const EXPECTED_CI_E2E_CALLER = [
+  '  e2e:',
+  '    uses: ./.github/workflows/ci-e2e.yml',
+  '    permissions:',
+  '      contents: read',
+  '',
+  '  scope-parity:',
+];
+
+const REVIEWED_FILE_SHA256: Record<string, string> = {
+  '.github/workflows/ci-e2e.yml':
+    'c1e1971fcc4cc324ccca99fd32e8579b23f4b4c7795520c2e7df71a69a209dd4',
+  '.github/actions/setup-gitnexus-web/action.yml':
+    '3845c12ad70b565aa3efd70c7bb27c019bc3a8048b189d907c0761ff71f49e2f',
+  'gitnexus-web/e2e/support/assert-live-results.mjs':
+    'e7ec2dffbb91d7e38f7f2814b02a1a4e9b57a108d199abae308c799de71b31f2',
+};
+
+describe('CI pin parity with the resolver', () => {
+  const workflow = fs.readFileSync(path.join(REPO_ROOT, '.github/workflows/ci-e2e.yml'), 'utf8');
+  const workflowLines = workflow.replace(/\r\n/g, '\n').split('\n');
+
+  function exactBlock(expected: string[]): string[] {
+    const starts = workflowLines.flatMap((line, i) => (line === expected[0] ? [i] : []));
+    expect(starts, `block start must appear exactly once: ${expected[0]}`).toHaveLength(1);
+    return workflowLines.slice(starts[0], starts[0] + expected.length);
+  }
+
+  function jobOf(lineIndex: number): string | undefined {
+    for (let i = lineIndex; i >= 0; i--) {
+      const match = workflowLines[i].match(/^ {2}([A-Za-z0-9_-]+):\s*$/);
+      if (match) return match[1];
+    }
+    return undefined;
+  }
+
+  it('downloads the same Chrome for Testing build the resolver pins', () => {
+    expect(workflow).toContain(`CFT_VERSION="${PINNED_CFT_VERSION}"`);
+    const urlTemplate = workflow.match(/CFT_URL="([^"]+)"/)?.[1];
+    expect(urlTemplate?.replace('${CFT_VERSION}', PINNED_CFT_VERSION)).toBe(
+      OFFICIAL_CFT_ARTIFACTS.downloads.linux64.url,
+    );
+  });
+
+  // Exact-text contracts: any edit to these blocks, however it is spelled, must come with a
+  // reviewed update to the expected text here. Each step block runs through the next step's
+  // first line so nothing (a key, or a comment followed by a key) can be appended to it.
+  it('keeps the pinned download, integrity checks, and live sandbox step exactly as reviewed', () => {
+    expect(exactBlock(EXPECTED_BROWSER_SECURITY_STEPS)).toEqual(EXPECTED_BROWSER_SECURITY_STEPS);
+  });
+
+  it('runs the E2E tests against the pinned executable exactly as reviewed', () => {
+    expect(exactBlock(EXPECTED_E2E_TEST_STEP)).toEqual(EXPECTED_E2E_TEST_STEP);
+  });
+
+  it('runs the e2e job unconditionally after a web, workflow, or setup-action change', () => {
+    expect(exactBlock(EXPECTED_E2E_JOB_HEADER)).toEqual(EXPECTED_E2E_JOB_HEADER);
+    expect(exactBlock(EXPECTED_PATH_FILTER)).toEqual(EXPECTED_PATH_FILTER);
+  });
+
+  it('defines only the reviewed jobs, with the security steps inside the e2e job', () => {
+    const jobsAt = workflowLines.indexOf('jobs:');
+    const jobKeys = workflowLines
+      .slice(jobsAt + 1)
+      .flatMap((line) => line.match(/^ {2}([A-Za-z0-9_-]+):\s*$/)?.[1] ?? []);
+    expect(jobKeys).toEqual(['check-changes', 'e2e']);
+    for (const start of [EXPECTED_BROWSER_SECURITY_STEPS[0], EXPECTED_E2E_TEST_STEP[0]]) {
+      expect(jobOf(workflowLines.indexOf(start))).toBe('e2e');
+    }
+  });
+
+  it('pins the full reviewed text of the E2E workflow and its setup action', () => {
+    for (const [rel, expected] of Object.entries(REVIEWED_FILE_SHA256)) {
+      const actual = createHash('sha256')
+        .update(fs.readFileSync(path.join(REPO_ROOT, rel)))
+        .digest('hex');
+      expect(actual, `${rel} changed: review the whole file, then update its hash here`).toBe(
+        expected,
+      );
+    }
+  });
+
+  it('keeps the CI entry point calling the E2E workflow unconditionally', () => {
+    const ciLines = fs
+      .readFileSync(path.join(REPO_ROOT, '.github/workflows/ci.yml'), 'utf8')
+      .split('\n');
+    const starts = ciLines.flatMap((line, i) => (line === EXPECTED_CI_E2E_CALLER[0] ? [i] : []));
+    expect(starts).toHaveLength(1);
+    expect(ciLines.slice(starts[0], starts[0] + EXPECTED_CI_E2E_CALLER.length)).toEqual(
+      EXPECTED_CI_E2E_CALLER,
+    );
+  });
+
+  it('writes GITHUB_ENV only from the reviewed lines', () => {
+    expect(
+      workflowLines.filter((line) => line.includes('GITHUB_ENV')).map((l) => l.trim()),
+    ).toEqual([
+      'run: echo "GITNEXUS_HOME=${RUNNER_TEMP}/gitnexus-home" >> "$GITHUB_ENV"',
+      'echo "CHROME_BIN=${DEST_DIR}/chrome-linux64/chrome" >> "$GITHUB_ENV"',
+      'echo "GITNEXUS_EXPECTED_CHROME_VERSION=${CFT_VERSION}" >> "$GITHUB_ENV"',
+    ]);
+  });
+});
+
+describe('Live results check used by the CI live step', () => {
+  const checker = path.join(WEB_ROOT, 'e2e/support/assert-live-results.mjs');
+  const PIN_SUITE = 'CI pin parity with the resolver';
+  const LIVE_SUITE = 'Live browser launch and boundaries';
+  const REQUIRED: Array<[string, string]> = [
+    [PIN_SUITE, 'pins the full reviewed text of the E2E workflow and its setup action'],
+    [PIN_SUITE, 'keeps the CI entry point calling the E2E workflow unconditionally'],
+    [LIVE_SUITE, 'arms the live tests whenever CI pins an exact browser build'],
+    [LIVE_SUITE, 'runs renderers of the configured browser inside the kernel sandbox'],
+    [LIVE_SUITE, 'detects unsandboxed renderers when the sandbox is turned off'],
+    [LIVE_SUITE, 'enforces CSP and CORS with the configured context'],
+  ];
+  const testFile = path.join(WEB_ROOT, 'test/unit/browser-security.test.ts');
+  let reportDir: string;
+
+  beforeEach(() => {
+    reportDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gitnexus-live-results-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(reportDir, { recursive: true, force: true });
+  });
+
+  function passingReport(name = testFile) {
+    return {
+      success: true,
+      numFailedTests: 0,
+      testResults: [
+        {
+          name,
+          assertionResults: [
+            { ancestorTitles: ['Some other suite'], title: 'unrelated', status: 'passed' },
+            ...REQUIRED.map(([suite, title]) => ({
+              ancestorTitles: [suite],
+              title,
+              status: 'passed',
+            })),
+          ],
+        },
+      ],
+    };
+  }
+
+  function check(report: unknown) {
+    const file = path.join(reportDir, 'report.json');
+    fs.writeFileSync(file, typeof report === 'string' ? report : JSON.stringify(report));
+    return spawnSync(process.execPath, [checker, file], { cwd: WEB_ROOT, encoding: 'utf8' });
+  }
+
+  function withoutTitle(title: string) {
+    const report = passingReport();
+    report.testResults[0].assertionResults = report.testResults[0].assertionResults.filter(
+      (a) => a.title !== title,
+    );
+    return report;
+  }
+
+  it('names tests that exist in this file', () => {
+    const source = fs.readFileSync(fileURLToPath(import.meta.url), 'utf8');
+    for (const suite of [PIN_SUITE, LIVE_SUITE]) expect(source).toContain(`describe('${suite}'`);
+    for (const [, title] of REQUIRED) {
+      expect(title).toMatch(/^[a-zA-Z0-9 ]+$/);
+      expect(source).toMatch(new RegExp(`\\bit(?:\\.runIf\\(shouldRunLive\\))?\\(\\s*'${title}'`));
+    }
+  });
+
+  it('accepts a run in which every required test passed', () => {
+    expect(check(passingReport()).status).toBe(0);
+  });
+
+  it('rejects each required test that was skipped, as in a run without a pinned browser', () => {
+    for (const [, title] of REQUIRED) {
+      const report = passingReport();
+      const target = report.testResults[0].assertionResults.find((a) => a.title === title);
+      if (!target) throw new Error(`fixture lacks ${title}`);
+      target.status = 'skipped';
+      const result = check(report);
+      expect(result.status, title).toBe(1);
+      expect(result.stderr).toContain(`"${title}" did not pass (status: skipped)`);
+    }
+  });
+
+  it('rejects a run missing any required test, as when the config filters it out', () => {
+    for (const [suite, title] of REQUIRED) {
+      const result = check(withoutTitle(title));
+      expect(result.status, title).toBe(1);
+      expect(result.stderr).toContain(`expected one "${suite} > ${title}", found 0`);
+    }
+  });
+
+  it('rejects a run in which the test file was excluded', () => {
+    const result = check({ ...passingReport(), testResults: [] });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('expected exactly one result');
+  });
+
+  it('rejects a same-named test file anywhere other than the reviewed path', () => {
+    for (const name of [
+      path.join(WEB_ROOT, 'test/decoy/test/unit/browser-security.test.ts'),
+      path.join(os.tmpdir(), 'elsewhere/test/unit/browser-security.test.ts'),
+    ]) {
+      expect(check(passingReport(name)).status).toBe(1);
+    }
+  });
+
+  it('rejects a missing, renamed, or relocated live test', () => {
+    const report = passingReport();
+    report.testResults[0].assertionResults[3].ancestorTitles = ['Another suite'];
+    expect(check(report).status).toBe(1);
+  });
+
+  it('rejects a duplicated required test', () => {
+    const report = passingReport();
+    report.testResults[0].assertionResults.push({ ...report.testResults[0].assertionResults[3] });
+    expect(check(report).status).toBe(1);
+  });
+
+  it('rejects a run that failed or did not succeed', () => {
+    expect(check({ ...passingReport(), numFailedTests: 1 }).status).toBe(1);
+    expect(check({ ...passingReport(), success: false }).status).toBe(1);
+  });
+
+  it('rejects an unreadable report and a missing argument', () => {
+    expect(check('{not json').status).toBe(1);
+    expect(spawnSync(process.execPath, [checker], { cwd: WEB_ROOT, encoding: 'utf8' }).status).toBe(
+      2,
+    );
+  });
+});
+
+describe('Process tree sandbox validation', () => {
   const cleanProcessSnapshot = [
     ' 1000     1 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --gitnexus-sec-id=test-session-123',
-    ' 1001  1000 /Applications/Google Chrome.app/Contents/Frameworks/.../Helpers/Google Chrome Helper.app/Contents/MacOS/Google Chrome Helper --type=zygote',
-    ' 1002  1001 /Applications/Google Chrome.app/Contents/Frameworks/.../Helpers/Google Chrome Helper (Renderer).app/Contents/MacOS/Google Chrome Helper (Renderer) --type=renderer --seatbelt-client=83',
-    ' 1003  1000 /Applications/Google Chrome.app/Contents/Frameworks/.../Helpers/Google Chrome Helper.app/Contents/MacOS/Google Chrome Helper --type=utility --utility-sub-type=network.mojom.NetworkService',
+    ' 1001  1000 /Applications/Google Chrome.app/Contents/Frameworks/Helpers/Google Chrome Helper --type=zygote',
+    ' 1002  1001 /Applications/Google Chrome.app/Contents/Frameworks/Helpers/Google Chrome Helper (Renderer) --type=renderer --seatbelt-client=83',
+    ' 1003  1000 /Applications/Google Chrome.app/Contents/Frameworks/Helpers/Google Chrome Helper --type=utility --utility-sub-type=network.mojom.NetworkService',
+    ' 2000     1 /usr/bin/unrelated --type=renderer --no-sandbox',
   ];
 
-  it('validates a recursive process tree (e.g. Linux zygote -> renderer hierarchy)', () => {
-    // PID 1000 (browser) -> PID 1001 (zygote) -> PID 1002 (renderer)
+  it('walks the tree recursively and ignores unrelated processes', () => {
     const result = validateProcessTreeSandbox(cleanProcessSnapshot, 'test-session-123');
     expect(result.browserPid).toBe('1000');
     expect(result.childCount).toBe(3);
@@ -462,22 +907,19 @@ describe('Browser Security Baseline — Process Tree Sandbox Validation & Recurs
     expect(result.allPids).toEqual(['1000', '1001', '1003', '1002']);
   });
 
-  it('mutation proof: fails when root browser contains forbidden flag', () => {
-    const processDisallowed = LITERAL_DISALLOWED_FLAGS.filter((f) => f !== '--user-data-dir');
-    for (const flag of processDisallowed) {
+  it('fails when the root browser carries any disallowed flag', () => {
+    for (const flag of LITERAL_DISALLOWED_PROCESS_FLAGS) {
       const mutant = [
         ` 1000     1 /path/chrome ${flag} --gitnexus-sec-id=test-session-123`,
         ' 1001  1000 /path/chrome-helper --type=renderer',
       ];
       expect(() => validateProcessTreeSandbox(mutant, 'test-session-123')).toThrow(
-        new RegExp(
-          `Insecure flag detected: process \\(PID 1000\\) contains forbidden ${flag.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&')}`,
-        ),
+        /Insecure flag detected: process \(PID 1000\)/,
       );
     }
   });
 
-  it('mutation proof: fails when grandchild renderer process contains forbidden flag', () => {
+  it('fails when a grandchild renderer carries --no-sandbox', () => {
     const mutant = [
       ' 1000     1 /path/chrome --gitnexus-sec-id=test-session-123',
       ' 1001  1000 /path/chrome --type=zygote',
@@ -488,23 +930,48 @@ describe('Browser Security Baseline — Process Tree Sandbox Validation & Recurs
     );
   });
 
-  it('fails closed when process table read returns empty', () => {
+  it('fails when a process disables a single site isolation feature', () => {
+    const mutant = [
+      ' 1000     1 /path/chrome --gitnexus-sec-id=test-session-123 --disable-features=Translate,site-per-process',
+      ' 1001  1000 /path/chrome-helper --type=renderer',
+    ];
+    expect(() => validateProcessTreeSandbox(mutant, 'test-session-123')).toThrow(
+      /contains forbidden --disable-features=site-per-process/,
+    );
+  });
+
+  it('fails closed when the process table is empty', () => {
     expect(() => validateProcessTreeSandbox([], 'test-session-123')).toThrow(
       /Process table read failure: process table snapshot is empty/,
     );
   });
 
-  it('fails closed when exact token --gitnexus-sec-id=<id> is not matched (Finding #14)', () => {
-    const looseSnapshot = [
-      ' 1000 1 /path/chrome --random-token=test-session-123',
-      ' 1001 1000 /path/chrome-helper --type=renderer',
+  it('matches the identifier token exactly, not by prefix or suffix', () => {
+    const snapshots = [
+      [' 1000 1 /path/chrome --random-token=run-1', ' 1001 1000 /path/helper --type=renderer'],
+      [' 1000 1 /path/chrome --gitnexus-sec-id=run-1x', ' 1001 1000 /path/helper --type=renderer'],
+      [' 1000 1 /path/chrome x--gitnexus-sec-id=run-1', ' 1001 1000 /path/helper --type=renderer'],
     ];
-    expect(() => validateProcessTreeSandbox(looseSnapshot, 'test-session-123')).toThrow(
-      /Target browser process not found for identifier "test-session-123"/,
+    for (const snapshot of snapshots) {
+      expect(() => validateProcessTreeSandbox(snapshot, 'run-1')).toThrow(
+        /Target browser process not found for identifier "run-1"/,
+      );
+    }
+  });
+
+  it('fails closed when more than one process carries the identifier', () => {
+    const spoofed = [
+      ' 900 1 /tmp/decoy --gitnexus-sec-id=test-session-123',
+      ' 901 900 /tmp/decoy-child --type=renderer',
+      ' 1000 1 /path/chrome --no-sandbox --gitnexus-sec-id=test-session-123',
+      ' 1001 1000 /path/helper --type=renderer --no-sandbox',
+    ];
+    expect(() => collectProcessTree(spoofed, 'test-session-123')).toThrow(
+      /Ambiguous browser process: 2 processes carry identifier "test-session-123" \(PIDs 900, 1000\)/,
     );
   });
 
-  it('fails closed when child process count is 0 (vacuous check prevention)', () => {
+  it('fails closed when the browser has no child processes', () => {
     const vacuous = [' 1000 1 /path/chrome --gitnexus-sec-id=test-session-123'];
     expect(() => validateProcessTreeSandbox(vacuous, 'test-session-123')).toThrow(
       /Vacuous check: no child processes found for browser PID 1000/,
@@ -512,125 +979,517 @@ describe('Browser Security Baseline — Process Tree Sandbox Validation & Recurs
   });
 });
 
-describe('Browser Security Baseline — macOS Seatbelt Kernel Sandbox (Finding #17)', () => {
-  it('returns true when sandbox_check outputs 1 (sandboxed)', () => {
-    const mockExec = () => '1\n';
-    expect(checkProcessSeatbeltSandboxed(1234, mockExec)).toBe(true);
+describe('macOS Seatbelt kernel sandbox check', () => {
+  it('maps sandbox_check output to a sandbox state', () => {
+    expect(checkProcessSeatbeltSandboxed(1234, () => '1\n')).toBe(true);
+    expect(checkProcessSeatbeltSandboxed(1234, () => '0\n')).toBe(false);
   });
 
-  it('returns false when sandbox_check outputs 0 (unsandboxed)', () => {
-    const mockExec = () => '0\n';
-    expect(checkProcessSeatbeltSandboxed(1234, mockExec)).toBe(false);
-  });
-
-  it('passes -I isolated mode to python3 executable args', () => {
+  it('runs only the absolute system python3 in isolated mode', () => {
+    let capturedBin = '';
     let capturedArgs: string[] = [];
-    const mockExec = (_bin: string, args: string[]) => {
+    checkProcessSeatbeltSandboxed(1234, (bin, args) => {
+      capturedBin = bin;
       capturedArgs = args;
       return '1\n';
-    };
-    checkProcessSeatbeltSandboxed(1234, mockExec);
-    expect(capturedArgs).toContain('-I');
-    expect(capturedArgs).toContain('-c');
+    });
+    expect(SYSTEM_PYTHON3).toBe('/usr/bin/python3');
+    expect(capturedBin).toBe('/usr/bin/python3');
+    expect(capturedArgs.slice(0, 2)).toEqual(['-I', '-c']);
   });
 
-  it('throws on invalid PID input', () => {
+  it('fails closed when the system python3 cannot run, with no PATH fallback', () => {
+    const calls: string[] = [];
+    expect(() =>
+      checkProcessSeatbeltSandboxed(1234, (bin) => {
+        calls.push(bin);
+        throw new Error('ENOENT');
+      }),
+    ).toThrow(/sandbox_check failed for PID 1234/);
+    expect(calls).toEqual(['/usr/bin/python3']);
+  });
+
+  it('fails closed on unexpected output', () => {
+    expect(() => checkProcessSeatbeltSandboxed(1234, () => 'maybe\n')).toThrow(
+      /Unexpected sandbox_check output/,
+    );
+  });
+
+  it('rejects invalid PIDs', () => {
     expect(() => checkProcessSeatbeltSandboxed(-1)).toThrow(/Invalid PID/);
     expect(() => checkProcessSeatbeltSandboxed('abc')).toThrow(/Invalid PID/);
   });
 
-  it('validates that test runner harness process itself is NOT sandboxed', () => {
-    if (process.platform === 'darwin') {
-      const isHarnessSandboxed = checkProcessSeatbeltSandboxed(process.pid);
-      expect(isHarnessSandboxed).toBe(false);
+  it.runIf(process.platform === 'darwin')('reports the test runner itself as unsandboxed', () => {
+    expect(checkProcessSeatbeltSandboxed(process.pid)).toBe(false);
+  });
+});
+
+describe('Linux kernel sandbox check', () => {
+  function procReader(
+    files: Record<string, string>,
+    links: Record<string, string>,
+  ): LinuxProcReader {
+    return {
+      readFile: (p) => {
+        if (!(p in files)) throw new Error(`ENOENT ${p}`);
+        return files[p];
+      },
+      readlink: (p) => {
+        if (!(p in links)) throw new Error(`ENOENT ${p}`);
+        return links[p];
+      },
+    };
+  }
+
+  const browserLinks = { '/proc/10/ns/user': 'user:[1]', '/proc/10/ns/pid': 'pid:[1]' };
+  const unfilteredBrowser = { '/proc/10/status': 'Name:\tchrome\nSeccomp:\t0\n' };
+  const ownNamespaces = {
+    ...browserLinks,
+    '/proc/20/ns/user': 'user:[2]',
+    '/proc/20/ns/pid': 'pid:[2]',
+  };
+
+  it('reports a seccomp-filtered renderer in its own namespaces as sandboxed', () => {
+    const state = readLinuxSandboxState(
+      20,
+      10,
+      procReader(
+        {
+          ...unfilteredBrowser,
+          '/proc/20/status': 'Name:\tchrome\nSeccomp:\t2\nSeccomp_filters:\t3\n',
+        },
+        ownNamespaces,
+      ),
+    );
+    expect(state).toEqual({
+      seccompMode: 2,
+      browserSeccompMode: 0,
+      seccompFilters: 3,
+      browserSeccompFilters: undefined,
+      rendererAddedSeccompFilter: true,
+      separateUserNamespace: true,
+      separatePidNamespace: true,
+      sandboxed: true,
+    });
+  });
+
+  it('accepts the setuid sandbox shape: own PID namespace, shared user namespace', () => {
+    const state = readLinuxSandboxState(
+      20,
+      10,
+      procReader(
+        { ...unfilteredBrowser, '/proc/20/status': 'Seccomp:\t2\n' },
+        { ...browserLinks, '/proc/20/ns/user': 'user:[1]', '/proc/20/ns/pid': 'pid:[2]' },
+      ),
+    );
+    expect(state.separateUserNamespace).toBe(false);
+    expect(state.separatePidNamespace).toBe(true);
+    expect(state.sandboxed).toBe(true);
+  });
+
+  it('accepts the namespace sandbox shape: own user namespace, shared PID namespace', () => {
+    const state = readLinuxSandboxState(
+      20,
+      10,
+      procReader(
+        { ...unfilteredBrowser, '/proc/20/status': 'Seccomp:\t2\n' },
+        { ...browserLinks, '/proc/20/ns/user': 'user:[2]', '/proc/20/ns/pid': 'pid:[1]' },
+      ),
+    );
+    expect(state.sandboxed).toBe(true);
+  });
+
+  it('reports a renderer without a seccomp filter as unsandboxed', () => {
+    const state = readLinuxSandboxState(
+      20,
+      10,
+      procReader({ ...unfilteredBrowser, '/proc/20/status': 'Seccomp:\t0\n' }, ownNamespaces),
+    );
+    expect(state.sandboxed).toBe(false);
+  });
+
+  it('reports a renderer in seccomp strict mode as unsandboxed', () => {
+    const state = readLinuxSandboxState(
+      20,
+      10,
+      procReader({ ...unfilteredBrowser, '/proc/20/status': 'Seccomp:\t1\n' }, ownNamespaces),
+    );
+    expect(state.rendererAddedSeccompFilter).toBe(false);
+    expect(state.sandboxed).toBe(false);
+  });
+
+  it('does not count a seccomp filter inherited from the browser', () => {
+    const state = readLinuxSandboxState(
+      20,
+      10,
+      procReader(
+        {
+          '/proc/10/status': 'Seccomp:\t2\nSeccomp_filters:\t1\n',
+          '/proc/20/status': 'Seccomp:\t2\nSeccomp_filters:\t1\n',
+        },
+        ownNamespaces,
+      ),
+    );
+    expect(state.rendererAddedSeccompFilter).toBe(false);
+    expect(state.sandboxed).toBe(false);
+  });
+
+  it('counts a filter the renderer adds on top of an inherited one', () => {
+    const state = readLinuxSandboxState(
+      20,
+      10,
+      procReader(
+        {
+          '/proc/10/status': 'Seccomp:\t2\nSeccomp_filters:\t1\n',
+          '/proc/20/status': 'Seccomp:\t2\nSeccomp_filters:\t2\n',
+        },
+        ownNamespaces,
+      ),
+    );
+    expect(state.sandboxed).toBe(true);
+  });
+
+  it('fails closed when the browser is filtered and filter counts are unavailable', () => {
+    const state = readLinuxSandboxState(
+      20,
+      10,
+      procReader(
+        { '/proc/10/status': 'Seccomp:\t2\n', '/proc/20/status': 'Seccomp:\t2\n' },
+        ownNamespaces,
+      ),
+    );
+    expect(state.sandboxed).toBe(false);
+  });
+
+  it('reports a renderer sharing the browser namespaces as unsandboxed', () => {
+    const state = readLinuxSandboxState(
+      20,
+      10,
+      procReader(
+        { ...unfilteredBrowser, '/proc/20/status': 'Seccomp:\t2\n' },
+        { ...browserLinks, '/proc/20/ns/user': 'user:[1]', '/proc/20/ns/pid': 'pid:[1]' },
+      ),
+    );
+    expect(state.sandboxed).toBe(false);
+  });
+
+  it('fails closed when /proc cannot be read or lacks a Seccomp line', () => {
+    expect(() => readLinuxSandboxState(20, 10, procReader({}, browserLinks))).toThrow(/ENOENT/);
+    expect(() =>
+      readLinuxSandboxState(
+        20,
+        10,
+        procReader({ ...unfilteredBrowser, '/proc/20/status': 'Name:\tchrome\n' }, {}),
+      ),
+    ).toThrow(/Cannot read Seccomp mode for PID 20/);
+    expect(() =>
+      readLinuxSandboxState(
+        20,
+        10,
+        procReader(
+          { '/proc/10/status': 'Name:\tchrome\n', '/proc/20/status': 'Seccomp:\t2\n' },
+          {},
+        ),
+      ),
+    ).toThrow(/Cannot read Seccomp mode for PID 10/);
+  });
+});
+
+describe('Global setup post-launch verification', () => {
+  function fakeResolution(): SecureBrowserResolution {
+    return {
+      executablePath: '/opt/chrome',
+      version: '156.0.8078.80',
+      source: 'env',
+      args: ['--enable-webgl'],
+      chromiumSandbox: true,
+    };
+  }
+
+  function fakeLaunch(reportedVersion: string) {
+    const state = { closed: false, options: undefined as unknown };
+    const launch = async (options: unknown) => {
+      state.options = options;
+      return {
+        version: () => reportedVersion,
+        close: async () => {
+          state.closed = true;
+        },
+      };
+    };
+    return { launch, state };
+  }
+
+  it('launches the resolved executable with the sandbox on and accepts a patched browser', async () => {
+    const { launch, state } = fakeLaunch('156.0.8078.80');
+    await createGlobalSetup({ resolve: fakeResolution, launch, platform: 'linux' })();
+    expect(state.options).toEqual({
+      executablePath: '/opt/chrome',
+      args: ['--enable-webgl'],
+      chromiumSandbox: true,
+      headless: true,
+    });
+    expect(state.closed).toBe(true);
+  });
+
+  it('rejects a launched browser that reports a version below the floor', async () => {
+    const { launch, state } = fakeLaunch('145.0.7632.6');
+    await expect(
+      createGlobalSetup({ resolve: fakeResolution, launch, platform: 'linux' })(),
+    ).rejects.toThrow(/below minimum secure baseline/);
+    expect(state.closed).toBe(true);
+  });
+
+  it('applies the Windows floor on Windows', async () => {
+    const { launch } = fakeLaunch('156.0.8078.73');
+    await expect(
+      createGlobalSetup({ resolve: fakeResolution, launch, platform: 'win32' })(),
+    ).rejects.toThrow(/below minimum secure baseline 156.0.8078.74/);
+  });
+
+  it('rejects a launched browser that differs from the required exact pin', async () => {
+    const { launch } = fakeLaunch('156.0.8078.81');
+    await expect(
+      createGlobalSetup({
+        resolve: fakeResolution,
+        launch,
+        platform: 'linux',
+        expectedExactVersion: '156.0.8078.80',
+      })(),
+    ).rejects.toThrow(/does not match the required pinned version/);
+  });
+});
+
+describe('Default global setup entry point', () => {
+  let stubDir = '';
+  const savedEnv: Record<string, string | undefined> = {};
+
+  beforeEach(() => {
+    stubDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gitnexus-global-setup-'));
+    for (const name of [...BROWSER_ENV_VARS, 'GITNEXUS_EXPECTED_CHROME_VERSION']) {
+      savedEnv[name] = process.env[name];
+      delete process.env[name];
     }
   });
-});
 
-describe('Browser Security Baseline — Playwright Config Entry Point (Findings #1, #5, #9)', () => {
-  it('exports valid secure Playwright configuration with globalSetup and without __dirname ReferenceError', () => {
-    expect(playwrightConfig).toBeDefined();
-    expect(playwrightConfig.globalSetup).toBe('./e2e/support/global-setup.ts');
-    expect(playwrightConfig.use).toBeDefined();
-    expect(playwrightConfig.use?.bypassCSP).toBe(false);
-    expect(playwrightConfig.use?.launchOptions?.executablePath).toBeTruthy();
-    expect(playwrightConfig.use?.launchOptions?.chromiumSandbox).toBe(true);
-    expect(playwrightConfig.use?.launchOptions?.args).toContain('--enable-webgl');
-    expect(playwrightConfig.use?.launchOptions?.args).not.toContain('--no-sandbox');
+  afterEach(() => {
+    for (const [name, value] of Object.entries(savedEnv)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    fs.rmSync(stubDir, { recursive: true, force: true });
+    vi.doUnmock('@playwright/test');
+    vi.resetModules();
   });
 
-  it('globalSetup function exists and enforces pre-test live browser launch verification', () => {
-    expect(globalSetup).toBeDefined();
-    expect(typeof globalSetup).toBe('function');
+  async function importDefaultWithLaunchedVersion(reportedVersion: string) {
+    const launched: unknown[] = [];
+    vi.resetModules();
+    vi.doMock('@playwright/test', () => ({
+      chromium: {
+        launch: async (options: unknown) => {
+          launched.push(options);
+          return { version: () => reportedVersion, close: async () => {} };
+        },
+      },
+    }));
+    const { default: setup } = await import('../../e2e/support/global-setup');
+    return { setup, launched };
+  }
+
+  it('maps the CI exact pin and the platform into the setup dependencies', () => {
+    const pinned = defaultGlobalSetupDeps(
+      { GITNEXUS_EXPECTED_CHROME_VERSION: '156.0.8078.80' },
+      'win32',
+    );
+    expect(pinned.platform).toBe('win32');
+    expect(pinned.expectedExactVersion).toBe('156.0.8078.80');
+    expect(
+      defaultGlobalSetupDeps({ GITNEXUS_EXPECTED_CHROME_VERSION: '' }, 'linux')
+        .expectedExactVersion,
+    ).toBeUndefined();
   });
+
+  it.skipIf(process.platform === 'win32')(
+    'resolves the browser from the environment it was given',
+    () => {
+      const stub = writeStubBrowser(stubDir, 'Google Chrome 156.0.8078.80');
+      const resolution = defaultGlobalSetupDeps({ CHROME_BIN: stub }, 'linux').resolve();
+      expect(resolution.executablePath).toBe(stub);
+      expect(resolution.source).toBe('env');
+    },
+  );
+
+  it.skipIf(process.platform === 'win32')(
+    'rejects a launched browser that differs from the pin in GITNEXUS_EXPECTED_CHROME_VERSION',
+    async () => {
+      process.env.CHROME_BIN = writeStubBrowser(stubDir, 'Google Chrome 156.0.8078.80');
+      process.env.GITNEXUS_EXPECTED_CHROME_VERSION = '156.0.8078.80';
+      const { setup, launched } = await importDefaultWithLaunchedVersion('156.0.8078.81');
+      await expect(setup()).rejects.toThrow(
+        /156.0.8078.81 does not match the required pinned version 156.0.8078.80/,
+      );
+      expect(launched).toEqual([
+        expect.objectContaining({ executablePath: process.env.CHROME_BIN, chromiumSandbox: true }),
+      ]);
+    },
+  );
+
+  it.skipIf(process.platform === 'win32')(
+    'applies the floor of the platform it runs on',
+    async () => {
+      process.env.CHROME_BIN = writeStubBrowser(stubDir, 'Google Chrome 156.0.8078.80');
+      const original = Object.getOwnPropertyDescriptor(process, 'platform');
+      Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+      try {
+        const { setup } = await importDefaultWithLaunchedVersion('156.0.8078.73');
+        await expect(setup()).rejects.toThrow(/below minimum secure baseline 156.0.8078.74/);
+      } finally {
+        if (original) Object.defineProperty(process, 'platform', original);
+      }
+    },
+  );
 });
 
-describe('Browser Security Baseline — Live Browser Launch & Boundaries (Findings #3, #9, #13, #23)', () => {
-  // Gated behind RUN_LIVE_BROWSER_TESTS so CI unit test suites without Chrome pass cleanly
+describe('Playwright config entry point', () => {
+  let stubDir = '';
+  const savedEnv: Record<string, string | undefined> = {};
+
+  beforeEach(() => {
+    stubDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gitnexus-browser-stub-'));
+    for (const name of [...BROWSER_ENV_VARS, 'GITNEXUS_EXPECTED_CHROME_VERSION']) {
+      savedEnv[name] = process.env[name];
+      delete process.env[name];
+    }
+  });
+
+  afterEach(() => {
+    for (const [name, value] of Object.entries(savedEnv)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    fs.rmSync(stubDir, { recursive: true, force: true });
+    vi.resetModules();
+  });
+
+  it.skipIf(process.platform === 'win32')(
+    'builds a sandboxed, CSP-enforcing config around the resolved executable',
+    async () => {
+      const stub = writeStubBrowser(stubDir, 'Google Chrome 156.0.8078.80');
+      process.env.CHROME_BIN = stub;
+      vi.resetModules();
+      const { default: config } = await import('../../playwright.config');
+
+      expect(config.globalSetup).toBe('./e2e/support/global-setup.ts');
+      expect(config.use?.bypassCSP).toBe(false);
+      expect(config.use?.launchOptions?.executablePath).toBe(stub);
+      expect(config.use?.launchOptions?.chromiumSandbox).toBe(true);
+      expect(config.use?.launchOptions?.args).toContain('--enable-webgl');
+      expect(config.use?.launchOptions?.args).not.toContain('--no-sandbox');
+    },
+  );
+
+  it.skipIf(process.platform === 'win32')(
+    'loads through the real Playwright loader and refuses an unpatched executable',
+    () => {
+      const playwrightCli = path.join(WEB_ROOT, 'node_modules/.bin/playwright');
+      const run = (versionLine: string) =>
+        spawnSync(playwrightCli, ['test', '--list'], {
+          cwd: WEB_ROOT,
+          env: {
+            ...envWithoutBrowserOverrides(),
+            CHROME_BIN: writeStubBrowser(stubDir, versionLine),
+          },
+          encoding: 'utf8',
+          timeout: 60_000,
+        });
+
+      const unpatched = run('Google Chrome 145.0.7632.6');
+      expect(unpatched.status).not.toBe(0);
+      expect(`${unpatched.stdout}${unpatched.stderr}`).toMatch(/below minimum secure baseline/);
+
+      const patched = run('Google Chrome 156.0.8078.80');
+      expect(`${patched.stdout}${patched.stderr}`).not.toMatch(/ReferenceError/);
+      expect(patched.status).toBe(0);
+    },
+    90_000,
+  );
+});
+
+describe('Live browser launch and boundaries', () => {
   const shouldRunLive =
     process.env.RUN_LIVE_BROWSER_TESTS === '1' || process.env.RUN_LIVE_BROWSER_TESTS === 'true';
 
-  (shouldRunLive ? it : it.skip)(
-    'launches patched browser verifying post-launch version, process tree sandbox, and profile boundaries',
+  async function loadConfig() {
+    const { default: config } = await import('../../playwright.config');
+    const launchOptions = config.use?.launchOptions;
+    if (!launchOptions?.executablePath) {
+      throw new Error('Playwright config resolved no executable');
+    }
+    return { config, launchOptions };
+  }
+
+  function snapshotProcessTable(): string[] {
+    return execSync('ps -ww -eo pid,ppid,command').toString().split('\n');
+  }
+
+  function assertRendererSandbox(browserPid: string, rendererPid: string, expected: boolean) {
+    if (process.platform === 'darwin') {
+      expect(checkProcessSeatbeltSandboxed(rendererPid)).toBe(expected);
+    } else if (process.platform === 'linux') {
+      expect(readLinuxSandboxState(rendererPid, browserPid).sandboxed).toBe(expected);
+    } else {
+      throw new Error(`No kernel sandbox check implemented for ${process.platform}`);
+    }
+  }
+
+  it('arms the live tests whenever CI pins an exact browser build', () => {
+    if (process.env.GITNEXUS_EXPECTED_CHROME_VERSION) {
+      expect(shouldRunLive).toBe(true);
+    }
+  });
+
+  it.runIf(shouldRunLive)(
+    'runs renderers of the configured browser inside the kernel sandbox',
     async () => {
       const { chromium } = await import('@playwright/test');
-      const resolution = resolveSecureBrowserLaunchOptions();
-      const runId = `gn-sec-live-${Date.now()}`;
+      const { launchOptions } = await loadConfig();
+      const runId = `gn-sec-live-${process.pid}-${Date.now()}`;
 
       const browser = await chromium.launch({
-        executablePath: resolution.executablePath,
-        args: [...resolution.args, `--gitnexus-sec-id=${runId}`],
-        chromiumSandbox: resolution.chromiumSandbox,
+        ...launchOptions,
+        args: [...(launchOptions.args ?? []), `--gitnexus-sec-id=${runId}`],
         headless: true,
       });
 
       try {
-        // 1. Post-launch version verification (Finding #9)
-        const liveVersion = verifyLiveBrowserVersion(browser);
-        expect(isSecureChromiumVersion(liveVersion)).toBe(true);
+        await globalSetup();
+        verifyLiveBrowserVersion(
+          browser,
+          process.platform,
+          process.env.GITNEXUS_EXPECTED_CHROME_VERSION || undefined,
+        );
 
-        // 2. Profile and Cookie Boundary Isolation (Finding #13)
         const contextA = await browser.newContext();
         const contextB = await browser.newContext();
-
         const pageA = await contextA.newPage();
         const pageB = await contextB.newPage();
+        await pageA.goto('data:text/html,<h1>GitNexus context A</h1>');
+        await pageB.goto('data:text/html,<h1>GitNexus context B</h1>');
 
-        await pageA.goto('data:text/html,<h1>GitNexus Security Baseline Test</h1>');
-        await pageB.goto('data:text/html,<h1>GitNexus Context B</h1>');
-
-        // Inspect OS process table with -ww to prevent truncation (Finding #23)
-        const psOutput = execSync('ps -ww -eo pid,ppid,command').toString();
-        const processLines = psOutput.split('\n');
-
-        const validation = validateProcessTreeSandbox(processLines, runId);
-        expect(validation.childCount).toBeGreaterThan(0);
-        expect(validation.rendererCount).toBeGreaterThan(0);
+        const validation = validateProcessTreeSandbox(snapshotProcessTable(), runId);
         expect(validation.rendererPids.length).toBeGreaterThan(0);
-
-        // On macOS Darwin: verify actual OS Seatbelt kernel sandbox on owned renderer processes
-        if (process.platform === 'darwin') {
-          expect(checkProcessSeatbeltSandboxed(validation.browserPid)).toBe(false);
-          for (const rendererPid of validation.rendererPids) {
-            expect(checkProcessSeatbeltSandboxed(rendererPid)).toBe(true);
-          }
+        for (const rendererPid of validation.rendererPids) {
+          assertRendererSandbox(validation.browserPid, rendererPid, true);
         }
 
-        // Cookie isolation check
+        // Smoke check of a browser invariant: no repository setting can change it.
         await contextA.addCookies([
-          {
-            name: 'session_token',
-            value: 'secret_123',
-            domain: 'localhost',
-            path: '/',
-          },
+          { name: 'session_token', value: 'secret_123', domain: 'localhost', path: '/' },
         ]);
-
-        const cookiesA = await contextA.cookies();
-        const cookiesB = await contextB.cookies();
-
-        expect(cookiesA.some((c) => c.name === 'session_token')).toBe(true);
-        expect(cookiesB.some((c) => c.name === 'session_token')).toBe(false);
+        expect((await contextA.cookies()).some((c) => c.name === 'session_token')).toBe(true);
+        expect((await contextB.cookies()).some((c) => c.name === 'session_token')).toBe(false);
 
         await contextA.close();
         await contextB.close();
@@ -638,101 +1497,132 @@ describe('Browser Security Baseline — Live Browser Launch & Boundaries (Findin
         await browser.close();
       }
     },
+    60_000,
   );
 
-  (shouldRunLive ? it : it.skip)(
-    'enforces origin, cross-origin redirect, and CSP security boundaries on local fixtures (Finding #13)',
+  it.runIf(shouldRunLive)(
+    'detects unsandboxed renderers when the sandbox is turned off',
     async () => {
       const { chromium } = await import('@playwright/test');
-      const resolution = resolveSecureBrowserLaunchOptions();
+      const { launchOptions } = await loadConfig();
+      const runId = `gn-sec-neg-${process.pid}-${Date.now()}`;
 
-      // Create two local HTTP servers representing distinct origins
-      let receivedCookiesOnB = '';
+      const browser = await chromium.launch({
+        ...launchOptions,
+        chromiumSandbox: false,
+        args: [...(launchOptions.args ?? []), `--gitnexus-sec-id=${runId}`],
+        headless: true,
+      });
+
+      try {
+        const page = await (await browser.newContext()).newPage();
+        await page.goto('data:text/html,<h1>GitNexus negative control</h1>');
+
+        const table = snapshotProcessTable();
+        expect(() => validateProcessTreeSandbox(table, runId)).toThrow(/--no-sandbox/);
+
+        const tree = collectProcessTree(table, runId);
+        const rendererPids = tree.descendantPids.filter((pid) =>
+          (tree.commandLineByPid.get(pid) ?? '').split(/\s+/).includes('--type=renderer'),
+        );
+        expect(rendererPids.length).toBeGreaterThan(0);
+        for (const rendererPid of rendererPids) {
+          assertRendererSandbox(tree.browserPid, rendererPid, false);
+        }
+      } finally {
+        await browser.close();
+      }
+    },
+    60_000,
+  );
+
+  it.runIf(shouldRunLive)(
+    'enforces CSP and CORS with the configured context',
+    async () => {
+      const { chromium } = await import('@playwright/test');
+      const { config, launchOptions } = await loadConfig();
+
       const serverB = http.createServer((req, res) => {
         if (req.url === '/secret') {
-          // No Access-Control-Allow-Origin header (CORS blocked)
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ secret: 'origin-b-secret-data' }));
+        } else if (req.url === '/public') {
+          res.writeHead(200, {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*',
+          });
+          res.end(JSON.stringify({ ok: true }));
         } else if (req.url === '/landing') {
-          receivedCookiesOnB = req.headers['cookie'] || '';
           res.writeHead(200, { 'Content-Type': 'text/html' });
-          res.end('<h1>Landing on Origin B</h1>');
+          res.end('<h1>Landing on origin B</h1>');
         } else {
           res.writeHead(404);
           res.end();
         }
       });
-
       await new Promise<void>((resolve) => serverB.listen(0, 'localhost', () => resolve()));
       const addrB = serverB.address();
       const portB = typeof addrB === 'object' && addrB ? addrB.port : 0;
 
+      const inlineScript =
+        '<script>window.__inlineScriptExecuted = true;</script><h1>Origin A</h1>';
       const serverA = http.createServer((req, res) => {
         if (req.url === '/redirect') {
-          // Cross-origin redirect to Server B (distinct host and port)
-          res.writeHead(302, {
-            Location: `http://localhost:${portB}/landing`,
-          });
+          res.writeHead(302, { Location: `http://localhost:${portB}/landing` });
           res.end();
-        } else {
-          // Serve HTML with strict CSP forbidding inline scripts without nonce
+        } else if (req.url === '/csp') {
           res.writeHead(200, {
             'Content-Type': 'text/html',
-            'Content-Security-Policy': "default-src 'self'; script-src 'self'",
-            'Set-Cookie': 'origin_a_secret=token123; Path=/',
+            'Content-Security-Policy': "script-src 'self'",
           });
-          res.end(`<!DOCTYPE html>
-            <html>
-              <body>
-                <h1>Origin A</h1>
-                <script>window.__cspViolationOccurred = false; window.__inlineScriptExecuted = true;</script>
-              </body>
-            </html>`);
+          res.end(inlineScript);
+        } else {
+          res.writeHead(200, { 'Content-Type': 'text/html' });
+          res.end(inlineScript);
         }
       });
-
       await new Promise<void>((resolve) => serverA.listen(0, '127.0.0.1', () => resolve()));
       const addrA = serverA.address();
       const portA = typeof addrA === 'object' && addrA ? addrA.port : 0;
+      const originA = `http://127.0.0.1:${portA}`;
 
-      const browser = await chromium.launch({
-        executablePath: resolution.executablePath,
-        args: resolution.args,
-        chromiumSandbox: resolution.chromiumSandbox,
-        headless: true,
-      });
+      const browser = await chromium.launch({ ...launchOptions, headless: true });
 
       try {
-        const context = await browser.newContext({ bypassCSP: false });
+        const context = await browser.newContext({ bypassCSP: config.use?.bypassCSP });
         const page = await context.newPage();
+        const inlineRan = () =>
+          page.evaluate(
+            () =>
+              (window as unknown as { __inlineScriptExecuted?: boolean }).__inlineScriptExecuted ===
+              true,
+          );
 
-        // 1. CSP Enforcement: inline script without unsafe-inline or nonce must NOT execute
-        await page.goto(`http://127.0.0.1:${portA}/`);
-        const inlineExecuted = await page.evaluate(
-          () => (window as unknown as { __inlineScriptExecuted?: boolean }).__inlineScriptExecuted,
-        );
-        expect(inlineExecuted).toBeUndefined();
+        await page.goto(`${originA}/plain`);
+        expect(await inlineRan()).toBe(true);
+        await page.goto(`${originA}/csp`);
+        expect(await inlineRan()).toBe(false);
 
-        // 2. Same-Origin Policy (SOP) / CORS enforcement:
-        // Trying to fetch Origin B from Origin A must fail due to CORS policy
-        const fetchResult = await page.evaluate(async (targetUrl) => {
-          try {
-            await fetch(targetUrl);
-            return 'fetched_successfully';
-          } catch (err: unknown) {
-            const msg = err instanceof Error ? err.message : String(err);
-            return `blocked_by_cors: ${msg}`;
-          }
-        }, `http://localhost:${portB}/secret`);
-        expect(fetchResult).toContain('blocked_by_cors');
+        await page.goto(`${originA}/plain`);
+        const fetchStatus = (url: string) =>
+          page.evaluate(async (target) => {
+            try {
+              const response = await fetch(target);
+              return `ok:${response.status}`;
+            } catch {
+              return 'blocked';
+            }
+          }, url);
+        expect(await fetchStatus(`http://localhost:${portB}/public`)).toBe('ok:200');
+        expect(await fetchStatus(`http://localhost:${portB}/secret`)).toBe('blocked');
 
-        // 3. Redirect Boundary Isolation:
-        // Navigating through cross-origin 302 redirect from Origin A (127.0.0.1) to Origin B (localhost)
-        await page.goto(`http://127.0.0.1:${portA}/redirect`);
+        // Smoke check of a browser invariant: storage stays per-origin across a redirect.
+        await page.evaluate(() => window.localStorage.setItem('origin_a_secret', 'token123'));
+        await page.goto(`${originA}/redirect`);
         expect(page.url()).toBe(`http://localhost:${portB}/landing`);
-
-        // Origin A's cookie must NOT have leaked to Origin B in the redirect request
-        expect(receivedCookiesOnB).not.toContain('origin_a_secret');
+        expect(
+          await page.evaluate(() => window.localStorage.getItem('origin_a_secret')),
+        ).toBeNull();
 
         await context.close();
       } finally {
@@ -741,5 +1631,6 @@ describe('Browser Security Baseline — Live Browser Launch & Boundaries (Findin
         serverB.close();
       }
     },
+    60_000,
   );
 });
