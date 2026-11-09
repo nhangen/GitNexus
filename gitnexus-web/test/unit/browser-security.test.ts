@@ -697,7 +697,7 @@ const EXPECTED_CI_E2E_CALLER = [
 
 const REVIEWED_FILE_SHA256: Record<string, string> = {
   '.github/workflows/ci-e2e.yml':
-    'a08a6b91ed2bc0144c94c3abb910201a566b65da0a0250f4860d6becf0f2648c',
+    'bbbf3c94bf120788f57c102f6e882b290e84e90827f750cdd0af0465ea6457a2',
   '.github/actions/setup-gitnexus-web/action.yml':
     '3845c12ad70b565aa3efd70c7bb27c019bc3a8048b189d907c0761ff71f49e2f',
   'gitnexus-web/e2e/support/assert-live-results.mjs':
@@ -758,6 +758,15 @@ describe('CI pin parity with the resolver', () => {
         'persist-credentials: false',
       ]);
     }
+  });
+
+  it('installs the ffmpeg build video recording needs, and no Playwright browser', () => {
+    const runs = workflowLines
+      .map((l) => l.trim())
+      .filter((l) => /\bplaywright install(?=\s|$)/.test(l));
+    expect(runs).toEqual(['run: npx playwright install ffmpeg']);
+    const ffmpegAt = workflowLines.findIndex((l) => l.trim() === runs[0]);
+    expect(ffmpegAt).toBeLessThan(workflowLines.indexOf(EXPECTED_E2E_TEST_STEP[0]));
   });
 
   it('defines only the reviewed jobs, with the security steps inside the e2e job', () => {

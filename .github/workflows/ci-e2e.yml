@@ -48,6 +48,11 @@ jobs:
         run: npx playwright install-deps chromium
         working-directory: gitnexus-web
 
+      # Video recording on failure needs Playwright's ffmpeg build; this downloads no browser.
+      - name: Install Playwright ffmpeg
+        run: npx playwright install ffmpeg
+        working-directory: gitnexus-web
+
       # EXPECTED_MD5/EXPECTED_SIZE are the GCS object metadata (md5Hash, size) of the archive
       # below, recorded when the pin was chosen. They detect a changed or truncated download;
       # they are storage metadata, not a publisher signature. Re-read them from
