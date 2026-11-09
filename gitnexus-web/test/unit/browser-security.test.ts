@@ -587,6 +587,8 @@ const EXPECTED_E2E_JOB_HEADER = [
   '    timeout-minutes: 20',
   '    steps:',
   '      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2',
+  '        with:',
+  '          persist-credentials: false',
 ];
 
 const EXPECTED_BROWSER_SECURITY_STEPS = [
@@ -672,7 +674,7 @@ const EXPECTED_CI_E2E_CALLER = [
 
 const REVIEWED_FILE_SHA256: Record<string, string> = {
   '.github/workflows/ci-e2e.yml':
-    'c1e1971fcc4cc324ccca99fd32e8579b23f4b4c7795520c2e7df71a69a209dd4',
+    '297b82ec55edd8f38a2d7e2c1c925cf54e9b3ac40a22dfde035d77fdeca18923',
   '.github/actions/setup-gitnexus-web/action.yml':
     '3845c12ad70b565aa3efd70c7bb27c019bc3a8048b189d907c0761ff71f49e2f',
   'gitnexus-web/e2e/support/assert-live-results.mjs':
@@ -719,6 +721,19 @@ describe('CI pin parity with the resolver', () => {
   it('runs the e2e job unconditionally after a web, workflow, or setup-action change', () => {
     expect(exactBlock(EXPECTED_E2E_JOB_HEADER)).toEqual(EXPECTED_E2E_JOB_HEADER);
     expect(exactBlock(EXPECTED_PATH_FILTER)).toEqual(EXPECTED_PATH_FILTER);
+  });
+
+  it('does not persist the checkout token into later steps', () => {
+    const checkouts = workflowLines.flatMap((line, i) =>
+      line.includes('uses: actions/checkout@') ? [i] : [],
+    );
+    expect(checkouts).toHaveLength(2);
+    for (const i of checkouts) {
+      expect(workflowLines.slice(i + 1, i + 3).map((l) => l.trim())).toEqual([
+        'with:',
+        'persist-credentials: false',
+      ]);
+    }
   });
 
   it('defines only the reviewed jobs, with the security steps inside the e2e job', () => {
