@@ -221,6 +221,12 @@ describe('Chromium version verification', () => {
       );
     });
 
+    it('rejects a recognized product line that is not the first line of output', () => {
+      expect(() => parseChromiumVersion('Wrapper banner\nChromium 999.0.0.0')).toThrow(
+        /cannot parse Chromium version/,
+      );
+    });
+
     it('rejects a version token glued to trailing characters', () => {
       expect(() => parseChromiumVersion('Google Chrome 156.0.8078.80beta')).toThrow(
         /cannot parse Chromium version/,

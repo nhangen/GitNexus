@@ -279,7 +279,7 @@ export function isSecureChromiumVersion(
 export function parseChromiumVersion(output: string): string {
   const trimmed = output.trim();
   const match = trimmed.match(
-    /^(?:Google Chrome(?: for Testing)?|Chromium|HeadlessChrome)[ /]([0-9]+(?:\.[0-9]+){2,3})(?=\s|$)/m,
+    /^(?:Google Chrome(?: for Testing)?|Chromium|HeadlessChrome)[ /]([0-9]+(?:\.[0-9]+){2,3})(?=\s|$)/,
   );
 
   if (match && match[1]) {
