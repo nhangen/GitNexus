@@ -591,7 +591,7 @@ const EXPECTED_E2E_JOB_HEADER = [
   '          persist-credentials: false',
 ];
 
-const EXPECTED_BROWSER_SECURITY_STEPS = [
+const EXPECTED_CFT_INSTALL_STEP = [
   '      - name: Install pinned Chrome for Testing (GCS object size/MD5 check, not a signature)',
   '        run: |',
   '          CFT_VERSION="156.0.8078.80"',
@@ -634,10 +634,16 @@ const EXPECTED_BROWSER_SECURITY_STEPS = [
   '          echo "GITNEXUS_EXPECTED_CHROME_VERSION=${CFT_VERSION}" >> "$GITHUB_ENV"',
   '        working-directory: gitnexus-web',
   '',
+  '      - name: Install backend dependencies',
+];
+
+const EXPECTED_LIVE_CHECK_STEP = [
   '      # Launches the pinned build with chromiumSandbox: true and checks the live process tree,',
   '      # the kernel sandbox state of its renderers (/proc Seccomp and namespaces on Linux), and',
   '      # that the configured context enforces CSP and CORS. The results check fails unless every',
   '      # live test actually ran and passed; a skipped or excluded test file exits 0 otherwise.',
+  '      # It runs last, after every install, build and server start, so no later step can swap',
+  '      # CHROME_BIN or the binary before the E2E tests launch it.',
   '      - name: Verify live browser sandbox, CSP and CORS',
   '        run: |',
   '          npx vitest run test/unit/browser-security.test.ts --reporter=default --reporter=json --outputFile.json="${RUNNER_TEMP}/live-browser-results.json"',
@@ -648,7 +654,7 @@ const EXPECTED_BROWSER_SECURITY_STEPS = [
   '          CHROME_BIN: ${{ env.CHROME_BIN }}',
   '          GITNEXUS_EXPECTED_CHROME_VERSION: ${{ env.GITNEXUS_EXPECTED_CHROME_VERSION }}',
   '',
-  '      - name: Install backend dependencies',
+  '      - name: Run E2E tests',
 ];
 
 const EXPECTED_E2E_TEST_STEP = [
@@ -674,7 +680,7 @@ const EXPECTED_CI_E2E_CALLER = [
 
 const REVIEWED_FILE_SHA256: Record<string, string> = {
   '.github/workflows/ci-e2e.yml':
-    '297b82ec55edd8f38a2d7e2c1c925cf54e9b3ac40a22dfde035d77fdeca18923',
+    'f33e046ba8d7fc7f647371d46ce5a0289f3f17fee645ada4c6f1d3c192275866',
   '.github/actions/setup-gitnexus-web/action.yml':
     '3845c12ad70b565aa3efd70c7bb27c019bc3a8048b189d907c0761ff71f49e2f',
   'gitnexus-web/e2e/support/assert-live-results.mjs':
@@ -711,7 +717,8 @@ describe('CI pin parity with the resolver', () => {
   // reviewed update to the expected text here. Each step block runs through the next step's
   // first line so nothing (a key, or a comment followed by a key) can be appended to it.
   it('keeps the pinned download, integrity checks, and live sandbox step exactly as reviewed', () => {
-    expect(exactBlock(EXPECTED_BROWSER_SECURITY_STEPS)).toEqual(EXPECTED_BROWSER_SECURITY_STEPS);
+    expect(exactBlock(EXPECTED_CFT_INSTALL_STEP)).toEqual(EXPECTED_CFT_INSTALL_STEP);
+    expect(exactBlock(EXPECTED_LIVE_CHECK_STEP)).toEqual(EXPECTED_LIVE_CHECK_STEP);
   });
 
   it('runs the E2E tests against the pinned executable exactly as reviewed', () => {
@@ -742,7 +749,11 @@ describe('CI pin parity with the resolver', () => {
       .slice(jobsAt + 1)
       .flatMap((line) => line.match(/^ {2}([A-Za-z0-9_-]+):\s*$/)?.[1] ?? []);
     expect(jobKeys).toEqual(['check-changes', 'e2e']);
-    for (const start of [EXPECTED_BROWSER_SECURITY_STEPS[0], EXPECTED_E2E_TEST_STEP[0]]) {
+    for (const start of [
+      EXPECTED_CFT_INSTALL_STEP[0],
+      EXPECTED_LIVE_CHECK_STEP[0],
+      EXPECTED_E2E_TEST_STEP[0],
+    ]) {
       expect(jobOf(workflowLines.indexOf(start))).toBe('e2e');
     }
   });

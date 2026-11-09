@@ -95,20 +95,6 @@ jobs:
           echo "GITNEXUS_EXPECTED_CHROME_VERSION=${CFT_VERSION}" >> "$GITHUB_ENV"
         working-directory: gitnexus-web
 
-      # Launches the pinned build with chromiumSandbox: true and checks the live process tree,
-      # the kernel sandbox state of its renderers (/proc Seccomp and namespaces on Linux), and
-      # that the configured context enforces CSP and CORS. The results check fails unless every
-      # live test actually ran and passed; a skipped or excluded test file exits 0 otherwise.
-      - name: Verify live browser sandbox, CSP and CORS
-        run: |
-          npx vitest run test/unit/browser-security.test.ts --reporter=default --reporter=json --outputFile.json="${RUNNER_TEMP}/live-browser-results.json"
-          node e2e/support/assert-live-results.mjs "${RUNNER_TEMP}/live-browser-results.json"
-        working-directory: gitnexus-web
-        env:
-          RUN_LIVE_BROWSER_TESTS: '1'
-          CHROME_BIN: ${{ env.CHROME_BIN }}
-          GITNEXUS_EXPECTED_CHROME_VERSION: ${{ env.GITNEXUS_EXPECTED_CHROME_VERSION }}
-
       - name: Install backend dependencies
         run: npm ci
         working-directory: gitnexus
@@ -145,6 +131,22 @@ jobs:
       - name: Wait for Vite dev server
         run: npx wait-on http://localhost:5173 --timeout 30000
         working-directory: gitnexus-web
+
+      # Launches the pinned build with chromiumSandbox: true and checks the live process tree,
+      # the kernel sandbox state of its renderers (/proc Seccomp and namespaces on Linux), and
+      # that the configured context enforces CSP and CORS. The results check fails unless every
+      # live test actually ran and passed; a skipped or excluded test file exits 0 otherwise.
+      # It runs last, after every install, build and server start, so no later step can swap
+      # CHROME_BIN or the binary before the E2E tests launch it.
+      - name: Verify live browser sandbox, CSP and CORS
+        run: |
+          npx vitest run test/unit/browser-security.test.ts --reporter=default --reporter=json --outputFile.json="${RUNNER_TEMP}/live-browser-results.json"
+          node e2e/support/assert-live-results.mjs "${RUNNER_TEMP}/live-browser-results.json"
+        working-directory: gitnexus-web
+        env:
+          RUN_LIVE_BROWSER_TESTS: '1'
+          CHROME_BIN: ${{ env.CHROME_BIN }}
+          GITNEXUS_EXPECTED_CHROME_VERSION: ${{ env.GITNEXUS_EXPECTED_CHROME_VERSION }}
 
       - name: Run E2E tests
         run: npx playwright test
