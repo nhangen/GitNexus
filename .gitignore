@@ -7,6 +7,9 @@ dist/
 # TypeScript build info
 *.tsbuildinfo
 
+# Local Chrome for Testing downloads (see gitnexus-web/e2e/support/browser-security.ts)
+.browsers/
+
 # IDE
 .vscode/
 .idea/

@@ -1,38 +1,28 @@
 import { defineConfig } from '@playwright/test';
+import { resolveSecureBrowserLaunchOptions } from './e2e/support/browser-security';
 
-// Enable insecure browser config (disabled security + CSP bypass) only when explicitly requested.
-// Example: PLAYWRIGHT_INSECURE=1 npx playwright test
-const insecureE2E = process.env.PLAYWRIGHT_INSECURE === '1';
-
-// Base launch args: always enable software WebGL for sigma.js graph rendering in headless mode.
-const launchArgs = [
-  '--use-gl=angle',
-  '--use-angle=swiftshader',
-  '--enable-webgl',
-  '--enable-unsafe-swiftshader',
-];
-
-if (insecureE2E) {
-  // Allow cross-origin requests to gitnexus serve on a different port when explicitly enabled.
-  launchArgs.unshift('--disable-web-security', '--disable-site-isolation-trials');
-}
+// Resolves an explicit Chromium executable at or above the advisory floor and fails closed
+// otherwise; Playwright's bundled Chromium is never used. See e2e/support/browser-security.ts.
+const secureBrowser = resolveSecureBrowserLaunchOptions();
 
 export default defineConfig({
   testDir: './e2e',
+  globalSetup: './e2e/support/global-setup.ts',
   testIgnore: ['**/manual-record.spec.ts', '**/debug-issues.spec.ts'],
   timeout: 60_000,
   retries: process.env.CI ? 1 : 0,
   use: {
     baseURL: 'http://localhost:5173',
     trace: 'retain-on-failure',
-    screenshot: 'retain-on-failure',
+    screenshot: 'only-on-failure',
     video: 'retain-on-failure',
     launchOptions: {
-      args: launchArgs,
+      executablePath: secureBrowser.executablePath,
+      args: secureBrowser.args,
+      chromiumSandbox: secureBrowser.chromiumSandbox,
     },
-    // Vite dev server sets COEP require-corp for SharedArrayBuffer (LadybugDB WASM).
-    // Only bypass CSP when explicitly running in insecure E2E mode.
-    bypassCSP: insecureE2E,
+    // Page CSP stays enforced; bypassing it would weaken origin boundaries under test.
+    bypassCSP: false,
   },
   projects: [
     {
