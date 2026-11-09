@@ -642,8 +642,8 @@ const EXPECTED_LIVE_CHECK_STEP = [
   '      # the kernel sandbox state of its renderers (/proc Seccomp and namespaces on Linux), and',
   '      # that the configured context enforces CSP and CORS. The results check fails unless every',
   '      # live test actually ran and passed; a skipped or excluded test file exits 0 otherwise.',
-  '      # It runs last, after every install, build and server start, so no later step can swap',
-  '      # CHROME_BIN or the binary before the E2E tests launch it.',
+  '      # It runs after every install and build step. The backend and Vite servers started earlier',
+  '      # keep running, so this narrows the window before the E2E launch rather than closing it.',
   '      - name: Verify live browser sandbox, CSP and CORS',
   '        run: |',
   '          npx vitest run test/unit/browser-security.test.ts --reporter=default --reporter=json --outputFile.json="${RUNNER_TEMP}/live-browser-results.json"',
@@ -680,7 +680,7 @@ const EXPECTED_CI_E2E_CALLER = [
 
 const REVIEWED_FILE_SHA256: Record<string, string> = {
   '.github/workflows/ci-e2e.yml':
-    'f33e046ba8d7fc7f647371d46ce5a0289f3f17fee645ada4c6f1d3c192275866',
+    'd8f105bd1d98dfefc89d59fae46efe8d9aaddcb9f1b296eabb48f155c24f8b28',
   '.github/actions/setup-gitnexus-web/action.yml':
     '3845c12ad70b565aa3efd70c7bb27c019bc3a8048b189d907c0761ff71f49e2f',
   'gitnexus-web/e2e/support/assert-live-results.mjs':

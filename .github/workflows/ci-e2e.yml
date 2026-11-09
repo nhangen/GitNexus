@@ -136,8 +136,8 @@ jobs:
       # the kernel sandbox state of its renderers (/proc Seccomp and namespaces on Linux), and
       # that the configured context enforces CSP and CORS. The results check fails unless every
       # live test actually ran and passed; a skipped or excluded test file exits 0 otherwise.
-      # It runs last, after every install, build and server start, so no later step can swap
-      # CHROME_BIN or the binary before the E2E tests launch it.
+      # It runs after every install and build step. The backend and Vite servers started earlier
+      # keep running, so this narrows the window before the E2E launch rather than closing it.
       - name: Verify live browser sandbox, CSP and CORS
         run: |
           npx vitest run test/unit/browser-security.test.ts --reporter=default --reporter=json --outputFile.json="${RUNNER_TEMP}/live-browser-results.json"
