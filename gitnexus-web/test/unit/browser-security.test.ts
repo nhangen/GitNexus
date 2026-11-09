@@ -651,7 +651,10 @@ const EXPECTED_LIVE_CHECK_STEP = [
   '        working-directory: gitnexus-web',
   '        env:',
   "          RUN_LIVE_BROWSER_TESTS: '1'",
+  "          PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH: ''",
   '          CHROME_BIN: ${{ env.CHROME_BIN }}',
+  "          CHROME_PATH: ''",
+  "          CHROMIUM_PATH: ''",
   '          GITNEXUS_EXPECTED_CHROME_VERSION: ${{ env.GITNEXUS_EXPECTED_CHROME_VERSION }}',
   '',
   '      - name: Run E2E tests',
@@ -663,7 +666,10 @@ const EXPECTED_E2E_TEST_STEP = [
   '        working-directory: gitnexus-web',
   '        env:',
   "          E2E: '1'",
+  "          PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH: ''",
   '          CHROME_BIN: ${{ env.CHROME_BIN }}',
+  "          CHROME_PATH: ''",
+  "          CHROMIUM_PATH: ''",
   '          GITNEXUS_EXPECTED_CHROME_VERSION: ${{ env.GITNEXUS_EXPECTED_CHROME_VERSION }}',
   '',
   '      - name: Upload test results',
@@ -680,7 +686,7 @@ const EXPECTED_CI_E2E_CALLER = [
 
 const REVIEWED_FILE_SHA256: Record<string, string> = {
   '.github/workflows/ci-e2e.yml':
-    'd8f105bd1d98dfefc89d59fae46efe8d9aaddcb9f1b296eabb48f155c24f8b28',
+    '83b39622b7610f6d53286e17a20ca88552d603433afbfa99b45511b7ceaab889',
   '.github/actions/setup-gitnexus-web/action.yml':
     '3845c12ad70b565aa3efd70c7bb27c019bc3a8048b189d907c0761ff71f49e2f',
   'gitnexus-web/e2e/support/assert-live-results.mjs':

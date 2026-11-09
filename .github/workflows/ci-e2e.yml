@@ -145,7 +145,10 @@ jobs:
         working-directory: gitnexus-web
         env:
           RUN_LIVE_BROWSER_TESTS: '1'
+          PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH: ''
           CHROME_BIN: ${{ env.CHROME_BIN }}
+          CHROME_PATH: ''
+          CHROMIUM_PATH: ''
           GITNEXUS_EXPECTED_CHROME_VERSION: ${{ env.GITNEXUS_EXPECTED_CHROME_VERSION }}
 
       - name: Run E2E tests
@@ -153,7 +156,10 @@ jobs:
         working-directory: gitnexus-web
         env:
           E2E: '1'
+          PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH: ''
           CHROME_BIN: ${{ env.CHROME_BIN }}
+          CHROME_PATH: ''
+          CHROMIUM_PATH: ''
           GITNEXUS_EXPECTED_CHROME_VERSION: ${{ env.GITNEXUS_EXPECTED_CHROME_VERSION }}
 
       - name: Upload test results
