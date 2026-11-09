@@ -676,7 +676,7 @@ const REVIEWED_FILE_SHA256: Record<string, string> = {
   '.github/actions/setup-gitnexus-web/action.yml':
     '3845c12ad70b565aa3efd70c7bb27c019bc3a8048b189d907c0761ff71f49e2f',
   'gitnexus-web/e2e/support/assert-live-results.mjs':
-    'e7ec2dffbb91d7e38f7f2814b02a1a4e9b57a108d199abae308c799de71b31f2',
+    'daaf858ec7878654ec24225605d0c525f5ef764ea57e7ef755e36191b05a17f5',
 };
 
 describe('CI pin parity with the resolver', () => {
@@ -892,6 +892,19 @@ describe('Live results check used by the CI live step', () => {
     expect(spawnSync(process.execPath, [checker], { cwd: WEB_ROOT, encoding: 'utf8' }).status).toBe(
       2,
     );
+  });
+
+  it('says why a report could not be read', () => {
+    const missing = spawnSync(process.execPath, [checker, path.join(reportDir, 'absent.json')], {
+      cwd: WEB_ROOT,
+      encoding: 'utf8',
+    });
+    expect(missing.status).toBe(1);
+    expect(missing.stderr).toContain('ENOENT');
+    expect(missing.stderr).toContain('absent.json');
+
+    const malformed = check('{not json');
+    expect(malformed.stderr).toMatch(/SyntaxError: .*JSON/);
   });
 });
 

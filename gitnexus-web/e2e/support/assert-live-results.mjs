@@ -76,7 +76,8 @@ try {
     normalize(resolve(process.cwd(), TEST_FILE)),
   );
 } catch (error) {
-  problems = [`cannot read vitest JSON report: ${error instanceof Error ? error.name : 'error'}`];
+  const detail = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
+  problems = [`cannot read vitest JSON report ${reportPath}: ${detail}`];
 }
 
 if (problems.length > 0) {
