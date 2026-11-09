@@ -630,7 +630,18 @@ const EXPECTED_CFT_INSTALL_STEP = [
   '            exit 1',
   '          fi',
   '',
-  '          echo "CHROME_BIN=${DEST_DIR}/chrome-linux64/chrome" >> "$GITHUB_ENV"',
+  '          # Ubuntu 24.04 blocks unprivileged user namespaces through AppArmor, which leaves Chrome',
+  '          # with no usable sandbox. Grant userns to the pinned build only, after copying it to a',
+  '          # root-owned directory so the profiled path is not writable by later steps.',
+  '          PINNED_CHROME="/opt/chrome-for-testing/chrome-linux64/chrome"',
+  '          sudo mkdir -p /opt/chrome-for-testing',
+  '          sudo cp -a chrome-linux64 /opt/chrome-for-testing/',
+  '          sudo chown -R root:root /opt/chrome-for-testing',
+  '          printf \'abi <abi/4.0>,\\ninclude <tunables/global>\\n\\nprofile cft-chrome %s flags=(unconfined) {\\n  userns,\\n}\\n\' "${PINNED_CHROME}" \\',
+  '            | sudo tee /etc/apparmor.d/cft-chrome > /dev/null',
+  '          sudo apparmor_parser -r /etc/apparmor.d/cft-chrome',
+  '',
+  '          echo "CHROME_BIN=${PINNED_CHROME}" >> "$GITHUB_ENV"',
   '          echo "GITNEXUS_EXPECTED_CHROME_VERSION=${CFT_VERSION}" >> "$GITHUB_ENV"',
   '        working-directory: gitnexus-web',
   '',
@@ -686,7 +697,7 @@ const EXPECTED_CI_E2E_CALLER = [
 
 const REVIEWED_FILE_SHA256: Record<string, string> = {
   '.github/workflows/ci-e2e.yml':
-    '83b39622b7610f6d53286e17a20ca88552d603433afbfa99b45511b7ceaab889',
+    'a08a6b91ed2bc0144c94c3abb910201a566b65da0a0250f4860d6becf0f2648c',
   '.github/actions/setup-gitnexus-web/action.yml':
     '3845c12ad70b565aa3efd70c7bb27c019bc3a8048b189d907c0761ff71f49e2f',
   'gitnexus-web/e2e/support/assert-live-results.mjs':
@@ -791,7 +802,7 @@ describe('CI pin parity with the resolver', () => {
       workflowLines.filter((line) => line.includes('GITHUB_ENV')).map((l) => l.trim()),
     ).toEqual([
       'run: echo "GITNEXUS_HOME=${RUNNER_TEMP}/gitnexus-home" >> "$GITHUB_ENV"',
-      'echo "CHROME_BIN=${DEST_DIR}/chrome-linux64/chrome" >> "$GITHUB_ENV"',
+      'echo "CHROME_BIN=${PINNED_CHROME}" >> "$GITHUB_ENV"',
       'echo "GITNEXUS_EXPECTED_CHROME_VERSION=${CFT_VERSION}" >> "$GITHUB_ENV"',
     ]);
   });

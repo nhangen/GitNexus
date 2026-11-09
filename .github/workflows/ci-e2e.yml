@@ -91,7 +91,18 @@ jobs:
             exit 1
           fi
 
-          echo "CHROME_BIN=${DEST_DIR}/chrome-linux64/chrome" >> "$GITHUB_ENV"
+          # Ubuntu 24.04 blocks unprivileged user namespaces through AppArmor, which leaves Chrome
+          # with no usable sandbox. Grant userns to the pinned build only, after copying it to a
+          # root-owned directory so the profiled path is not writable by later steps.
+          PINNED_CHROME="/opt/chrome-for-testing/chrome-linux64/chrome"
+          sudo mkdir -p /opt/chrome-for-testing
+          sudo cp -a chrome-linux64 /opt/chrome-for-testing/
+          sudo chown -R root:root /opt/chrome-for-testing
+          printf 'abi <abi/4.0>,\ninclude <tunables/global>\n\nprofile cft-chrome %s flags=(unconfined) {\n  userns,\n}\n' "${PINNED_CHROME}" \
+            | sudo tee /etc/apparmor.d/cft-chrome > /dev/null
+          sudo apparmor_parser -r /etc/apparmor.d/cft-chrome
+
+          echo "CHROME_BIN=${PINNED_CHROME}" >> "$GITHUB_ENV"
           echo "GITNEXUS_EXPECTED_CHROME_VERSION=${CFT_VERSION}" >> "$GITHUB_ENV"
         working-directory: gitnexus-web
 
