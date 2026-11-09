@@ -496,18 +496,18 @@ export function validateProcessTreeSandbox(
 }
 
 /**
- * Query macOS kernel Seatbelt sandbox state for a specific process ID using
- * system `sandbox_check(pid, NULL, SANDBOX_FILTER_NONE)`.
- *
- * Implemented using Python 3 `-I` (isolated mode) stdlib ctypes loading macOS libSystem.
- */
-/**
  * Absolute path, so a planted `python3` earlier on PATH is never chosen. On macOS this is
  * the xcrun shim, which still selects the developer toolchain from `DEVELOPER_DIR` or
  * `xcode-select`; `-I` does not change that. The PID is validated as an integer first.
  */
 export const SYSTEM_PYTHON3 = '/usr/bin/python3';
 
+/**
+ * Query macOS kernel Seatbelt sandbox state for a specific process ID using
+ * system `sandbox_check(pid, NULL, SANDBOX_FILTER_NONE)`.
+ *
+ * Implemented using Python 3 `-I` (isolated mode) stdlib ctypes loading macOS libSystem.
+ */
 export function checkProcessSeatbeltSandboxed(
   pid: number | string,
   execCommand?: (bin: string, args: string[]) => string,
