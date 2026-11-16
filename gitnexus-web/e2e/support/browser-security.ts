@@ -192,12 +192,16 @@ export function findDisallowedFlag(
 
 /**
  * Base launch args required for headless WebGL rendering (Sigma.js graph view).
+ *
+ * --enable-unsafe-swiftshader is an accepted risk. Chrome gates it because it exposes
+ * SwiftShader's software-GPU JIT to WebGL content; all WebGL content under E2E is
+ * first-party. The only third-party loads are Google Fonts CSS and font files (index.html),
+ * which run no WebGL.
  */
 export const REQUIRED_BASE_LAUNCH_ARGS = [
   '--use-gl=angle',
   '--use-angle=swiftshader',
   '--enable-webgl',
-  // Accepted risk: E2E renders only first-party content.
   '--enable-unsafe-swiftshader',
 ] as const;
 
