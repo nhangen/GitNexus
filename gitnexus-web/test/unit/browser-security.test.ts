@@ -699,7 +699,7 @@ const REVIEWED_FILE_SHA256: Record<string, string> = {
   '.github/workflows/ci-e2e.yml':
     'bbbf3c94bf120788f57c102f6e882b290e84e90827f750cdd0af0465ea6457a2',
   '.github/actions/setup-gitnexus-web/action.yml':
-    '3845c12ad70b565aa3efd70c7bb27c019bc3a8048b189d907c0761ff71f49e2f',
+    '8ab60a4f3a85d3f983e3d9c36536f3d3e0dd1342d0ce66011cfcf3bc49f33d56',
   'gitnexus-web/e2e/support/assert-live-results.mjs':
     'daaf858ec7878654ec24225605d0c525f5ef764ea57e7ef755e36191b05a17f5',
 };
