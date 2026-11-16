@@ -597,6 +597,7 @@ const EXPECTED_CFT_INSTALL_STEP = [
   '          CFT_VERSION="156.0.8078.80"',
   '          CFT_URL="https://storage.googleapis.com/chrome-for-testing-public/${CFT_VERSION}/linux64/chrome-linux64.zip"',
   '          EXPECTED_MD5="6a158ba7e01da016f1988bae0643d9e5"',
+  '          EXPECTED_SHA256="b711c720f774be355197f32edf37e0651418ba036d92446ee2da19ac017540a7"',
   '          EXPECTED_SIZE="201329937"',
   '          DEST_DIR="${RUNNER_TEMP}/chrome-for-testing"',
   '',
@@ -619,7 +620,12 @@ const EXPECTED_CFT_INSTALL_STEP = [
   '            exit 1',
   '          }',
   '',
-  '          echo "Archive matches recorded GCS object size and MD5. Extracting..."',
+  '          echo "${EXPECTED_SHA256}  chrome-linux64.zip" | sha256sum -c - || {',
+  '            echo "::error::CfT archive SHA256 does not match pinned hash"',
+  '            exit 1',
+  '          }',
+  '',
+  '          echo "Archive matches recorded GCS object size, MD5, and SHA256. Extracting..."',
   '          unzip -q chrome-linux64.zip',
   '          chmod +x chrome-linux64/chrome',
   '',
@@ -697,7 +703,7 @@ const EXPECTED_CI_E2E_CALLER = [
 
 const REVIEWED_FILE_SHA256: Record<string, string> = {
   '.github/workflows/ci-e2e.yml':
-    'bbbf3c94bf120788f57c102f6e882b290e84e90827f750cdd0af0465ea6457a2',
+    '7308b3e6f76eb04d8fd5a4aa289e36a1dd2ecea2689fe88160a73992470b9793',
   '.github/actions/setup-gitnexus-web/action.yml':
     '3845c12ad70b565aa3efd70c7bb27c019bc3a8048b189d907c0761ff71f49e2f',
   'gitnexus-web/e2e/support/assert-live-results.mjs':
