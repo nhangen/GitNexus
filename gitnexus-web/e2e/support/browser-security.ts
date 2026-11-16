@@ -164,6 +164,25 @@ function normalizeFeatureEntry(entry: string): string {
 }
 
 /**
+ * Splits a switch into a normalized `--lowercase` name and its raw `=` value, after
+ * stripping surrounding whitespace and quotes. Returns undefined for a non-switch.
+ */
+function parseSwitch(
+  arg: string,
+  platform: NodeJS.Platform,
+): { name: string; rawValue: string | undefined } | undefined {
+  const trimmed = arg.trim().replace(/^["']+|["']+$/g, '');
+  const isSwitch = trimmed.startsWith('-') || (platform === 'win32' && trimmed.startsWith('/'));
+  if (!isSwitch) return undefined;
+  const eq = trimmed.indexOf('=');
+  const rawName = eq === -1 ? trimmed : trimmed.slice(0, eq);
+  return {
+    name: `--${rawName.replace(/^[-/]+/, '').toLowerCase()}`,
+    rawValue: eq === -1 ? undefined : trimmed.slice(eq + 1),
+  };
+}
+
+/**
  * Chromium accepts `--name` and `-name` (and `/name` on Windows), and switch names
  * case-insensitively on Windows, so matching is done on a normalized `--lowercase` name.
  * Feature-list entries are compared without a `*` prefix or a `<Trial` / `:params` suffix.
@@ -173,18 +192,12 @@ export function findDisallowedFlag(
   disallowed: readonly string[],
   platform: NodeJS.Platform = process.platform,
 ): string | undefined {
-  const trimmed = arg.trim().replace(/^["']+|["']+$/g, '');
-  const isSwitch = trimmed.startsWith('-') || (platform === 'win32' && trimmed.startsWith('/'));
-  if (!isSwitch) return undefined;
-  const eq = trimmed.indexOf('=');
-  const rawName = eq === -1 ? trimmed : trimmed.slice(0, eq);
-  const name = `--${rawName.replace(/^[-/]+/, '').toLowerCase()}`;
+  const parsed = parseSwitch(arg, platform);
+  if (!parsed) return undefined;
+  const { name, rawValue } = parsed;
   if (disallowed.some((flag) => flag.toLowerCase() === name)) return name;
-  if (name === '--disable-features' && eq !== -1) {
-    const features = trimmed
-      .slice(eq + 1)
-      .split(',')
-      .map(normalizeFeatureEntry);
+  if (name === '--disable-features' && rawValue !== undefined) {
+    const features = rawValue.split(',').map(normalizeFeatureEntry);
     for (const feature of DISALLOWED_DISABLED_FEATURES) {
       if (features.includes(feature.toLowerCase())) return `--disable-features=${feature}`;
     }
@@ -221,15 +234,10 @@ export function isAllowedLaunchArg(
   arg: string,
   platform: NodeJS.Platform = process.platform,
 ): boolean {
-  const trimmed = arg.trim().replace(/^["']+|["']+$/g, '');
-  const isSwitch = trimmed.startsWith('-') || (platform === 'win32' && trimmed.startsWith('/'));
-  if (!isSwitch) return false;
-  const eq = trimmed.indexOf('=');
-  const rawName = eq === -1 ? trimmed : trimmed.slice(0, eq);
-  const name = `--${rawName.replace(/^[-/]+/, '').toLowerCase()}`;
-  const value = eq === -1 ? undefined : trimmed.slice(eq + 1).replace(/^["']+|["']+$/g, '');
-  const normalized = value !== undefined ? `${name}=${value.toLowerCase()}` : name;
-
+  const parsed = parseSwitch(arg, platform);
+  if (!parsed) return false;
+  const value = parsed.rawValue?.replace(/^["']+|["']+$/g, '').toLowerCase();
+  const normalized = value !== undefined ? `${parsed.name}=${value}` : parsed.name;
   return (ALLOWED_LAUNCH_ARGS as readonly string[]).includes(normalized);
 }
 
@@ -386,7 +394,7 @@ function defaultExecCommand(bin: string, args: string[]): string {
 /**
  * Sanitize launch arguments:
  * - Enforces an allow list: rejects any argument not explicitly permitted in ALLOWED_LAUNCH_ARGS (throws).
- * - Preserves required base rendering args without duplicates.
+ * - Returns the required base rendering args; an accepted custom arg is always one of them.
  */
 export function sanitizeLaunchArgs(
   customArgs: string[] = [],
@@ -400,18 +408,7 @@ export function sanitizeLaunchArgs(
     }
   }
 
-  const sanitized = new Set<string>(REQUIRED_BASE_LAUNCH_ARGS);
-  for (const arg of customArgs) {
-    const trimmed = arg.trim().replace(/^["']+|["']+$/g, '');
-    const eq = trimmed.indexOf('=');
-    const rawName = eq === -1 ? trimmed : trimmed.slice(0, eq);
-    const name = `--${rawName.replace(/^[-/]+/, '').toLowerCase()}`;
-    const value = eq === -1 ? undefined : trimmed.slice(eq + 1).replace(/^["']+|["']+$/g, '');
-    const normalized = value !== undefined ? `${name}=${value.toLowerCase()}` : name;
-    sanitized.add(normalized);
-  }
-
-  return Array.from(sanitized);
+  return [...REQUIRED_BASE_LAUNCH_ARGS];
 }
 
 export interface ProcessTreeValidationResult {

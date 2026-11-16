@@ -356,6 +356,14 @@ describe('Launch argument allow list', () => {
     expect(sanitized.sort()).toEqual([...REQUIRED_BASE_LAUNCH_ARGS].sort());
   });
 
+  it('returns only the canonical base args for accepted spelling variants', () => {
+    const sanitized = sanitizeLaunchArgs(
+      ['"--enable-webgl"', '-ENABLE-WEBGL', '/USE-GL=angle', '--use-angle="SwiftShader"'],
+      'win32',
+    );
+    expect(sanitized).toEqual([...REQUIRED_BASE_LAUNCH_ARGS]);
+  });
+
   it('rejects near-variants that would have bypassed a deny list', () => {
     for (const arg of [
       '--ignore-certificate-errors-spki-list',
