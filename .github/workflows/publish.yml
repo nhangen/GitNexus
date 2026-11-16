@@ -45,7 +45,7 @@ jobs:
           # ~30s slower per release; runs rarely.
           package-manager-cache: false
       - name: Build gitnexus-shared
-        run: npm install && npm run build
+        run: npm ci && npm run build
         working-directory: gitnexus-shared
 
       - run: npm ci
