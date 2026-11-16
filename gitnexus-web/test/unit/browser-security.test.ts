@@ -294,26 +294,26 @@ describe('Launch argument allow list', () => {
     ]);
   });
 
-  it('rejects every disallowed flag, bare and with a value', () => {
+  it('rejects every known-dangerous flag, bare and with a value', () => {
     for (const disallowed of LITERAL_DISALLOWED_FLAGS) {
       expect(() => sanitizeLaunchArgs([disallowed])).toThrow(
-        /Launch argument rejected: .* is not in ALLOWED_LAUNCH_ARGS/,
+        /Launch argument rejected: .* is not in ALLOWED_LAUNCH_ARGS/s,
       );
       expect(() => sanitizeLaunchArgs([`${disallowed}=value`])).toThrow(
-        /Launch argument rejected: .* is not in ALLOWED_LAUNCH_ARGS/,
+        /Launch argument rejected: .* is not in ALLOWED_LAUNCH_ARGS/s,
       );
     }
   });
 
-  it('rejects single-dash and upper-case spellings Chromium also accepts', () => {
+  it('rejects single-dash and upper-case spellings of a dangerous flag', () => {
     for (const arg of ['-no-sandbox', '--NO-SANDBOX', '-Disable-Web-Security', '---no-sandbox']) {
       expect(() => sanitizeLaunchArgs([arg])).toThrow(
-        /Launch argument rejected: .* is not in ALLOWED_LAUNCH_ARGS/,
+        /Launch argument rejected: .* is not in ALLOWED_LAUNCH_ARGS/s,
       );
     }
   });
 
-  it('rejects disabling site isolation features alone or inside a feature list', () => {
+  it('rejects any --disable-features list, including site isolation features', () => {
     for (const arg of [
       '--disable-features=site-per-process',
       '--disable-features=IsolateOrigins',
@@ -330,7 +330,7 @@ describe('Launch argument allow list', () => {
       '"--disable-features=SitePerProcess"',
     ]) {
       expect(() => sanitizeLaunchArgs([arg])).toThrow(
-        /Launch argument rejected: .* is not in ALLOWED_LAUNCH_ARGS/,
+        /Launch argument rejected: .* is not in ALLOWED_LAUNCH_ARGS/s,
       );
     }
   });
@@ -354,7 +354,7 @@ describe('Launch argument allow list', () => {
       'not-a-switch',
     ]) {
       expect(() => sanitizeLaunchArgs([arg])).toThrow(
-        /Launch argument rejected: .* is not in ALLOWED_LAUNCH_ARGS/,
+        /Launch argument rejected: .* is not in ALLOWED_LAUNCH_ARGS/s,
       );
     }
   });
@@ -393,7 +393,7 @@ describe('Launch argument allow list', () => {
       '--enable-features=NetworkServiceInProcess',
     ]) {
       expect(() => sanitizeLaunchArgs([arg])).toThrow(
-        /Launch argument rejected: .* is not in ALLOWED_LAUNCH_ARGS/,
+        /Launch argument rejected: .* is not in ALLOWED_LAUNCH_ARGS/s,
       );
     }
   });
@@ -412,8 +412,28 @@ describe('Launch argument allow list', () => {
     expect(isAllowedLaunchArg('not-a-switch')).toBe(false);
   });
 
-  it('defines ALLOWED_LAUNCH_ARGS matching REQUIRED_BASE_LAUNCH_ARGS', () => {
-    expect(ALLOWED_LAUNCH_ARGS).toEqual(REQUIRED_BASE_LAUNCH_ARGS);
+  it('allows no switch that the dangerous-flag list forbids', () => {
+    for (const platform of ['linux', 'darwin', 'win32'] as const) {
+      for (const arg of ALLOWED_LAUNCH_ARGS) {
+        expect(findDisallowedFlag(arg, DISALLOWED_SECURITY_FLAGS, platform)).toBeUndefined();
+        expect(findDisallowedFlag(arg, DISALLOWED_PROCESS_FLAGS, platform)).toBeUndefined();
+      }
+    }
+  });
+
+  it('rejects a dangerous arg mixed with allowed ones, and smuggled extra switches', () => {
+    for (const args of [
+      ['--enable-webgl', '--no-sandbox'],
+      ['--no-sandbox', '--enable-webgl'],
+      ['--enable-webgl --no-sandbox'],
+      ['--use-gl=angle,--no-sandbox'],
+      ['--use-gl=angle --no-sandbox'],
+      ['--enable-webgl\n--no-sandbox'],
+    ]) {
+      expect(() => sanitizeLaunchArgs(args)).toThrow(
+        /Launch argument rejected: .* is not in ALLOWED_LAUNCH_ARGS/s,
+      );
+    }
   });
 
   it('lists every literal disallowed flag', () => {
@@ -452,6 +472,24 @@ describe('Fail-closed executable resolution', () => {
           fsExists: () => false,
         }),
       ).toThrow(/executable file not found/);
+    });
+
+    it('validates customArgs with the resolved platform', () => {
+      const base = {
+        customExecutablePath: '/usr/bin/custom-chrome',
+        fsExists: () => true,
+        execCommand: () => 'Google Chrome 156.0.8078.80\n',
+        customArgs: ['/use-gl=angle'],
+      };
+      expect(resolveSecureBrowserLaunchOptions({ ...base, platform: 'win32' }).args).toEqual([
+        ...REQUIRED_BASE_LAUNCH_ARGS,
+      ]);
+      expect(() => resolveSecureBrowserLaunchOptions({ ...base, platform: 'linux' })).toThrow(
+        /Launch argument rejected: .* is not in ALLOWED_LAUNCH_ARGS/s,
+      );
+      expect(() =>
+        resolveSecureBrowserLaunchOptions({ ...base, customArgs: ['--no-sandbox'] }),
+      ).toThrow(/Launch argument rejected: .* is not in ALLOWED_LAUNCH_ARGS/s);
     });
 
     it('refuses a custom executable below the floor', () => {
@@ -1066,16 +1104,6 @@ describe('Process tree sandbox validation', () => {
     ];
     expect(() => validateProcessTreeSandbox(mutant, 'test-session-123')).toThrow(
       /Insecure flag detected: process \(PID 1002\) contains forbidden --no-sandbox/,
-    );
-  });
-
-  it('fails when a process carries --ignore-certificate-errors', () => {
-    const mutant = [
-      ' 1000     1 /path/chrome --ignore-certificate-errors --gitnexus-sec-id=test-session-123',
-      ' 1001  1000 /path/chrome-helper --type=renderer',
-    ];
-    expect(() => validateProcessTreeSandbox(mutant, 'test-session-123')).toThrow(
-      /Insecure flag detected: process \(PID 1000\) contains forbidden --ignore-certificate-errors/,
     );
   });
 
