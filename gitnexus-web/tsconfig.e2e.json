@@ -8,7 +8,14 @@
     "skipLibCheck": true,
     "esModuleInterop": true,
     "noEmit": true,
-    "types": ["node"]
+    "types": ["node", "vitest/globals"],
+    "allowJs": true,
+    "checkJs": true
   },
-  "include": ["playwright.config.ts", "e2e/support/**/*.ts"]
+  "include": [
+    "playwright.config.ts",
+    "e2e/support/**/*.ts",
+    "e2e/support/assert-live-results.mjs",
+    "test/unit/browser-security.test.ts"
+  ]
 }
