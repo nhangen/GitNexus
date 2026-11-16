@@ -83,3 +83,10 @@ jobs:
 
       - name: Fail on high+ findings
         run: zizmor --config .github/zizmor.yml --min-severity high .
+
+      # artipacked is medium severity, so the high-only gate above lets a
+      # checkout that persists its token merge green. Gate it on its own.
+      - name: Fail on credential-persisting checkouts (artipacked)
+        run: |
+          zizmor --config .github/zizmor.yml --format json . > zizmor.json || true
+          jq -e '[.[] | select(.ident == "artipacked" and (.ignored | not))] | length == 0' zizmor.json
