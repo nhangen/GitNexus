@@ -20,6 +20,9 @@ import {
   validateProcessTreeSandbox,
   checkProcessSeatbeltSandboxed,
   readLinuxSandboxState,
+  isProcessRunning,
+  checkRendererSandboxState,
+  verifyRenderersSandboxed,
   getSystemCandidatePaths,
   MIN_CHROMIUM_SECURITY_VERSION,
   MIN_CHROMIUM_SECURITY_VERSION_POSIX,
@@ -1267,6 +1270,242 @@ describe('Linux kernel sandbox check', () => {
   });
 });
 
+describe('Renderer sandbox verification and exit tolerance', () => {
+  function procReader(
+    files: Record<string, string>,
+    links: Record<string, string>,
+  ): LinuxProcReader {
+    return {
+      readFile: (p) => {
+        if (!(p in files)) throw new Error(`ENOENT ${p}`);
+        return files[p];
+      },
+      readlink: (p) => {
+        if (!(p in links)) throw new Error(`ENOENT ${p}`);
+        return links[p];
+      },
+    };
+  }
+
+  const browserLinks = { '/proc/10/ns/user': 'user:[1]', '/proc/10/ns/pid': 'pid:[1]' };
+  const unfilteredBrowser = { '/proc/10/status': 'Name:\tchrome\nSeccomp:\t0\n' };
+  const sharedNamespaces = {
+    ...browserLinks,
+    '/proc/20/ns/user': 'user:[1]',
+    '/proc/20/ns/pid': 'pid:[1]',
+  };
+  const sandboxedRendererFiles = {
+    ...unfilteredBrowser,
+    '/proc/20/status': 'Name:\tchrome\nSeccomp:\t2\nSeccomp_filters:\t2\n',
+    '/proc/30/status': 'Name:\tchrome\nSeccomp:\t2\nSeccomp_filters:\t2\n',
+  };
+  const sandboxedRendererLinks = {
+    ...browserLinks,
+    '/proc/20/ns/user': 'user:[2]',
+    '/proc/20/ns/pid': 'pid:[2]',
+    '/proc/30/ns/user': 'user:[3]',
+    '/proc/30/ns/pid': 'pid:[3]',
+  };
+
+  describe('isProcessRunning', () => {
+    it('reports the current process as running', () => {
+      expect(isProcessRunning(process.pid)).toBe(true);
+    });
+
+    it('reports a non-existent PID as not running', () => {
+      expect(isProcessRunning(99999999)).toBe(false);
+    });
+
+    it('rejects invalid or non-positive PIDs', () => {
+      expect(isProcessRunning(0)).toBe(false);
+      expect(isProcessRunning(-1)).toBe(false);
+      expect(isProcessRunning(NaN)).toBe(false);
+      expect(isProcessRunning('invalid')).toBe(false);
+      expect(isProcessRunning(1.5)).toBe(false);
+    });
+  });
+
+  describe('checkRendererSandboxState', () => {
+    it('verifies a sandboxed Linux renderer when running', () => {
+      const result = checkRendererSandboxState(20, 10, {
+        platform: 'linux',
+        procReader: procReader(sandboxedRendererFiles, sandboxedRendererLinks),
+        isProcessRunning: () => true,
+      });
+      expect(result).toEqual({ verified: true, sandboxed: true });
+    });
+
+    it('verifies an unsandboxed Linux renderer when running', () => {
+      const result = checkRendererSandboxState(20, 10, {
+        platform: 'linux',
+        procReader: procReader(
+          { ...unfilteredBrowser, '/proc/20/status': 'Seccomp:\t0\n' },
+          sharedNamespaces,
+        ),
+        isProcessRunning: () => true,
+      });
+      expect(result).toEqual({ verified: true, sandboxed: false });
+    });
+
+    it('tolerates a renderer that exited before the check', () => {
+      const result = checkRendererSandboxState(20, 10, {
+        platform: 'linux',
+        procReader: procReader(sandboxedRendererFiles, sandboxedRendererLinks),
+        isProcessRunning: () => false,
+      });
+      expect(result).toEqual({ verified: false, exited: true });
+    });
+
+    it('tolerates a renderer that exited between snapshot and Linux /proc read', () => {
+      let called = 0;
+      const isAlive = () => {
+        called++;
+        return called === 1;
+      };
+      const result = checkRendererSandboxState(20, 10, {
+        platform: 'linux',
+        procReader: procReader(unfilteredBrowser, browserLinks),
+        isProcessRunning: isAlive,
+      });
+      expect(result).toEqual({ verified: false, exited: true });
+    });
+
+    it('treats a Linux /proc read error as fatal when the PID is still running', () => {
+      expect(() =>
+        checkRendererSandboxState(20, 10, {
+          platform: 'linux',
+          procReader: procReader(unfilteredBrowser, browserLinks),
+          isProcessRunning: () => true,
+        }),
+      ).toThrow(/ENOENT/);
+    });
+
+    it('treats malformed /proc status as fatal when the PID is still running', () => {
+      expect(() =>
+        checkRendererSandboxState(20, 10, {
+          platform: 'linux',
+          procReader: procReader(
+            { ...unfilteredBrowser, '/proc/20/status': 'Name:\tchrome\n' },
+            browserLinks,
+          ),
+          isProcessRunning: () => true,
+        }),
+      ).toThrow(/Cannot read Seccomp mode/);
+    });
+
+    it('verifies a sandboxed macOS renderer when running', () => {
+      const result = checkRendererSandboxState(20, 10, {
+        platform: 'darwin',
+        execCommand: () => '1\n',
+        isProcessRunning: () => true,
+      });
+      expect(result).toEqual({ verified: true, sandboxed: true });
+    });
+
+    it('tolerates a macOS renderer that exited before check', () => {
+      const result = checkRendererSandboxState(20, 10, {
+        platform: 'darwin',
+        execCommand: () => '1\n',
+        isProcessRunning: () => false,
+      });
+      expect(result).toEqual({ verified: false, exited: true });
+    });
+
+    it('tolerates a macOS renderer when sandbox_check throws and PID is not running', () => {
+      const result = checkRendererSandboxState(20, 10, {
+        platform: 'darwin',
+        execCommand: () => {
+          throw new Error('Process exited');
+        },
+        isProcessRunning: () => false,
+      });
+      expect(result).toEqual({ verified: false, exited: true });
+    });
+
+    it('treats a macOS sandbox_check error as fatal when PID is still running', () => {
+      expect(() =>
+        checkRendererSandboxState(20, 10, {
+          platform: 'darwin',
+          execCommand: () => {
+            throw new Error('Command failed');
+          },
+          isProcessRunning: () => true,
+        }),
+      ).toThrow(/sandbox_check failed/);
+    });
+
+    it('rejects an unsupported platform', () => {
+      expect(() =>
+        checkRendererSandboxState(20, 10, {
+          platform: 'win32',
+          isProcessRunning: () => true,
+        }),
+      ).toThrow(/No kernel sandbox check implemented for win32/);
+    });
+  });
+
+  describe('verifyRenderersSandboxed', () => {
+    it('verifies all renderers when all are running and sandboxed', () => {
+      const result = verifyRenderersSandboxed([20, 30], 10, true, {
+        platform: 'linux',
+        procReader: procReader(sandboxedRendererFiles, sandboxedRendererLinks),
+        isProcessRunning: () => true,
+      });
+      expect(result).toEqual({
+        verifiedCount: 2,
+        verifiedPids: ['20', '30'],
+        exitedPids: [],
+      });
+    });
+
+    it('tolerates a renderer that exited if at least one renderer is verified', () => {
+      const result = verifyRenderersSandboxed([20, 30], 10, true, {
+        platform: 'linux',
+        procReader: procReader(sandboxedRendererFiles, sandboxedRendererLinks),
+        isProcessRunning: (pid) => Number(pid) === 30,
+      });
+      expect(result).toEqual({
+        verifiedCount: 1,
+        verifiedPids: ['30'],
+        exitedPids: ['20'],
+      });
+    });
+
+    it('fails when ALL renderers exited before check (at least one must be verified)', () => {
+      expect(() =>
+        verifyRenderersSandboxed([20, 30], 10, true, {
+          platform: 'linux',
+          procReader: procReader(sandboxedRendererFiles, sandboxedRendererLinks),
+          isProcessRunning: () => false,
+        }),
+      ).toThrow(/No renderer could be verified: all 2 renderer process\(es\) exited/);
+    });
+
+    it('fails when a verified renderer does not match the expected sandbox state', () => {
+      expect(() =>
+        verifyRenderersSandboxed([20], 10, true, {
+          platform: 'linux',
+          procReader: procReader(
+            { ...unfilteredBrowser, '/proc/20/status': 'Seccomp:\t0\n' },
+            sharedNamespaces,
+          ),
+          isProcessRunning: () => true,
+        }),
+      ).toThrow(/Renderer PID 20 sandbox state mismatch: expected sandboxed=true, got false/);
+    });
+
+    it('fails when a running renderer encounters a fatal read error', () => {
+      expect(() =>
+        verifyRenderersSandboxed([20], 10, true, {
+          platform: 'linux',
+          procReader: procReader(unfilteredBrowser, browserLinks),
+          isProcessRunning: () => true,
+        }),
+      ).toThrow(/ENOENT/);
+    });
+  });
+});
+
 describe('Global setup post-launch verification', () => {
   function fakeResolution(): SecureBrowserResolution {
     return {
@@ -1505,16 +1744,6 @@ describe('Live browser launch and boundaries', () => {
     return execSync('ps -ww -eo pid,ppid,command').toString().split('\n');
   }
 
-  function assertRendererSandbox(browserPid: string, rendererPid: string, expected: boolean) {
-    if (process.platform === 'darwin') {
-      expect(checkProcessSeatbeltSandboxed(rendererPid)).toBe(expected);
-    } else if (process.platform === 'linux') {
-      expect(readLinuxSandboxState(rendererPid, browserPid).sandboxed).toBe(expected);
-    } else {
-      throw new Error(`No kernel sandbox check implemented for ${process.platform}`);
-    }
-  }
-
   it('arms the live tests whenever CI pins an exact browser build', () => {
     if (process.env.GITNEXUS_EXPECTED_CHROME_VERSION) {
       expect(shouldRunLive).toBe(true);
@@ -1551,9 +1780,12 @@ describe('Live browser launch and boundaries', () => {
 
         const validation = validateProcessTreeSandbox(snapshotProcessTable(), runId);
         expect(validation.rendererPids.length).toBeGreaterThan(0);
-        for (const rendererPid of validation.rendererPids) {
-          assertRendererSandbox(validation.browserPid, rendererPid, true);
-        }
+        const verification = verifyRenderersSandboxed(
+          validation.rendererPids,
+          validation.browserPid,
+          true,
+        );
+        expect(verification.verifiedCount).toBeGreaterThan(0);
 
         // Smoke check of a browser invariant: no repository setting can change it.
         await contextA.addCookies([
@@ -1597,9 +1829,8 @@ describe('Live browser launch and boundaries', () => {
           (tree.commandLineByPid.get(pid) ?? '').split(/\s+/).includes('--type=renderer'),
         );
         expect(rendererPids.length).toBeGreaterThan(0);
-        for (const rendererPid of rendererPids) {
-          assertRendererSandbox(tree.browserPid, rendererPid, false);
-        }
+        const verification = verifyRenderersSandboxed(rendererPids, tree.browserPid, false);
+        expect(verification.verifiedCount).toBeGreaterThan(0);
       } finally {
         await browser.close();
       }

@@ -617,6 +617,142 @@ export function readLinuxSandboxState(
 }
 
 /**
+ * Test whether a process is currently running by signalling PID with signal 0.
+ * In POSIX, kill(pid, 0) performs error checking without sending a signal.
+ * Returns true if the process exists (even if unprivileged, EPERM), false if ESRCH.
+ * On Linux, additionally checks /proc/<pid>/status to ensure the process is not a zombie.
+ */
+export function isProcessRunning(pid: number | string): boolean {
+  const numericPid = Number(pid);
+  if (!Number.isInteger(numericPid) || numericPid <= 0) {
+    return false;
+  }
+  try {
+    process.kill(numericPid, 0);
+  } catch (err: unknown) {
+    if (typeof err === 'object' && err !== null && 'code' in err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'ESRCH') return false;
+      if (code === 'EPERM') return true;
+    }
+    return false;
+  }
+
+  // On Linux, a reaped process throws ESRCH above. A zombie (terminated but not reaped)
+  // still responds to signal 0, but its State in /proc/<pid>/status is 'Z (zombie)'.
+  if (process.platform === 'linux') {
+    try {
+      const status = fs.readFileSync(`/proc/${numericPid}/status`, 'utf8');
+      const stateMatch = status.match(/^State:\s+([A-Z])/m);
+      if (stateMatch && stateMatch[1] === 'Z') {
+        return false;
+      }
+    } catch {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+export interface RendererSandboxOptions {
+  platform?: NodeJS.Platform;
+  isProcessRunning?: (pid: number | string) => boolean;
+  execCommand?: (bin: string, args: string[]) => string;
+  procReader?: LinuxProcReader;
+}
+
+export type RendererSandboxResult =
+  | { verified: true; sandboxed: boolean }
+  | { verified: false; exited: true };
+
+/**
+ * Check the kernel sandbox state of a renderer process.
+ * If reading the sandbox state fails (or the renderer has exited) and re-checking the PID
+ * confirms it is no longer present, returns `{ verified: false, exited: true }`.
+ * If reading fails but the PID is still present, the read error is fatal and re-thrown.
+ */
+export function checkRendererSandboxState(
+  rendererPid: number | string,
+  browserPid: number | string,
+  options: RendererSandboxOptions = {},
+): RendererSandboxResult {
+  const platform = options.platform ?? process.platform;
+  const isAlive = options.isProcessRunning ?? isProcessRunning;
+
+  if (!isAlive(rendererPid)) {
+    return { verified: false, exited: true };
+  }
+
+  try {
+    if (platform === 'darwin') {
+      const sandboxed = checkProcessSeatbeltSandboxed(rendererPid, options.execCommand);
+      if (!isAlive(rendererPid)) {
+        return { verified: false, exited: true };
+      }
+      return { verified: true, sandboxed };
+    }
+    if (platform === 'linux') {
+      const state = readLinuxSandboxState(rendererPid, browserPid, options.procReader);
+      return { verified: true, sandboxed: state.sandboxed };
+    }
+    throw new Error(`No kernel sandbox check implemented for ${platform}`);
+  } catch (err) {
+    if (isAlive(rendererPid)) {
+      throw err;
+    }
+    return { verified: false, exited: true };
+  }
+}
+
+export interface RenderersSandboxVerificationResult {
+  verifiedCount: number;
+  verifiedPids: string[];
+  exitedPids: string[];
+}
+
+/**
+ * Verify that renderers in a process tree are running inside the kernel sandbox.
+ * Tolerates renderers that exited between the process snapshot and the kernel check,
+ * provided at least one renderer process is verified.
+ */
+export function verifyRenderersSandboxed(
+  rendererPids: Array<number | string>,
+  browserPid: number | string,
+  expectedSandboxed = true,
+  options: RendererSandboxOptions = {},
+): RenderersSandboxVerificationResult {
+  const verifiedPids: string[] = [];
+  const exitedPids: string[] = [];
+
+  for (const pid of rendererPids) {
+    const result = checkRendererSandboxState(pid, browserPid, options);
+    if (!result.verified) {
+      exitedPids.push(String(pid));
+      continue;
+    }
+    if (result.sandboxed !== expectedSandboxed) {
+      throw new Error(
+        `Renderer PID ${pid} sandbox state mismatch: expected sandboxed=${expectedSandboxed}, got ${result.sandboxed}`,
+      );
+    }
+    verifiedPids.push(String(pid));
+  }
+
+  if (verifiedPids.length === 0) {
+    throw new Error(
+      `No renderer could be verified: all ${rendererPids.length} renderer process(es) exited before kernel sandbox check`,
+    );
+  }
+
+  return {
+    verifiedCount: verifiedPids.length,
+    verifiedPids,
+    exitedPids,
+  };
+}
+
+/**
  * Get system candidate paths for Chromium/Chrome based on operating system.
  * Avoids path planting by ensuring base directory variables are non-empty.
  */
