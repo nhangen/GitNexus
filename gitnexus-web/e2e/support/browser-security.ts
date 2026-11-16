@@ -82,8 +82,9 @@ export const OFFICIAL_CFT_ARTIFACTS = {
 /**
  * Switches rejected in custom launch args: they disable or bypass sandboxing, site
  * isolation, web security, certificate checks, or local file isolation, or they replace
- * the sandboxed child executables. This is a best-effort deny list of known switches, not
- * an allow list; no production caller passes custom args today.
+ * the sandboxed child executables.
+ * Note: Launch args now enforce ALLOWED_LAUNCH_ARGS (an allow list) rather than this deny list,
+ * eliminating near-variant bypasses entirely.
  */
 export const DISALLOWED_SECURITY_FLAGS = [
   '--no-sandbox',
@@ -137,6 +138,7 @@ export const DISALLOWED_PROCESS_FLAGS = [
   '--browser-subprocess-path',
   '--disable-site-isolation-for-policy',
   '--no-sandbox-and-elevated',
+  '--ignore-certificate-errors',
 ] as const;
 
 /**
@@ -199,6 +201,37 @@ export const REQUIRED_BASE_LAUNCH_ARGS = [
   '--enable-webgl',
   '--enable-unsafe-swiftshader',
 ] as const;
+
+/**
+ * Allowed browser launch arguments: only the verified base args required for headless
+ * WebGL rendering (Sigma.js graph view).
+ *
+ * No shipped caller passes customArgs today. The only legitimate args are the four in
+ * REQUIRED_BASE_LAUNCH_ARGS, so an allow list closes the whole class of near-variants
+ * and security-bypassing overrides.
+ */
+export const ALLOWED_LAUNCH_ARGS = REQUIRED_BASE_LAUNCH_ARGS;
+
+/**
+ * Normalizes an argument and checks whether it is permitted by the launch args allow list.
+ * Chromium accepts `--name` and `-name` (and `/name` on Windows), and switch names
+ * case-insensitively on Windows.
+ */
+export function isAllowedLaunchArg(
+  arg: string,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  const trimmed = arg.trim().replace(/^["']+|["']+$/g, '');
+  const isSwitch = trimmed.startsWith('-') || (platform === 'win32' && trimmed.startsWith('/'));
+  if (!isSwitch) return false;
+  const eq = trimmed.indexOf('=');
+  const rawName = eq === -1 ? trimmed : trimmed.slice(0, eq);
+  const name = `--${rawName.replace(/^[-/]+/, '').toLowerCase()}`;
+  const value = eq === -1 ? undefined : trimmed.slice(eq + 1).replace(/^["']+|["']+$/g, '');
+  const normalized = value !== undefined ? `${name}=${value.toLowerCase()}` : name;
+
+  return (ALLOWED_LAUNCH_ARGS as readonly string[]).includes(normalized);
+}
 
 export interface SecureBrowserResolution {
   executablePath: string;
@@ -352,12 +385,15 @@ function defaultExecCommand(bin: string, args: string[]): string {
 
 /**
  * Sanitize launch arguments:
- * - Rejects any dangerous security-bypassing flags (throws).
+ * - Enforces an allow list: rejects any argument not explicitly permitted in ALLOWED_LAUNCH_ARGS (throws).
  * - Preserves required base rendering args without duplicates.
  */
-export function sanitizeLaunchArgs(customArgs: string[] = []): string[] {
+export function sanitizeLaunchArgs(
+  customArgs: string[] = [],
+  platform: NodeJS.Platform = process.platform,
+): string[] {
   for (const arg of customArgs) {
-    if (findDisallowedFlag(arg, DISALLOWED_SECURITY_FLAGS)) {
+    if (!isAllowedLaunchArg(arg, platform)) {
       throw new Error(
         `Insecure launch argument rejected: "${arg}" violates Chromium security baseline. Insecure overrides are forbidden.`,
       );
@@ -366,7 +402,13 @@ export function sanitizeLaunchArgs(customArgs: string[] = []): string[] {
 
   const sanitized = new Set<string>(REQUIRED_BASE_LAUNCH_ARGS);
   for (const arg of customArgs) {
-    sanitized.add(arg);
+    const trimmed = arg.trim().replace(/^["']+|["']+$/g, '');
+    const eq = trimmed.indexOf('=');
+    const rawName = eq === -1 ? trimmed : trimmed.slice(0, eq);
+    const name = `--${rawName.replace(/^[-/]+/, '').toLowerCase()}`;
+    const value = eq === -1 ? undefined : trimmed.slice(eq + 1).replace(/^["']+|["']+$/g, '');
+    const normalized = value !== undefined ? `${name}=${value.toLowerCase()}` : name;
+    sanitized.add(normalized);
   }
 
   return Array.from(sanitized);
@@ -677,7 +719,7 @@ export function resolveSecureBrowserLaunchOptions(
   const platform = options.platform ?? process.platform;
   const fsExists = options.fsExists ?? fs.existsSync;
   const execCommand = options.execCommand ?? defaultExecCommand;
-  const sanitizedArgs = sanitizeLaunchArgs(options.customArgs);
+  const sanitizedArgs = sanitizeLaunchArgs(options.customArgs, platform);
   const baseline = getMinimumSecurityBaseline(platform);
 
   const rejectionReasons: string[] = [];
