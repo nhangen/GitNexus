@@ -30,6 +30,8 @@ import {
   DISALLOWED_SECURITY_FLAGS,
   DISALLOWED_PROCESS_FLAGS,
   REQUIRED_BASE_LAUNCH_ARGS,
+  ALLOWED_LAUNCH_ARGS,
+  isAllowedLaunchArg,
   SYSTEM_PYTHON3,
   type LinuxProcReader,
   type SecureBrowserResolution,
@@ -96,6 +98,7 @@ const LITERAL_DISALLOWED_PROCESS_FLAGS = [
   '--browser-subprocess-path',
   '--disable-site-isolation-for-policy',
   '--no-sandbox-and-elevated',
+  '--ignore-certificate-errors',
 ];
 
 function writeStubBrowser(dir: string, versionLine: string): string {
@@ -312,7 +315,7 @@ describe('Chromium version verification', () => {
   });
 });
 
-describe('Launch argument deny list', () => {
+describe('Launch argument allow list', () => {
   it('preserves the required WebGL rendering flags', () => {
     const args = sanitizeLaunchArgs();
     for (const flag of [
@@ -331,22 +334,26 @@ describe('Launch argument deny list', () => {
     ]);
   });
 
-  it('rejects every disallowed flag, bare and with a value', () => {
+  it('rejects every known-dangerous flag, bare and with a value', () => {
     for (const disallowed of LITERAL_DISALLOWED_FLAGS) {
-      expect(() => sanitizeLaunchArgs([disallowed])).toThrow(/Insecure launch argument rejected/);
+      expect(() => sanitizeLaunchArgs([disallowed])).toThrow(
+        /Launch argument rejected: .* is not in ALLOWED_LAUNCH_ARGS/s,
+      );
       expect(() => sanitizeLaunchArgs([`${disallowed}=value`])).toThrow(
-        /Insecure launch argument rejected/,
+        /Launch argument rejected: .* is not in ALLOWED_LAUNCH_ARGS/s,
       );
     }
   });
 
-  it('rejects single-dash and upper-case spellings Chromium also accepts', () => {
+  it('rejects single-dash and upper-case spellings of a dangerous flag', () => {
     for (const arg of ['-no-sandbox', '--NO-SANDBOX', '-Disable-Web-Security', '---no-sandbox']) {
-      expect(() => sanitizeLaunchArgs([arg])).toThrow(/Insecure launch argument rejected/);
+      expect(() => sanitizeLaunchArgs([arg])).toThrow(
+        /Launch argument rejected: .* is not in ALLOWED_LAUNCH_ARGS/s,
+      );
     }
   });
 
-  it('rejects disabling site isolation features alone or inside a feature list', () => {
+  it('rejects any --disable-features list, including site isolation features', () => {
     for (const arg of [
       '--disable-features=site-per-process',
       '--disable-features=IsolateOrigins',
@@ -362,7 +369,9 @@ describe('Launch argument deny list', () => {
       '--disable-features="site-per-process"',
       '"--disable-features=SitePerProcess"',
     ]) {
-      expect(() => sanitizeLaunchArgs([arg])).toThrow(/Insecure launch argument rejected/);
+      expect(() => sanitizeLaunchArgs([arg])).toThrow(
+        /Launch argument rejected: .* is not in ALLOWED_LAUNCH_ARGS/s,
+      );
     }
   });
 
@@ -376,16 +385,95 @@ describe('Launch argument deny list', () => {
     expect(findDisallowedFlag('/no-sandbox', DISALLOWED_SECURITY_FLAGS, 'linux')).toBeUndefined();
   });
 
-  it('allows unrelated disabled features and safe custom flags', () => {
-    const sanitized = sanitizeLaunchArgs([
+  it('rejects unapproved custom flags and feature overrides', () => {
+    for (const arg of [
       '--custom-safe-flag',
       '--start-maximized',
       '--disable-features=Translate,MediaRouter',
-    ]);
-    expect(sanitized).toContain('--custom-safe-flag');
-    expect(sanitized).toContain('--start-maximized');
-    expect(sanitized).toContain('--disable-features=Translate,MediaRouter');
-    expect(sanitized).toContain('--enable-webgl');
+      '--disable-features=Translate',
+      'not-a-switch',
+    ]) {
+      expect(() => sanitizeLaunchArgs([arg])).toThrow(
+        /Launch argument rejected: .* is not in ALLOWED_LAUNCH_ARGS/s,
+      );
+    }
+  });
+
+  it('allows verified required base launch arguments in customArgs', () => {
+    const sanitized = sanitizeLaunchArgs(['--enable-webgl', '--use-gl=angle']);
+    expect(sanitized.sort()).toEqual([...REQUIRED_BASE_LAUNCH_ARGS].sort());
+  });
+
+  it('returns only the canonical base args for accepted spelling variants', () => {
+    const sanitized = sanitizeLaunchArgs(
+      ['"--enable-webgl"', '-ENABLE-WEBGL', '/USE-GL=angle', '--use-angle="SwiftShader"'],
+      'win32',
+    );
+    expect(sanitized).toEqual([...REQUIRED_BASE_LAUNCH_ARGS]);
+  });
+
+  it('rejects near-variants that would have bypassed a deny list', () => {
+    for (const arg of [
+      '--ignore-certificate-errors-spki-list',
+      '--allow-file-access',
+      '--load-extension',
+      '--load-extension=/path',
+      '--disable-extensions-except',
+      '--disable-extensions-except=/path',
+      '--proxy-server',
+      '--proxy-server=http://127.0.0.1:8080',
+      '--proxy-pac-url',
+      '--proxy-pac-url=http://127.0.0.1/pac',
+      '--host-resolver-rules',
+      '--host-resolver-rules="MAP * 127.0.0.1"',
+      '--js-flags',
+      '--js-flags="--no-opt"',
+      '--enable-features',
+      '--enable-features=network-service-in-process',
+      '--enable-features=NetworkServiceInProcess',
+    ]) {
+      expect(() => sanitizeLaunchArgs([arg])).toThrow(
+        /Launch argument rejected: .* is not in ALLOWED_LAUNCH_ARGS/s,
+      );
+    }
+  });
+
+  it('validates allowed launch args with isAllowedLaunchArg', () => {
+    expect(isAllowedLaunchArg('--use-gl=angle')).toBe(true);
+    expect(isAllowedLaunchArg('--use-angle=swiftshader')).toBe(true);
+    expect(isAllowedLaunchArg('--enable-webgl')).toBe(true);
+    expect(isAllowedLaunchArg('--enable-unsafe-swiftshader')).toBe(true);
+    expect(isAllowedLaunchArg('-enable-webgl')).toBe(true);
+    expect(isAllowedLaunchArg('--ENABLE-WEBGL')).toBe(true);
+    expect(isAllowedLaunchArg('/use-gl=angle', 'win32')).toBe(true);
+    expect(isAllowedLaunchArg('/use-gl=angle', 'linux')).toBe(false);
+    expect(isAllowedLaunchArg('--use-gl=other')).toBe(false);
+    expect(isAllowedLaunchArg('--enable-webgl=value')).toBe(false);
+    expect(isAllowedLaunchArg('not-a-switch')).toBe(false);
+  });
+
+  it('allows no switch that the dangerous-flag list forbids', () => {
+    for (const platform of ['linux', 'darwin', 'win32'] as const) {
+      for (const arg of ALLOWED_LAUNCH_ARGS) {
+        expect(findDisallowedFlag(arg, DISALLOWED_SECURITY_FLAGS, platform)).toBeUndefined();
+        expect(findDisallowedFlag(arg, DISALLOWED_PROCESS_FLAGS, platform)).toBeUndefined();
+      }
+    }
+  });
+
+  it('rejects a dangerous arg mixed with allowed ones, and smuggled extra switches', () => {
+    for (const args of [
+      ['--enable-webgl', '--no-sandbox'],
+      ['--no-sandbox', '--enable-webgl'],
+      ['--enable-webgl --no-sandbox'],
+      ['--use-gl=angle,--no-sandbox'],
+      ['--use-gl=angle --no-sandbox'],
+      ['--enable-webgl\n--no-sandbox'],
+    ]) {
+      expect(() => sanitizeLaunchArgs(args)).toThrow(
+        /Launch argument rejected: .* is not in ALLOWED_LAUNCH_ARGS/s,
+      );
+    }
   });
 
   it('lists every literal disallowed flag', () => {
@@ -424,6 +512,24 @@ describe('Fail-closed executable resolution', () => {
           fsExists: () => false,
         }),
       ).toThrow(/executable file not found/);
+    });
+
+    it('validates customArgs with the resolved platform', () => {
+      const base = {
+        customExecutablePath: '/usr/bin/custom-chrome',
+        fsExists: () => true,
+        execCommand: () => 'Google Chrome 156.0.8078.80\n',
+        customArgs: ['/use-gl=angle'],
+      };
+      expect(resolveSecureBrowserLaunchOptions({ ...base, platform: 'win32' }).args).toEqual([
+        ...REQUIRED_BASE_LAUNCH_ARGS,
+      ]);
+      expect(() => resolveSecureBrowserLaunchOptions({ ...base, platform: 'linux' })).toThrow(
+        /Launch argument rejected: .* is not in ALLOWED_LAUNCH_ARGS/s,
+      );
+      expect(() =>
+        resolveSecureBrowserLaunchOptions({ ...base, customArgs: ['--no-sandbox'] }),
+      ).toThrow(/Launch argument rejected: .* is not in ALLOWED_LAUNCH_ARGS/s);
     });
 
     it('refuses a custom executable below the floor', () => {

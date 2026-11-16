@@ -80,10 +80,10 @@ export const OFFICIAL_CFT_ARTIFACTS = {
 } as const;
 
 /**
- * Switches rejected in custom launch args: they disable or bypass sandboxing, site
- * isolation, web security, certificate checks, or local file isolation, or they replace
- * the sandboxed child executables. This is a best-effort deny list of known switches, not
- * an allow list; no production caller passes custom args today.
+ * Known switches that disable or bypass sandboxing, site isolation, web security,
+ * certificate checks, or local file isolation, or that replace the sandboxed child
+ * executables. Custom launch args are gated by ALLOWED_LAUNCH_ARGS, not by this list; it
+ * is kept so tests can assert that no allow-list entry is a known-dangerous switch.
  */
 export const DISALLOWED_SECURITY_FLAGS = [
   '--no-sandbox',
@@ -137,6 +137,7 @@ export const DISALLOWED_PROCESS_FLAGS = [
   '--browser-subprocess-path',
   '--disable-site-isolation-for-policy',
   '--no-sandbox-and-elevated',
+  '--ignore-certificate-errors',
 ] as const;
 
 /**
@@ -162,6 +163,25 @@ function normalizeFeatureEntry(entry: string): string {
 }
 
 /**
+ * Splits a switch into a normalized `--lowercase` name and its raw `=` value, after
+ * stripping surrounding whitespace and quotes. Returns undefined for a non-switch.
+ */
+function parseSwitch(
+  arg: string,
+  platform: NodeJS.Platform,
+): { name: string; rawValue: string | undefined } | undefined {
+  const trimmed = arg.trim().replace(/^["']+|["']+$/g, '');
+  const isSwitch = trimmed.startsWith('-') || (platform === 'win32' && trimmed.startsWith('/'));
+  if (!isSwitch) return undefined;
+  const eq = trimmed.indexOf('=');
+  const rawName = eq === -1 ? trimmed : trimmed.slice(0, eq);
+  return {
+    name: `--${rawName.replace(/^[-/]+/, '').toLowerCase()}`,
+    rawValue: eq === -1 ? undefined : trimmed.slice(eq + 1),
+  };
+}
+
+/**
  * Chromium accepts `--name` and `-name` (and `/name` on Windows), and switch names
  * case-insensitively on Windows, so matching is done on a normalized `--lowercase` name.
  * Feature-list entries are compared without a `*` prefix or a `<Trial` / `:params` suffix.
@@ -171,18 +191,12 @@ export function findDisallowedFlag(
   disallowed: readonly string[],
   platform: NodeJS.Platform = process.platform,
 ): string | undefined {
-  const trimmed = arg.trim().replace(/^["']+|["']+$/g, '');
-  const isSwitch = trimmed.startsWith('-') || (platform === 'win32' && trimmed.startsWith('/'));
-  if (!isSwitch) return undefined;
-  const eq = trimmed.indexOf('=');
-  const rawName = eq === -1 ? trimmed : trimmed.slice(0, eq);
-  const name = `--${rawName.replace(/^[-/]+/, '').toLowerCase()}`;
+  const parsed = parseSwitch(arg, platform);
+  if (!parsed) return undefined;
+  const { name, rawValue } = parsed;
   if (disallowed.some((flag) => flag.toLowerCase() === name)) return name;
-  if (name === '--disable-features' && eq !== -1) {
-    const features = trimmed
-      .slice(eq + 1)
-      .split(',')
-      .map(normalizeFeatureEntry);
+  if (name === '--disable-features' && rawValue !== undefined) {
+    const features = rawValue.split(',').map(normalizeFeatureEntry);
     for (const feature of DISALLOWED_DISABLED_FEATURES) {
       if (features.includes(feature.toLowerCase())) return `--disable-features=${feature}`;
     }
@@ -199,6 +213,32 @@ export const REQUIRED_BASE_LAUNCH_ARGS = [
   '--enable-webgl',
   '--enable-unsafe-swiftshader',
 ] as const;
+
+/**
+ * Allowed browser launch arguments: only the verified base args required for headless
+ * WebGL rendering (Sigma.js graph view).
+ *
+ * No shipped caller passes customArgs today. The only legitimate args are the four in
+ * REQUIRED_BASE_LAUNCH_ARGS, so an allow list closes the whole class of near-variants in
+ * customArgs. The running-process check (DISALLOWED_PROCESS_FLAGS) is still a deny list.
+ */
+export const ALLOWED_LAUNCH_ARGS = REQUIRED_BASE_LAUNCH_ARGS;
+
+/**
+ * Whether an argument is on the launch args allow list. Every spelling Chromium accepts
+ * (`-name`, `/name` on Windows, quoted) is matched, with the name and the value compared
+ * lowercased on every platform.
+ */
+export function isAllowedLaunchArg(
+  arg: string,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  const parsed = parseSwitch(arg, platform);
+  if (!parsed) return false;
+  const value = parsed.rawValue?.replace(/^["']+|["']+$/g, '').toLowerCase();
+  const normalized = value !== undefined ? `${parsed.name}=${value}` : parsed.name;
+  return (ALLOWED_LAUNCH_ARGS as readonly string[]).includes(normalized);
+}
 
 export interface SecureBrowserResolution {
   executablePath: string;
@@ -334,24 +374,23 @@ function defaultExecCommand(bin: string, args: string[]): string {
 
 /**
  * Sanitize launch arguments:
- * - Rejects any dangerous security-bypassing flags (throws).
- * - Preserves required base rendering args without duplicates.
+ * - Enforces an allow list: rejects any argument not explicitly permitted in ALLOWED_LAUNCH_ARGS (throws).
+ * - Returns the required base rendering args; an accepted custom arg is always one of them.
  */
-export function sanitizeLaunchArgs(customArgs: string[] = []): string[] {
+export function sanitizeLaunchArgs(
+  customArgs: string[] = [],
+  platform: NodeJS.Platform = process.platform,
+): string[] {
   for (const arg of customArgs) {
-    if (findDisallowedFlag(arg, DISALLOWED_SECURITY_FLAGS)) {
+    if (!isAllowedLaunchArg(arg, platform)) {
       throw new Error(
-        `Insecure launch argument rejected: "${arg}" violates Chromium security baseline. Insecure overrides are forbidden.`,
+        `Launch argument rejected: "${arg}" is not in ALLOWED_LAUNCH_ARGS (${ALLOWED_LAUNCH_ARGS.join(', ')}). ` +
+          'Adding a launch arg to the allow list needs a security review.',
       );
     }
   }
 
-  const sanitized = new Set<string>(REQUIRED_BASE_LAUNCH_ARGS);
-  for (const arg of customArgs) {
-    sanitized.add(arg);
-  }
-
-  return Array.from(sanitized);
+  return [...REQUIRED_BASE_LAUNCH_ARGS];
 }
 
 export interface ProcessTreeValidationResult {
@@ -659,7 +698,7 @@ export function resolveSecureBrowserLaunchOptions(
   const platform = options.platform ?? process.platform;
   const fsExists = options.fsExists ?? fs.existsSync;
   const execCommand = options.execCommand ?? defaultExecCommand;
-  const sanitizedArgs = sanitizeLaunchArgs(options.customArgs);
+  const sanitizedArgs = sanitizeLaunchArgs(options.customArgs, platform);
   const baseline = getMinimumSecurityBaseline(platform);
 
   const rejectionReasons: string[] = [];
