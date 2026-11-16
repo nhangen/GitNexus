@@ -94,6 +94,7 @@ jobs:
       # For tag-push events github.ref is already the tag ref — no override needed.
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          persist-credentials: false
           ref: ${{ inputs.tag || github.ref }}
 
       # ── Lock the docker image version to the npm package version ──────────

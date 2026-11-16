@@ -131,6 +131,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          persist-credentials: false
           repository: ${{ steps.pr.outputs.is_pr == 'true' && steps.pr.outputs.repo || github.repository }}
           ref: ${{ steps.pr.outputs.is_pr == 'true' && steps.pr.outputs.sha || '' }}
           fetch-depth: 1
