@@ -859,7 +859,7 @@ const REVIEWED_FILE_SHA256: Record<string, string> = {
   '.github/actions/setup-gitnexus-web/action.yml':
     '8ab60a4f3a85d3f983e3d9c36536f3d3e0dd1342d0ce66011cfcf3bc49f33d56',
   'gitnexus-web/e2e/support/assert-live-results.mjs':
-    'daaf858ec7878654ec24225605d0c525f5ef764ea57e7ef755e36191b05a17f5',
+    '9262f184c88746271f98f300f0e102eb7bb18c890bd8dfcd8e4cff89a2758103',
 };
 
 describe('CI pin parity with the resolver', () => {

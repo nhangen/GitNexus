@@ -1,3 +1,4 @@
+// @ts-check
 // Exit status alone can't show the live tests ran: they skip without a pinned browser, and a
 // vitest config change can exclude or filter tests while the run still exits 0. The workflow pin
 // tests are required here too, so the e2e job runs them whatever tests the config selects. This
@@ -30,8 +31,36 @@ const REQUIRED_PASSED = [
   ['Live browser launch and boundaries', 'enforces CSP and CORS with the configured context'],
 ];
 
+/**
+ * @typedef {{
+ *   title?: string;
+ *   ancestorTitles?: string[];
+ *   status?: string;
+ * }} VitestAssertionResult
+ *
+ * @typedef {{
+ *   name?: string;
+ *   assertionResults?: VitestAssertionResult[];
+ * }} VitestFileResult
+ *
+ * @typedef {{
+ *   success?: boolean;
+ *   numFailedTests?: number;
+ *   testResults?: VitestFileResult[];
+ * }} VitestReport
+ */
+
+/**
+ * @param {string} p
+ * @returns {string}
+ */
 const normalize = (p) => p.replace(/\\/g, '/');
 
+/**
+ * @param {VitestReport} report
+ * @param {string} expectedFile
+ * @returns {string[]}
+ */
 function problemsIn(report, expectedFile) {
   const problems = [];
   if (report?.success !== true) problems.push('vitest run did not report success');
