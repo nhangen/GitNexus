@@ -617,10 +617,7 @@ export function readLinuxSandboxState(
 }
 
 /**
- * Test whether a process is currently running by signalling PID with signal 0.
- * In POSIX, kill(pid, 0) performs error checking without sending a signal.
- * Returns true if the process exists (even if unprivileged, EPERM), false if ESRCH.
- * On Linux, additionally checks /proc/<pid>/status to ensure the process is not a zombie.
+ * Whether PID is running. A Linux zombie counts as not running.
  */
 export function isProcessRunning(pid: number | string): boolean {
   const numericPid = Number(pid);
@@ -677,6 +674,10 @@ export function checkRendererSandboxState(
   browserPid: number | string,
   options: RendererSandboxOptions = {},
 ): RendererSandboxResult {
+  const numericPid = Number(rendererPid);
+  if (!Number.isInteger(numericPid) || numericPid <= 0) {
+    throw new Error(`Invalid PID "${rendererPid}" for renderer sandbox check`);
+  }
   const platform = options.platform ?? process.platform;
   const isAlive = options.isProcessRunning ?? isProcessRunning;
 
@@ -687,6 +688,9 @@ export function checkRendererSandboxState(
   try {
     if (platform === 'darwin') {
       const sandboxed = checkProcessSeatbeltSandboxed(rendererPid, options.execCommand);
+      // sandbox_check returns 1 (sandboxed) for a dead PID instead of failing, so a
+      // renderer that exited mid-read would pass. Linux needs no recheck: a dead PID's
+      // /proc reads throw. A PID reused before this recheck can still slip through.
       if (!isAlive(rendererPid)) {
         return { verified: false, exited: true };
       }
@@ -722,6 +726,9 @@ export function verifyRenderersSandboxed(
   expectedSandboxed = true,
   options: RendererSandboxOptions = {},
 ): RenderersSandboxVerificationResult {
+  if (rendererPids.length === 0) {
+    throw new Error('No renderer PIDs supplied for kernel sandbox check');
+  }
   const verifiedPids: string[] = [];
   const exitedPids: string[] = [];
 
