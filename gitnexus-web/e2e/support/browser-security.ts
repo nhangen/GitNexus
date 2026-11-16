@@ -80,11 +80,10 @@ export const OFFICIAL_CFT_ARTIFACTS = {
 } as const;
 
 /**
- * Switches rejected in custom launch args: they disable or bypass sandboxing, site
- * isolation, web security, certificate checks, or local file isolation, or they replace
- * the sandboxed child executables.
- * Note: Launch args now enforce ALLOWED_LAUNCH_ARGS (an allow list) rather than this deny list,
- * eliminating near-variant bypasses entirely.
+ * Known switches that disable or bypass sandboxing, site isolation, web security,
+ * certificate checks, or local file isolation, or that replace the sandboxed child
+ * executables. Custom launch args are gated by ALLOWED_LAUNCH_ARGS, not by this list; it
+ * is kept so tests can assert that no allow-list entry is a known-dangerous switch.
  */
 export const DISALLOWED_SECURITY_FLAGS = [
   '--no-sandbox',
@@ -220,15 +219,15 @@ export const REQUIRED_BASE_LAUNCH_ARGS = [
  * WebGL rendering (Sigma.js graph view).
  *
  * No shipped caller passes customArgs today. The only legitimate args are the four in
- * REQUIRED_BASE_LAUNCH_ARGS, so an allow list closes the whole class of near-variants
- * and security-bypassing overrides.
+ * REQUIRED_BASE_LAUNCH_ARGS, so an allow list closes the whole class of near-variants in
+ * customArgs. The running-process check (DISALLOWED_PROCESS_FLAGS) is still a deny list.
  */
 export const ALLOWED_LAUNCH_ARGS = REQUIRED_BASE_LAUNCH_ARGS;
 
 /**
- * Normalizes an argument and checks whether it is permitted by the launch args allow list.
- * Chromium accepts `--name` and `-name` (and `/name` on Windows), and switch names
- * case-insensitively on Windows.
+ * Whether an argument is on the launch args allow list. Every spelling Chromium accepts
+ * (`-name`, `/name` on Windows, quoted) is matched, with the name and the value compared
+ * lowercased on every platform.
  */
 export function isAllowedLaunchArg(
   arg: string,
