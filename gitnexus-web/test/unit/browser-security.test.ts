@@ -155,29 +155,41 @@ describe('Chromium version verification', () => {
       expect(getMinimumSecurityBaseline('linux')).toBe('156.0.8078.73');
       expect(getMinimumSecurityBaseline('darwin')).toBe('156.0.8078.73');
       expect(getMinimumSecurityBaseline('win32')).toBe('156.0.8078.74');
+      expect(getMinimumSecurityBaseline('freebsd')).toBe('156.0.8078.73');
     });
 
     it('accepts versions meeting the platform floor', () => {
-      expect(isSecureChromiumVersion('156.0.8078.73', 'linux')).toBe(true);
-      expect(isSecureChromiumVersion('156.0.8078.73', 'darwin')).toBe(true);
-      expect(isSecureChromiumVersion('156.0.8078.73', 'win32')).toBe(false);
-      expect(isSecureChromiumVersion('156.0.8078.74', 'win32')).toBe(true);
-      expect(isSecureChromiumVersion(PINNED_CFT_VERSION)).toBe(true);
-      expect(isSecureChromiumVersion('157.0.0.0')).toBe(true);
+      expect(isSecureChromiumVersion('156.0.8078.73', getMinimumSecurityBaseline('linux'))).toBe(
+        true,
+      );
+      expect(isSecureChromiumVersion('156.0.8078.73', getMinimumSecurityBaseline('darwin'))).toBe(
+        true,
+      );
+      expect(isSecureChromiumVersion('156.0.8078.73', getMinimumSecurityBaseline('win32'))).toBe(
+        false,
+      );
+      expect(isSecureChromiumVersion('156.0.8078.74', getMinimumSecurityBaseline('win32'))).toBe(
+        true,
+      );
+      expect(isSecureChromiumVersion('156.0.8078.73', getMinimumSecurityBaseline('freebsd'))).toBe(
+        true,
+      );
+      expect(isSecureChromiumVersion(PINNED_CFT_VERSION, MIN_CHROMIUM_SECURITY_VERSION)).toBe(true);
+      expect(isSecureChromiumVersion('157.0.0.0', MIN_CHROMIUM_SECURITY_VERSION)).toBe(true);
     });
 
     it('rejects the Playwright 1.58.2 bundled Chromium (145.0.7632.6)', () => {
-      expect(isSecureChromiumVersion('145.0.7632.6')).toBe(false);
+      expect(isSecureChromiumVersion('145.0.7632.6', MIN_CHROMIUM_SECURITY_VERSION)).toBe(false);
     });
 
     it('rejects the Playwright 1.64.1 mapped Chromium (156.0.8078.4)', () => {
-      expect(isSecureChromiumVersion('156.0.8078.4')).toBe(false);
+      expect(isSecureChromiumVersion('156.0.8078.4', MIN_CHROMIUM_SECURITY_VERSION)).toBe(false);
     });
 
     it('rejects builds below the floor', () => {
-      expect(isSecureChromiumVersion('156.0.8078.72')).toBe(false);
-      expect(isSecureChromiumVersion('150.0.0.0')).toBe(false);
-      expect(isSecureChromiumVersion('140.0.0.0')).toBe(false);
+      expect(isSecureChromiumVersion('156.0.8078.72', MIN_CHROMIUM_SECURITY_VERSION)).toBe(false);
+      expect(isSecureChromiumVersion('150.0.0.0', MIN_CHROMIUM_SECURITY_VERSION)).toBe(false);
+      expect(isSecureChromiumVersion('140.0.0.0', MIN_CHROMIUM_SECURITY_VERSION)).toBe(false);
     });
   });
 
@@ -250,23 +262,51 @@ describe('Chromium version verification', () => {
     });
 
     it('rejects a live version below the floor', () => {
-      expect(verifyLiveBrowserVersion({ version: () => '156.0.8078.80' }, 'linux')).toBe(
-        '156.0.8078.80',
-      );
-      expect(() => verifyLiveBrowserVersion({ version: () => '145.0.7632.6' }, 'linux')).toThrow(
-        /below minimum secure baseline/,
-      );
+      expect(
+        verifyLiveBrowserVersion(
+          { version: () => '156.0.8078.80' },
+          getMinimumSecurityBaseline('linux'),
+        ),
+      ).toBe('156.0.8078.80');
+      expect(() =>
+        verifyLiveBrowserVersion(
+          { version: () => '145.0.7632.6' },
+          getMinimumSecurityBaseline('linux'),
+        ),
+      ).toThrow(/below minimum secure baseline/);
     });
 
     it('applies the Windows floor to a Windows live browser', () => {
-      expect(() => verifyLiveBrowserVersion({ version: () => '156.0.8078.73' }, 'win32')).toThrow(
-        /below minimum secure baseline 156.0.8078.74/,
-      );
+      expect(() =>
+        verifyLiveBrowserVersion(
+          { version: () => '156.0.8078.73' },
+          getMinimumSecurityBaseline('win32'),
+        ),
+      ).toThrow(/below minimum secure baseline 156.0.8078.74/);
+    });
+
+    it('applies the POSIX floor to a FreeBSD live browser without throwing version parse errors', () => {
+      expect(
+        verifyLiveBrowserVersion(
+          { version: () => '156.0.8078.73' },
+          getMinimumSecurityBaseline('freebsd'),
+        ),
+      ).toBe('156.0.8078.73');
+      expect(() =>
+        verifyLiveBrowserVersion(
+          { version: () => '156.0.8078.72' },
+          getMinimumSecurityBaseline('freebsd'),
+        ),
+      ).toThrow(/below minimum secure baseline 156.0.8078.73/);
     });
 
     it('rejects a live version that differs from a required exact pin', () => {
       expect(() =>
-        verifyLiveBrowserVersion({ version: () => '156.0.8078.81' }, 'linux', '156.0.8078.80'),
+        verifyLiveBrowserVersion(
+          { version: () => '156.0.8078.81' },
+          getMinimumSecurityBaseline('linux'),
+          '156.0.8078.80',
+        ),
       ).toThrow(/does not match the required pinned version 156.0.8078.80/);
     });
   });
@@ -1319,6 +1359,21 @@ describe('Global setup post-launch verification', () => {
     ).rejects.toThrow(/below minimum secure baseline 156.0.8078.74/);
   });
 
+  it('applies the POSIX floor on FreeBSD without throwing', async () => {
+    const { launch, state } = fakeLaunch('156.0.8078.73');
+    await createGlobalSetup({ resolve: fakeResolution, launch, platform: 'freebsd' })();
+    expect(state.closed).toBe(true);
+
+    const belowFloor = fakeLaunch('156.0.8078.72');
+    await expect(
+      createGlobalSetup({
+        resolve: fakeResolution,
+        launch: belowFloor.launch,
+        platform: 'freebsd',
+      })(),
+    ).rejects.toThrow(/below minimum secure baseline 156.0.8078.73/);
+  });
+
   it('rejects a launched browser that differs from the required exact pin', async () => {
     const { launch } = fakeLaunch('156.0.8078.81');
     await expect(
@@ -1538,7 +1593,7 @@ describe('Live browser launch and boundaries', () => {
         await globalSetup();
         verifyLiveBrowserVersion(
           browser,
-          process.platform,
+          getMinimumSecurityBaseline(process.platform),
           process.env.GITNEXUS_EXPECTED_CHROME_VERSION || undefined,
         );
 
