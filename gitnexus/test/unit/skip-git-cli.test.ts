@@ -73,18 +73,24 @@ describe('--skip-git CLI flag', () => {
           env,
         },
       );
-      expect(keepContext).toContain('"status": "found"');
-      expect(keepContext).toContain('"filePath": "src/keep.ts"');
+      // stdout is a pipe here (non-TTY), so output() emits compact JSON —
+      // the isTTY-only indentation upstream #3947/#3953 ported to this fork.
+      expect(keepContext).toContain('"status":"found"');
+      expect(keepContext).toContain('"filePath":"src/keep.ts"');
 
-      const leakedContext = execSync(
-        `node "${cliPath}" context leaked --repo "${path.basename(tmpDir)}"`,
-        {
+      // The ported #2469/#2915 fail-closed block makes an error payload exit 1,
+      // so read stdout from the non-zero exit instead of execSync returning it.
+      let leakedContext = '';
+      try {
+        execSync(`node "${cliPath}" context leaked --repo "${path.basename(tmpDir)}"`, {
           encoding: 'utf8',
           timeout: 60000,
           env,
-        },
-      );
-      expect(leakedContext).toContain(`"error": "Symbol 'leaked' not found"`);
+        });
+      } catch (err: any) {
+        leakedContext = err.stdout || '';
+      }
+      expect(leakedContext).toContain(`"error":"Symbol 'leaked' not found"`);
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
       fs.rmSync(gitnexusHome, { recursive: true, force: true });
