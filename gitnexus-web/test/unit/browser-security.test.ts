@@ -174,11 +174,14 @@ describe('Chromium version verification', () => {
       expect(isSecureChromiumVersion('156.0.8078.74', getMinimumSecurityBaseline('win32'))).toBe(
         true,
       );
-      expect(isSecureChromiumVersion('156.0.8078.73', getMinimumSecurityBaseline('freebsd'))).toBe(
-        true,
-      );
       expect(isSecureChromiumVersion(PINNED_CFT_VERSION, MIN_CHROMIUM_SECURITY_VERSION)).toBe(true);
       expect(isSecureChromiumVersion('157.0.0.0', MIN_CHROMIUM_SECURITY_VERSION)).toBe(true);
+    });
+
+    it('throws when a platform name is passed where a baseline version belongs', () => {
+      expect(() => isSecureChromiumVersion('156.0.8078.80', 'linux')).toThrow(
+        /Invalid version component/,
+      );
     });
 
     it('rejects the Playwright 1.58.2 bundled Chromium (145.0.7632.6)', () => {
@@ -288,7 +291,7 @@ describe('Chromium version verification', () => {
       ).toThrow(/below minimum secure baseline 156.0.8078.74/);
     });
 
-    it('applies the POSIX floor to a FreeBSD live browser without throwing version parse errors', () => {
+    it('checks a FreeBSD live browser against the POSIX floor', () => {
       expect(
         verifyLiveBrowserVersion(
           { version: () => '156.0.8078.73' },
@@ -1465,7 +1468,7 @@ describe('Global setup post-launch verification', () => {
     ).rejects.toThrow(/below minimum secure baseline 156.0.8078.74/);
   });
 
-  it('applies the POSIX floor on FreeBSD without throwing', async () => {
+  it('applies the POSIX floor on FreeBSD', async () => {
     const { launch, state } = fakeLaunch('156.0.8078.73');
     await createGlobalSetup({ resolve: fakeResolution, launch, platform: 'freebsd' })();
     expect(state.closed).toBe(true);
@@ -1478,6 +1481,7 @@ describe('Global setup post-launch verification', () => {
         platform: 'freebsd',
       })(),
     ).rejects.toThrow(/below minimum secure baseline 156.0.8078.73/);
+    expect(belowFloor.state.closed).toBe(true);
   });
 
   it('rejects a launched browser that differs from the required exact pin', async () => {

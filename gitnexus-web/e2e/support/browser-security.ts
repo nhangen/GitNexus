@@ -29,7 +29,7 @@ export const MIN_CHROMIUM_SECURITY_VERSION_POSIX = '156.0.8078.73';
 export const MIN_CHROMIUM_SECURITY_VERSION_WIN32 = '156.0.8078.74';
 export const MIN_CHROMIUM_SECURITY_VERSION = MIN_CHROMIUM_SECURITY_VERSION_POSIX;
 
-export function getMinimumSecurityBaseline(platform: NodeJS.Platform = process.platform): string {
+export function getMinimumSecurityBaseline(platform: NodeJS.Platform): string {
   return platform === 'win32'
     ? MIN_CHROMIUM_SECURITY_VERSION_WIN32
     : MIN_CHROMIUM_SECURITY_VERSION_POSIX;
