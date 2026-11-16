@@ -197,6 +197,7 @@ export const REQUIRED_BASE_LAUNCH_ARGS = [
   '--use-gl=angle',
   '--use-angle=swiftshader',
   '--enable-webgl',
+  // Accepted risk: E2E renders only first-party content.
   '--enable-unsafe-swiftshader',
 ] as const;
 
