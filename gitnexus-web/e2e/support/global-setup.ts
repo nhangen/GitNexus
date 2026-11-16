@@ -1,5 +1,6 @@
 import { chromium } from '@playwright/test';
 import {
+  getMinimumSecurityBaseline,
   resolveSecureBrowserLaunchOptions,
   verifyLiveBrowserVersion,
   type SecureBrowserResolution,
@@ -36,7 +37,11 @@ export function createGlobalSetup(deps: GlobalSetupDeps): () => Promise<void> {
       headless: true,
     });
     try {
-      verifyLiveBrowserVersion(browser, deps.platform, deps.expectedExactVersion);
+      verifyLiveBrowserVersion(
+        browser,
+        getMinimumSecurityBaseline(deps.platform),
+        deps.expectedExactVersion,
+      );
     } finally {
       await browser.close();
     }

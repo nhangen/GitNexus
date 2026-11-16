@@ -29,7 +29,7 @@ export const MIN_CHROMIUM_SECURITY_VERSION_POSIX = '156.0.8078.73';
 export const MIN_CHROMIUM_SECURITY_VERSION_WIN32 = '156.0.8078.74';
 export const MIN_CHROMIUM_SECURITY_VERSION = MIN_CHROMIUM_SECURITY_VERSION_POSIX;
 
-export function getMinimumSecurityBaseline(platform: NodeJS.Platform = process.platform): string {
+export function getMinimumSecurityBaseline(platform: NodeJS.Platform): string {
   return platform === 'win32'
     ? MIN_CHROMIUM_SECURITY_VERSION_WIN32
     : MIN_CHROMIUM_SECURITY_VERSION_POSIX;
@@ -298,16 +298,7 @@ export function compareChromiumVersions(v1: string, v2: string): number {
 /**
  * Verify whether a Chromium version meets or exceeds the security baseline.
  */
-export function isSecureChromiumVersion(
-  version: string,
-  baselineOrPlatform: string | NodeJS.Platform = MIN_CHROMIUM_SECURITY_VERSION,
-): boolean {
-  const baseline =
-    baselineOrPlatform === 'win32' ||
-    baselineOrPlatform === 'linux' ||
-    baselineOrPlatform === 'darwin'
-      ? getMinimumSecurityBaseline(baselineOrPlatform)
-      : baselineOrPlatform;
+export function isSecureChromiumVersion(version: string, baseline: string): boolean {
   return compareChromiumVersions(version, baseline) >= 0;
 }
 
@@ -356,7 +347,7 @@ export function probeBrowserVersion(
  */
 export function verifyLiveBrowserVersion(
   browser: { version(): string },
-  baselineOrPlatform: string | NodeJS.Platform = process.platform,
+  baseline: string,
   expectedExactVersion?: string,
 ): string {
   const ver = browser.version();
@@ -365,18 +356,9 @@ export function verifyLiveBrowserVersion(
       `Live launched browser version ${ver} does not match the required pinned version ${expectedExactVersion}.`,
     );
   }
-  if (!isSecureChromiumVersion(ver, baselineOrPlatform)) {
-    const targetBaseline =
-      typeof baselineOrPlatform === 'string' &&
-      !['win32', 'linux', 'darwin'].includes(baselineOrPlatform)
-        ? baselineOrPlatform
-        : getMinimumSecurityBaseline(
-            typeof baselineOrPlatform === 'string'
-              ? (baselineOrPlatform as NodeJS.Platform)
-              : undefined,
-          );
+  if (!isSecureChromiumVersion(ver, baseline)) {
     throw new Error(
-      `Live launched browser version ${ver} is below minimum secure baseline ${targetBaseline}.`,
+      `Live launched browser version ${ver} is below minimum secure baseline ${baseline}.`,
     );
   }
   return ver;
