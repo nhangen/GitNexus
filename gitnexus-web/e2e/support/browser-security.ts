@@ -403,7 +403,8 @@ export function sanitizeLaunchArgs(
   for (const arg of customArgs) {
     if (!isAllowedLaunchArg(arg, platform)) {
       throw new Error(
-        `Insecure launch argument rejected: "${arg}" violates Chromium security baseline. Insecure overrides are forbidden.`,
+        `Launch argument rejected: "${arg}" is not in ALLOWED_LAUNCH_ARGS (${ALLOWED_LAUNCH_ARGS.join(', ')}). ` +
+          'Adding a launch arg to the allow list needs a security review.',
       );
     }
   }

@@ -296,16 +296,20 @@ describe('Launch argument allow list', () => {
 
   it('rejects every disallowed flag, bare and with a value', () => {
     for (const disallowed of LITERAL_DISALLOWED_FLAGS) {
-      expect(() => sanitizeLaunchArgs([disallowed])).toThrow(/Insecure launch argument rejected/);
+      expect(() => sanitizeLaunchArgs([disallowed])).toThrow(
+        /Launch argument rejected: .* is not in ALLOWED_LAUNCH_ARGS/,
+      );
       expect(() => sanitizeLaunchArgs([`${disallowed}=value`])).toThrow(
-        /Insecure launch argument rejected/,
+        /Launch argument rejected: .* is not in ALLOWED_LAUNCH_ARGS/,
       );
     }
   });
 
   it('rejects single-dash and upper-case spellings Chromium also accepts', () => {
     for (const arg of ['-no-sandbox', '--NO-SANDBOX', '-Disable-Web-Security', '---no-sandbox']) {
-      expect(() => sanitizeLaunchArgs([arg])).toThrow(/Insecure launch argument rejected/);
+      expect(() => sanitizeLaunchArgs([arg])).toThrow(
+        /Launch argument rejected: .* is not in ALLOWED_LAUNCH_ARGS/,
+      );
     }
   });
 
@@ -325,7 +329,9 @@ describe('Launch argument allow list', () => {
       '--disable-features="site-per-process"',
       '"--disable-features=SitePerProcess"',
     ]) {
-      expect(() => sanitizeLaunchArgs([arg])).toThrow(/Insecure launch argument rejected/);
+      expect(() => sanitizeLaunchArgs([arg])).toThrow(
+        /Launch argument rejected: .* is not in ALLOWED_LAUNCH_ARGS/,
+      );
     }
   });
 
@@ -347,7 +353,9 @@ describe('Launch argument allow list', () => {
       '--disable-features=Translate',
       'not-a-switch',
     ]) {
-      expect(() => sanitizeLaunchArgs([arg])).toThrow(/Insecure launch argument rejected/);
+      expect(() => sanitizeLaunchArgs([arg])).toThrow(
+        /Launch argument rejected: .* is not in ALLOWED_LAUNCH_ARGS/,
+      );
     }
   });
 
@@ -384,7 +392,9 @@ describe('Launch argument allow list', () => {
       '--enable-features=network-service-in-process',
       '--enable-features=NetworkServiceInProcess',
     ]) {
-      expect(() => sanitizeLaunchArgs([arg])).toThrow(/Insecure launch argument rejected/);
+      expect(() => sanitizeLaunchArgs([arg])).toThrow(
+        /Launch argument rejected: .* is not in ALLOWED_LAUNCH_ARGS/,
+      );
     }
   });
 
