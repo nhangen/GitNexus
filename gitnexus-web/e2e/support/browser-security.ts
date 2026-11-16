@@ -50,7 +50,7 @@ export const GOOGLE_SECURITY_ADVISORY_URL =
 /**
  * Official Chrome for Testing (CfT) download URLs and archive layouts for the pinned build.
  * Archive integrity is checked in CI (.github/workflows/ci-e2e.yml) against recorded GCS
- * object metadata; that is storage metadata, not a publisher signature.
+ * object metadata and a first-use SHA256 pin; neither is a publisher signature.
  */
 const CFT_BUCKET = `https://storage.googleapis.com/chrome-for-testing-public/${PINNED_CFT_VERSION}`;
 

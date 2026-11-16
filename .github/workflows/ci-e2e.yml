@@ -53,14 +53,15 @@ jobs:
         run: npx playwright install ffmpeg
         working-directory: gitnexus-web
 
-      # EXPECTED_MD5 and EXPECTED_SIZE were confirmed against live GCS object metadata (md5Hash,
-      # size) of the archive below (storage/v1/b/chrome-for-testing-public/o/156.0.8078.80%2Flinux64%2Fchrome-linux64.zip).
-      # GCS only publishes md5Hash and crc32c, and CfT JSON endpoints publish no digests.
-      # EXPECTED_SHA256 was pinned on first use from a download confirmed against that GCS md5Hash.
-      # They detect a changed or truncated download; they are storage metadata and a first-use pin,
-      # not a publisher signature. Re-read and confirm them when bumping CFT_VERSION
-      # (PINNED_CFT_VERSION in gitnexus-web/e2e/support/browser-security.ts).
-      - name: Install pinned Chrome for Testing (GCS object size/MD5 check, not a signature)
+      # EXPECTED_MD5 and EXPECTED_SIZE come from the archive's GCS object metadata (md5Hash, size):
+      # https://storage.googleapis.com/storage/v1/b/chrome-for-testing-public/o/<version>%2Flinux64%2Fchrome-linux64.zip
+      # GCS only publishes md5Hash and crc32c, and CfT JSON endpoints publish no digests, so
+      # EXPECTED_SHA256 is a first-use pin. These detect a changed or truncated download, not a
+      # publisher signature. When bumping CFT_VERSION (PINNED_CFT_VERSION in
+      # gitnexus-web/e2e/support/browser-security.ts), re-read size and md5Hash from that URL
+      # (md5Hash is base64; EXPECTED_MD5 is hex: echo <md5Hash> | base64 -d | xxd -p), download the
+      # archive, confirm it against them, then recompute EXPECTED_SHA256.
+      - name: Install pinned Chrome for Testing (GCS size/MD5 and first-use SHA256 check, not a signature)
         run: |
           CFT_VERSION="156.0.8078.80"
           CFT_URL="https://storage.googleapis.com/chrome-for-testing-public/${CFT_VERSION}/linux64/chrome-linux64.zip"
@@ -93,7 +94,7 @@ jobs:
             exit 1
           }
 
-          echo "Archive matches recorded GCS object size, MD5, and SHA256. Extracting..."
+          echo "Archive matches recorded GCS size and MD5 and the pinned SHA256. Extracting..."
           unzip -q chrome-linux64.zip
           chmod +x chrome-linux64/chrome
 

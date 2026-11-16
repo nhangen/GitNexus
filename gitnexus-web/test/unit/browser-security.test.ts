@@ -592,7 +592,7 @@ const EXPECTED_E2E_JOB_HEADER = [
 ];
 
 const EXPECTED_CFT_INSTALL_STEP = [
-  '      - name: Install pinned Chrome for Testing (GCS object size/MD5 check, not a signature)',
+  '      - name: Install pinned Chrome for Testing (GCS size/MD5 and first-use SHA256 check, not a signature)',
   '        run: |',
   '          CFT_VERSION="156.0.8078.80"',
   '          CFT_URL="https://storage.googleapis.com/chrome-for-testing-public/${CFT_VERSION}/linux64/chrome-linux64.zip"',
@@ -625,7 +625,7 @@ const EXPECTED_CFT_INSTALL_STEP = [
   '            exit 1',
   '          }',
   '',
-  '          echo "Archive matches recorded GCS object size, MD5, and SHA256. Extracting..."',
+  '          echo "Archive matches recorded GCS size and MD5 and the pinned SHA256. Extracting..."',
   '          unzip -q chrome-linux64.zip',
   '          chmod +x chrome-linux64/chrome',
   '',
@@ -703,7 +703,7 @@ const EXPECTED_CI_E2E_CALLER = [
 
 const REVIEWED_FILE_SHA256: Record<string, string> = {
   '.github/workflows/ci-e2e.yml':
-    '7308b3e6f76eb04d8fd5a4aa289e36a1dd2ecea2689fe88160a73992470b9793',
+    '2ea775eada3af8f18f74c0a814d55c39bf066d6f50de672765f2e196f6336b3b',
   '.github/actions/setup-gitnexus-web/action.yml':
     '3845c12ad70b565aa3efd70c7bb27c019bc3a8048b189d907c0761ff71f49e2f',
   'gitnexus-web/e2e/support/assert-live-results.mjs':
