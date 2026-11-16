@@ -21,8 +21,24 @@ runs:
       shell: bash
       working-directory: gitnexus-shared
 
+    # npm 10's bundled node-gyp 11 can't find Visual Studio 2026 (18.x) on
+    # windows-latest. A failed native build makes npm silently drop the
+    # optionalDependency tree-sitter-kotlin, and every Kotlin test then fails.
+    # node-gyp 12.1.0 added VS 2026 support.
+    - name: Use a node-gyp that supports Visual Studio 2026
+      if: runner.os == 'Windows'
+      run: |
+        npm install -g node-gyp@12.4.0
+        echo "npm_config_node_gyp=$(npm root -g)/node-gyp/bin/node-gyp.js" >> "$GITHUB_ENV"
+      shell: bash
+
     - name: Install dependencies
-      run: npm ci
+      run: |
+        npm ci
+        if [ ! -d node_modules/tree-sitter-kotlin ]; then
+          echo "::error::tree-sitter-kotlin failed to install; its native build did not run or failed"
+          exit 1
+        fi
       shell: bash
       working-directory: gitnexus
 
