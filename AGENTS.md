@@ -1,5 +1,5 @@
-<!-- version: 1.7.0 -->
-<!-- Last updated: 2026-04-23 -->
+<!-- version: 1.8.0 -->
+<!-- Last updated: 2026-11-16 -->
 
 Last reviewed: 2026-04-23
 
@@ -48,6 +48,7 @@ Commands and gotchas live under **Repo reference** below and in **[CONTRIBUTING.
 
 | Date | Version | Change |
 |------|---------|--------|
+| 2026-11-16 | 1.8.0 | Added mandatory Fork hygiene section: `check-fork-sync.sh` guard, upstream-check-before-fixing, merge-never-reset, draft-approval for upstream PRs. |
 | 2026-04-23 | 1.7.0 | TypeScript added to `MIGRATED_LANGUAGES` (registry-primary call resolution by default). |
 | 2026-04-20 | 1.6.0 | Added scope-resolution pipeline pointer (RFC #909 Ring 3); Python migrated to registry-primary. |
 | 2026-04-19 | 1.5.0 | Cross-repo impact (#794): `impact`/`query`/`context` accept `repo: "@<group>"` + `service`. Removed `group_query`/`group_contracts`/`group_status` MCP tools; added `gitnexus://group/{name}/contracts` and `gitnexus://group/{name}/status` resources. |
@@ -206,6 +207,15 @@ npx gitnexus serve                         # HTTP API on port 4747 (from any ind
 - `npx tsc -b --noEmit` — typecheck
 
 **Pre-commit hook** (`.husky/pre-commit`): formatting (prettier via lint-staged) + typecheck for staged packages. Tests do **not** run in pre-commit — CI only.
+
+## Fork hygiene (mandatory)
+
+This repo is a fork of `abhigyanpatwari/GitNexus` (upstream). The global `gitnexus` install comes from upstream's npm package, so the fork's fixes do NOT reach your tooling unless upstreamed. Rules:
+
+1. **Run the guard first.** At new-worktree setup and before any fix batch, run `.github/scripts/check-fork-sync.sh`. Exit 1 = stop and reconcile before implementing anything.
+2. **Check upstream before fixing.** Before implementing any ticket, verify the bug still exists upstream (or in the installed 1.6.12) and that no upstream PR already fixes it: `gh api repos/abhigyanpatwari/GitNexus/contents/<path>?ref=main` and `gh pr list -R abhigyanpatwari/GitNexus --search <keyword>`.
+3. **Merge, never reset.** Fork-only commits are fixes upstream lacks. Reconcile with `.github/scripts/check-fork-sync.sh --merge` (or `gh repo sync` only when `ahead=0`). Never `reset --hard` onto `upstream/main`.
+4. **Upstreamable fixes go upstream.** When a fix applies to code that exists upstream (not fork-local harness), prepare a draft PR against upstream and get the user's rendered-draft approval before posting.
 
 ### Gotchas
 
