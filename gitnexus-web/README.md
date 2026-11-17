@@ -3,6 +3,11 @@
 React/Vite thin client for the GitNexus CLI. All queries go through the
 `gitnexus serve` HTTP API.
 
+> This package's e2e suite runs behind a browser security harness that exists
+> only in this fork (pinned CfT build, launch-flag allowlist, renderer
+> verification). See the root README's "Fork vs upstream" section and
+> `e2e/support/browser-security.ts`.
+
 ## Development
 
 ```bash

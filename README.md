@@ -149,6 +149,41 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for setup and pull requests,
 [TESTING.md](TESTING.md) for validation, and [GUARDRAILS.md](GUARDRAILS.md) for
 repository rules.
 
+## Fork vs upstream
+
+This is a maintained fork of [abhigyanpatwari/GitNexus](https://github.com/abhigyanpatwari/GitNexus).
+`main` tracks upstream `main` via merge (never reset); run
+`.github/scripts/check-fork-sync.sh` before starting work. The intentional
+divergences — keep this list current as either side changes:
+
+| Divergence | Where | Why | Upstreamable? |
+|---|---|---|---|
+| Fork-sync guard + fork hygiene rules | `.github/scripts/check-fork-sync.sh`, `AGENTS.md § Fork hygiene` | Keeps fork work from re-implementing what upstream already fixed | No — fork-specific |
+| `ci-scope-parity.yml`, `release-candidate.yml` | `.github/workflows/` | Fork-only workflows; upstream has neither | No — fork-specific |
+| e2e browser security harness | `gitnexus-web/e2e/support/` (`browser-security.ts`, `global-setup.ts`, `assert-live-results.mjs`), `browser-security.test.ts`, `gitnexus-web/README.md`, `tsconfig.e2e.json` | Pins a known-version Chrome for Testing build, enforces a launch-flags allowlist, verifies the renderer/versions at runtime, sha256-pins the download, and typechecks the whole harness. Upstream's e2e suite runs none of this | Open question — needs a maintainer appetite check; would need rework to fit upstream's `e2e/helpers/` |
+| `persist-credentials: false` in `claude.yml`, `ci-report.yml` | `.github/workflows/` | Upstream still persists the checkout token in these two; submitted upstream as [abhigyanpatwari/GitNexus#3973](https://github.com/abhigyanpatwari/GitNexus/pull/3973) | Yes — pending upstream review |
+| README (this file's fork sections) | `README.md`, `gitnexus-web/README.md` | Documents the fork delta; upstream owns its own | No — fork-specific |
+
+### e2e browser security harness
+
+The harness every fork e2e browser run goes through
+(`gitnexus-web/e2e/support/browser-security.ts`):
+
+1. **Pinned browser** — resolves an exact Chrome for Testing build
+   (`.browsers/` candidates or `CHROME_BIN`), refusing mismatched versions, so
+   e2e results are reproducible and known-vulnerable builds are blocked.
+2. **Launch-flag allowlist** — custom `chromium` args must match a reviewed
+   allowlist; unsafe flags (`--disable-web-security`, etc.) fail closed.
+3. **Runtime verification** — the launcher checks the renderer process and the
+   browser's reported version; a renderer exiting between snapshots fails the
+   run rather than passing silently.
+4. **Integrity pin** — the CfT archive URL carries a sha256 pin reviewed by the
+   unit suite; `--enable-unsafe-swiftshader` is a documented, first-party-WebGL
+   accepted risk.
+
+See `gitnexus-web/README.md` for local setup and the unit tests
+(`test/unit/browser-security.test.ts`) for the enforcement details.
+
 ## Enterprise
 
 GitNexus is available as an **enterprise offering** — fully managed **SaaS** or **self-hosted** deployment. Commercial use of the OSS version is also available with proper licensing.
