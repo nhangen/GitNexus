@@ -43,14 +43,16 @@ jobs:
             const path = require('path');
             const runId = context.payload.workflow_run.id;
 
-            const allArtifacts = await github.rest.actions.listWorkflowRunArtifacts({
+            // Sharded CI runs can upload more than one page of artifacts.
+            const allArtifacts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts, {
               owner: context.repo.owner,
               repo: context.repo.repo,
               run_id: runId,
+              per_page: 100,
             });
 
             async function downloadArtifact(name, dest) {
-              const match = allArtifacts.data.artifacts.find(a => a.name === name);
+              const match = allArtifacts.find(a => a.name === name);
               if (!match) {
                 core.warning(`Artifact "${name}" not found`);
                 return false;
@@ -69,10 +71,13 @@ jobs:
             const temp = process.env.RUNNER_TEMP;
             await downloadArtifact('pr-meta', path.join(temp, 'dl'));
             await downloadArtifact('test-reports', path.join(temp, 'dl'));
+            await downloadArtifact('test-dupes', path.join(temp, 'dl'));
 
       - name: Extract artifacts
         shell: bash
         run: |
+          # With no artifacts, let the metadata step skip the report cleanly.
+          mkdir -p "$RUNNER_TEMP/dl"
           cd "$RUNNER_TEMP/dl"
           # Extract each artifact into its own directory to avoid filename collisions
           for z in *.zip; do
@@ -125,7 +130,7 @@ jobs:
 
       - name: Checkout (for vitest config)
         if: steps.meta.outputs.skip != 'true'
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           sparse-checkout: gitnexus/vitest.config.ts
@@ -160,13 +165,14 @@ jobs:
 
             // Try each run until we find a downloadable test-reports artifact
             for (const run of runs.data.workflow_runs) {
-              const artifacts = await github.rest.actions.listWorkflowRunArtifacts({
+              const artifacts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts, {
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 run_id: run.id,
+                per_page: 100,
               });
 
-              const testReports = artifacts.data.artifacts.find(a => a.name === 'test-reports');
+              const testReports = artifacts.find(a => a.name === 'test-reports');
               if (!testReports) {
                 core.info(`Run ${run.id}: no test-reports artifact, trying next`);
                 continue;
@@ -257,21 +263,38 @@ jobs:
             fi
           }
 
+          # ── Helper: first matching file, tolerating an absent root ──
+          # `coverage-merge` (ci-tests.yml) is `needs: tests` with no
+          # `if: always()`, so a failing shard skips it and the `test-reports`
+          # artifact is never uploaded.  A bare `find` on the missing directory
+          # exits 1; `-o pipefail` carries that through `| head -1` and `-e`
+          # then killed this step — silently, because stderr is discarded and
+          # stdout is redirected to $GITHUB_OUTPUT.  That skipped "Comment on
+          # PR" and failed the run precisely when a PR had failing tests, which
+          # is when the report matters most.  Degrade to "" instead so the
+          # coverage-unavailable fallback below can do its job.
+          find_first() {
+            local root=$1 name=$2
+            [ -d "$root" ] || return 0
+            find "$root" -name "$name" -type f 2>/dev/null | head -1 || true
+          }
+
           # ── Read coverage reports ──
-          UNIT_SUMMARY=$(find "$DIR/test-reports" -name "coverage-summary.json" -type f 2>/dev/null | head -1)
+          UNIT_SUMMARY=$(find_first "$DIR/test-reports" "coverage-summary.json")
 
           read_cov "U" "$UNIT_SUMMARY"
 
           # ── Read base branch coverage (main) ──
           BASE_SUMMARY=""
           if [ "$BASE_FOUND" = "true" ] && [ -n "$BASE_DIR" ]; then
-            BASE_SUMMARY=$(find "$BASE_DIR/base" -name "coverage-summary.json" -type f 2>/dev/null | head -1)
+            BASE_SUMMARY=$(find_first "$BASE_DIR/base" "coverage-summary.json")
           fi
           read_cov "B" "$BASE_SUMMARY"
 
           # ── Locate test results ──
-          RESULTS_FILE=$(find "$DIR/test-reports" -name "test-results.json" -type f 2>/dev/null | head -1)
-          WEB_RESULTS_FILE=$(find "$DIR/test-reports" -name "web-test-results.json" -type f 2>/dev/null | head -1)
+          RESULTS_FILE=$(find_first "$DIR/test-reports" "test-results.json")
+          WEB_RESULTS_FILE=$(find_first "$DIR/test-reports" "web-test-results.json")
+          PYTEST_RESULTS_FILE=$(find_first "$DIR/test-reports" "pytest-results.json")
 
           sum_results() {
             local file=$1
@@ -288,12 +311,21 @@ jobs:
           # framework, not as a top-line metric).
           read -r CLI_T CLI_P CLI_F CLI_S _ CLI_D <<< "$(sum_results "$RESULTS_FILE")"
           read -r WEB_T WEB_P WEB_F WEB_S _ WEB_D <<< "$(sum_results "$WEB_RESULTS_FILE")"
+          read -r PY_T PY_P PY_F PY_S _ PY_D <<< "$(sum_results "$PYTEST_RESULTS_FILE")"
 
-          TOTAL=$((CLI_T + WEB_T))
-          PASSED=$((CLI_P + WEB_P))
-          FAILED=$((CLI_F + WEB_F))
-          SKIPPED=$((CLI_S + WEB_S))
+          TOTAL=$((CLI_T + WEB_T + PY_T))
+          PASSED=$((CLI_P + WEB_P + PY_P))
+          FAILED=$((CLI_F + WEB_F + PY_F))
+          SKIPPED=$((CLI_S + WEB_S + PY_S))
           DURATION=$((CLI_D > WEB_D ? CLI_D : WEB_D))
+          DURATION=$((DURATION > PY_D ? DURATION : PY_D))
+          EXECUTION_ERRORS=0
+          for rf in "$RESULTS_FILE" "$WEB_RESULTS_FILE" "$PYTEST_RESULTS_FILE"; do
+            if [ -n "$rf" ] && [ -f "$rf" ]; then
+              errors=$(jq -r '(.executionFailures // []) | length' "$rf")
+              EXECUTION_ERRORS=$((EXECUTION_ERRORS + errors))
+            fi
+          done
 
           # ── Status helpers ──
           status_icon() {
@@ -370,22 +402,22 @@ jobs:
             if [ "$TOTAL" -gt 0 ] 2>/dev/null; then
               echo "### Test Results"
               echo ""
-              echo "| Tests | Passed | Failed | Skipped | Duration |"
+              echo "| Tests | Passed | Failed | Unverified | Duration |"
               echo "|-------|--------|--------|---------|----------|"
               echo "| ${TOTAL} | ${PASSED} | ${FAILED} | ${SKIPPED} | ${DURATION}s |"
               echo ""
 
-              if [ "$FAILED" = "0" ]; then
+              if [[ "$FAILED" == "0" && "$SKIPPED" == "0" && "$EXECUTION_ERRORS" == "0" && "$TESTS" == "success" ]]; then
                 echo "✅ All **${PASSED}** tests passed"
               else
-                echo "❌ **${FAILED}** failed / **${PASSED}** passed"
+                echo "❌ Test execution is incomplete or failed: **${FAILED}** failed, **${SKIPPED}** unverified, **${EXECUTION_ERRORS}** runner/suite errors."
               fi
               if [ "$SKIPPED" != "0" ]; then
                 echo ""
                 echo "<details>"
-                echo "<summary>${SKIPPED} test(s) skipped — expand for details</summary>"
+                echo "<summary>${SKIPPED} test(s) have no recorded pass — expand for details</summary>"
                 echo ""
-                for rf in "$RESULTS_FILE" "$WEB_RESULTS_FILE"; do
+                for rf in "$RESULTS_FILE" "$WEB_RESULTS_FILE" "$PYTEST_RESULTS_FILE"; do
                   if [ -n "$rf" ] && [ -f "$rf" ]; then
                     jq -r '
                       .testResults[]
@@ -431,6 +463,34 @@ jobs:
               echo ""
             fi
 
+            # ── Possible duplicate tests (advisory, ci.yml test-dupes job) ──
+            # The JSON is produced by PR code, so only whitelisted kinds and
+            # strict path/line shapes reach the comment; free text is dropped.
+            DUPES_FILE=$(find_first "$DIR/test-dupes" "test-dupes.json")
+            if [ -n "$DUPES_FILE" ]; then
+              jq -r '
+                def path_ok: type == "string" and test("\\A[A-Za-z0-9._/@+-]{1,300}\\z");
+                def line_ok: type == "number" and . >= 1 and . <= 1000000 and floor == .;
+                def loc: "`\(.file):\(.line)`";
+                [ .findings[]?
+                  | select(.kind | IN("same-test", "assertions-pinned", "same-fixture-setup", "copied-helper", "orphan-bench-gate"))
+                  | select((.file | path_ok) and (.line | line_ok))
+                  | .matches = ([(.matches // [])[]? | select((.file | path_ok) and (.line | line_ok))][:3])
+                ]
+                | if length == 0 then empty else
+                    "### Possible duplicate tests",
+                    "",
+                    "Advisory only, never blocks merge: \(length) finding(s) on lines this PR changes. Run `npm run test:dupes` in `gitnexus/` for details; mark an intentional repeat with `// dupe-ok: <reason>`.",
+                    "",
+                    "| Kind | Changed | Already at |",
+                    "|------|---------|------------|",
+                    (.[:20][] | "| `\(.kind)` | \(loc) | \(if (.matches | length) == 0 then "no workflow runs it" else (.matches | map(loc) | join("<br>")) end) |"),
+                    (if length > 20 then "", "…and \(length - 20) more." else empty end),
+                    ""
+                  end
+              ' "$DUPES_FILE" 2>/dev/null || true
+            fi
+
             echo "---"
             echo "<sub>📋 [View full run](${RUN_URL}) · Generated by CI</sub>"
             echo "GITNEXUS_CI_REPORT_EOF_7f3a"
@@ -438,7 +498,7 @@ jobs:
 
       - name: Comment on PR
         if: steps.meta.outputs.skip != 'true'
-        uses: marocchino/sticky-pull-request-comment@0ea0beb66eb9baf113663a64ec522f60e49231c0 # v2
+        uses: marocchino/sticky-pull-request-comment@5770ad5eb8f42dd2c4f34da00c94c5381e49af88 # v2
         with:
           header: ci-report
           number: ${{ steps.meta.outputs.pr_number }}

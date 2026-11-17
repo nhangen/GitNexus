@@ -1,5 +1,24 @@
-import { describe, expect, it, vi } from 'vitest';
-import { createLbugDatabase, isWalCorruptionError } from '../../src/core/lbug/lbug-config.js';
+import os from 'os';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  createLbugDatabase,
+  estimateBufferPool,
+  maxDbSizeReachedRemedy,
+  parseMaxDbSize,
+  pastEofReadRemedy,
+  resolveMaxDbSize,
+  isLbugCheckpointIoError,
+  isStorageVersionMismatchError,
+  isWalCorruptionError,
+  setBufferPoolSizeHint,
+  STORAGE_VERSION_MISMATCH_SUGGESTION,
+  throwIfStorageVersionMismatch,
+  _setOsPageSizeForTests,
+  bufferPoolExhaustionRemedy,
+} from '../../src/core/lbug/lbug-config.js';
+import { _captureLogger } from '../../src/core/logger.js';
+
+const DEFAULT_THRESHOLD = 64 * 1024 * 1024;
 
 describe('isWalCorruptionError', () => {
   it.each([
@@ -34,7 +53,149 @@ describe('isWalCorruptionError', () => {
   });
 });
 
+describe('isStorageVersionMismatchError / throwIfStorageVersionMismatch', () => {
+  const NATIVE =
+    'Runtime exception: Trying to read a database file with a different version. Database file version: 43, Current build storage version: 42';
+
+  it.each([
+    ['documented native message', NATIVE],
+    ['bare phrase', 'Trying to read a database file with a different version'],
+  ])('matches storage-version mismatch: %s', (_label, msg) => {
+    expect(isStorageVersionMismatchError(msg)).toBe(true);
+    expect(isStorageVersionMismatchError(new Error(msg))).toBe(true);
+  });
+
+  it.each([
+    ['lock error', 'Could not set lock on file : /path/to/db'],
+    ['WAL corruption', 'Runtime exception: Corrupted wal file. Read out invalid WAL record type.'],
+    ['generic', 'Query failed'],
+    ['schema version wording', 'schema version mismatch in WAL'],
+  ])('does not match non-version error: %s', (_label, msg) => {
+    expect(isStorageVersionMismatchError(msg)).toBe(false);
+    expect(isStorageVersionMismatchError(new Error(msg))).toBe(false);
+  });
+
+  it('handles non-string input', () => {
+    expect(isStorageVersionMismatchError(undefined)).toBe(false);
+    expect(isStorageVersionMismatchError(null)).toBe(false);
+    expect(isStorageVersionMismatchError(42)).toBe(false);
+    expect(isStorageVersionMismatchError(new Error('ok'))).toBe(false);
+  });
+
+  it('throwIfStorageVersionMismatch wraps the native message with the rebuild hint', () => {
+    expect(() => throwIfStorageVersionMismatch(new Error(NATIVE))).toThrow(
+      new RegExp(
+        `${STORAGE_VERSION_MISMATCH_SUGGESTION.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}.*different version`,
+      ),
+    );
+  });
+
+  it('throwIfStorageVersionMismatch is a no-op for lock and WAL errors', () => {
+    expect(() =>
+      throwIfStorageVersionMismatch(new Error('Could not set lock on file : /path')),
+    ).not.toThrow();
+    expect(() =>
+      throwIfStorageVersionMismatch(new Error('Runtime exception: Corrupted wal file.')),
+    ).not.toThrow();
+  });
+});
+
 describe('createLbugDatabase WAL replay option', () => {
+  it('enables auto-checkpoint by default and uses default threshold (64 MiB)', () => {
+    const Database = vi.fn(function (this: any) {});
+    const lbugModule = { Database } as any;
+
+    createLbugDatabase(lbugModule, '/tmp/lbug-default');
+
+    expect(Database).toHaveBeenCalledWith(
+      '/tmp/lbug-default',
+      expect.any(Number),
+      false,
+      false,
+      expect.any(Number),
+      true,
+      DEFAULT_THRESHOLD,
+      true,
+      true,
+    );
+  });
+
+  it.each([
+    ['0', 0],
+    ['1024', 1024],
+    ['-1', -1],
+    ['invalid', DEFAULT_THRESHOLD],
+    ['', DEFAULT_THRESHOLD],
+  ])('respects GITNEXUS_WAL_CHECKPOINT_THRESHOLD=%s', (raw, expectedCheckpointThreshold) => {
+    try {
+      vi.stubEnv('GITNEXUS_WAL_CHECKPOINT_THRESHOLD', raw);
+      const Database = vi.fn(function (this: any) {});
+      const lbugModule = { Database } as any;
+
+      createLbugDatabase(lbugModule, '/tmp/lbug-env');
+
+      expect(Database).toHaveBeenCalledWith(
+        '/tmp/lbug-env',
+        expect.any(Number),
+        false,
+        false,
+        expect.any(Number),
+        true,
+        expectedCheckpointThreshold,
+        true,
+        true,
+      );
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('warns and falls back to default when GITNEXUS_WAL_CHECKPOINT_THRESHOLD is invalid', () => {
+    const cap = _captureLogger();
+    try {
+      vi.stubEnv('GITNEXUS_WAL_CHECKPOINT_THRESHOLD', 'invalid');
+      const Database = vi.fn(function (this: any) {});
+      const lbugModule = { Database } as any;
+
+      createLbugDatabase(lbugModule, '/tmp/lbug-invalid');
+
+      const warn = cap
+        .records()
+        .find(
+          (r) =>
+            typeof r.msg === 'string' &&
+            r.msg.includes('Ignoring invalid GITNEXUS_WAL_CHECKPOINT_THRESHOLD'),
+        );
+      expect(warn).toBeDefined();
+    } finally {
+      vi.unstubAllEnvs();
+      cap.restore();
+    }
+  });
+
+  it('does NOT warn when GITNEXUS_WAL_CHECKPOINT_THRESHOLD is empty (treated as unset)', () => {
+    const cap = _captureLogger();
+    try {
+      vi.stubEnv('GITNEXUS_WAL_CHECKPOINT_THRESHOLD', '');
+      const Database = vi.fn(function (this: any) {});
+      const lbugModule = { Database } as any;
+
+      createLbugDatabase(lbugModule, '/tmp/lbug-empty');
+
+      const warn = cap
+        .records()
+        .find(
+          (r) =>
+            typeof r.msg === 'string' &&
+            r.msg.includes('Ignoring invalid GITNEXUS_WAL_CHECKPOINT_THRESHOLD'),
+        );
+      expect(warn).toBeUndefined();
+    } finally {
+      vi.unstubAllEnvs();
+      cap.restore();
+    }
+  });
+
   it('passes throwOnWalReplayFailure and checksum constructor args explicitly', () => {
     const Database = vi.fn(function (this: any) {});
     const lbugModule = { Database } as any;
@@ -46,14 +207,574 @@ describe('createLbugDatabase WAL replay option', () => {
 
     expect(Database).toHaveBeenCalledWith(
       '/tmp/lbug',
-      0,
+      expect.any(Number),
       false,
       true,
       expect.any(Number),
       true,
-      -1,
+      DEFAULT_THRESHOLD,
       false,
       true,
     );
+  });
+});
+
+describe('createLbugDatabase buffer pool size (#2557)', () => {
+  it('passes an explicit native-default pool through to the constructor', () => {
+    const Database = vi.fn(function (this: unknown) {});
+    try {
+      vi.stubEnv('GITNEXUS_LBUG_BUFFER_POOL_SIZE', '1073741824');
+      createLbugDatabase(
+        { Database } as unknown as Parameters<typeof createLbugDatabase>[0],
+        '/tmp/lbug-zero',
+        { bufferPoolBytes: 0 },
+      );
+      expect(bufferPoolArg(Database)).toBe(0);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  const GiB = 1024 * 1024 * 1024;
+
+  // Pin a 4 KiB page so every expectation below is host-independent — on a
+  // 16 KiB-page Apple Silicon runner the #2631 granule scaling would
+  // otherwise multiply them by 4.
+  beforeEach(() => _setOsPageSizeForTests(4096));
+  afterEach(() => _setOsPageSizeForTests(undefined));
+
+  const bufferPoolArg = (Database: ReturnType<typeof vi.fn>): unknown => Database.mock.calls[0][1];
+
+  it.each([
+    ['32 GiB machine caps at 2 GiB', 32 * GiB, 2 * GiB],
+    ['1 GiB machine keeps the native-equivalent 80% bound', GiB, Math.floor(0.8 * GiB)],
+    ['64 MiB container clamps up to the floor', 64 * 1024 * 1024, 64 * 1024 * 1024],
+  ])('defaults to min(2 GiB, max(64 MiB, 0.8 * totalmem)): %s', (_label, totalmem, expected) => {
+    const totalmemSpy = vi.spyOn(os, 'totalmem').mockReturnValue(totalmem);
+    try {
+      const Database = vi.fn(function (this: any) {});
+      const lbugModule = { Database } as any;
+
+      createLbugDatabase(lbugModule, '/tmp/lbug-pool');
+
+      expect(bufferPoolArg(Database)).toBe(expected);
+    } finally {
+      totalmemSpy.mockRestore();
+    }
+  });
+
+  it.each([
+    ['1073741824', 1073741824],
+    ['0', 0],
+    ['1536.9', 1536],
+  ])('respects GITNEXUS_LBUG_BUFFER_POOL_SIZE=%s', (raw, expected) => {
+    try {
+      vi.stubEnv('GITNEXUS_LBUG_BUFFER_POOL_SIZE', raw);
+      const Database = vi.fn(function (this: any) {});
+      const lbugModule = { Database } as any;
+
+      createLbugDatabase(lbugModule, '/tmp/lbug-pool-env');
+
+      expect(bufferPoolArg(Database)).toBe(expected);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it.each([['abc'], ['-5']])('warns and falls back to the default for invalid value %s', (raw) => {
+    const cap = _captureLogger();
+    const totalmemSpy = vi.spyOn(os, 'totalmem').mockReturnValue(32 * GiB);
+    try {
+      vi.stubEnv('GITNEXUS_LBUG_BUFFER_POOL_SIZE', raw);
+      const Database = vi.fn(function (this: any) {});
+      const lbugModule = { Database } as any;
+
+      createLbugDatabase(lbugModule, '/tmp/lbug-pool-invalid');
+
+      expect(bufferPoolArg(Database)).toBe(2 * GiB);
+      const warn = cap
+        .records()
+        .find(
+          (r) =>
+            typeof r.msg === 'string' &&
+            r.msg.includes('Ignoring invalid GITNEXUS_LBUG_BUFFER_POOL_SIZE'),
+        );
+      expect(warn).toBeDefined();
+    } finally {
+      vi.unstubAllEnvs();
+      totalmemSpy.mockRestore();
+      cap.restore();
+    }
+  });
+
+  it('does NOT warn when GITNEXUS_LBUG_BUFFER_POOL_SIZE is empty (treated as unset)', () => {
+    const cap = _captureLogger();
+    try {
+      vi.stubEnv('GITNEXUS_LBUG_BUFFER_POOL_SIZE', '');
+      const Database = vi.fn(function (this: any) {});
+      const lbugModule = { Database } as any;
+
+      createLbugDatabase(lbugModule, '/tmp/lbug-pool-empty');
+
+      const warn = cap
+        .records()
+        .find(
+          (r) =>
+            typeof r.msg === 'string' &&
+            r.msg.includes('Ignoring invalid GITNEXUS_LBUG_BUFFER_POOL_SIZE'),
+        );
+      expect(warn).toBeUndefined();
+    } finally {
+      vi.unstubAllEnvs();
+      cap.restore();
+    }
+  });
+});
+
+describe('adaptive buffer pool hint', () => {
+  const GiB = 1024 * 1024 * 1024;
+  const MiB = 1024 * 1024;
+  const bufferPoolArg = (Database: ReturnType<typeof vi.fn>): unknown => Database.mock.calls[0][1];
+
+  beforeEach(() => _setOsPageSizeForTests(4096));
+  afterEach(() => {
+    setBufferPoolSizeHint(undefined);
+    _setOsPageSizeForTests(undefined);
+  });
+
+  describe('estimateBufferPool', () => {
+    it.each([
+      ['tiny graph clamps up to the 256 MiB COPY-safety floor', 41, 256 * MiB],
+      ['a graph under the floor still clamps up to 256 MiB', 40_000, 256 * MiB],
+      ['mid graph scales linearly (100k elements * 4 KiB = 400 MiB)', 100_000, 100_000 * 4 * 1024],
+      ['huge graph caps at the 2 GiB / 80%-RAM default', 10_000_000, 2 * GiB],
+    ])('%s', (_label, elements, expected) => {
+      const totalmemSpy = vi.spyOn(os, 'totalmem').mockReturnValue(32 * GiB);
+      try {
+        expect(estimateBufferPool(elements)).toBe(expected);
+      } finally {
+        totalmemSpy.mockRestore();
+      }
+    });
+  });
+
+  it.each([
+    ['a hint within range passes through', 512 * MiB, 512 * MiB],
+    ['a hint below the COPY-safety floor clamps up to 256 MiB', 100 * MiB, 256 * MiB],
+    ['a hint above the default clamps down to the 2 GiB cap', 8 * GiB, 2 * GiB],
+  ])(
+    'createLbugDatabase uses the clamped hint when no env override is set: %s',
+    (_label, hint, expected) => {
+      const totalmemSpy = vi.spyOn(os, 'totalmem').mockReturnValue(32 * GiB);
+      try {
+        setBufferPoolSizeHint(hint);
+        const Database = vi.fn(function (this: any) {});
+        createLbugDatabase({ Database } as any, '/tmp/lbug-hint');
+        expect(bufferPoolArg(Database)).toBe(expected);
+      } finally {
+        totalmemSpy.mockRestore();
+      }
+    },
+  );
+
+  it('env override wins over the hint (including 0 = native default)', () => {
+    try {
+      setBufferPoolSizeHint(128 * MiB);
+      vi.stubEnv('GITNEXUS_LBUG_BUFFER_POOL_SIZE', '0');
+      const Database = vi.fn(function (this: any) {});
+      createLbugDatabase({ Database } as any, '/tmp/lbug-hint-env');
+      expect(bufferPoolArg(Database)).toBe(0);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('falls back to the default when the hint is cleared', () => {
+    const totalmemSpy = vi.spyOn(os, 'totalmem').mockReturnValue(32 * GiB);
+    try {
+      setBufferPoolSizeHint(128 * MiB);
+      setBufferPoolSizeHint(undefined);
+      const Database = vi.fn(function (this: any) {});
+      createLbugDatabase({ Database } as any, '/tmp/lbug-hint-cleared');
+      expect(bufferPoolArg(Database)).toBe(2 * GiB);
+    } finally {
+      totalmemSpy.mockRestore();
+    }
+  });
+});
+
+// ─── Finding 8: strict + permissive checkpoint IO matchers ─────────────────
+describe('isLbugCheckpointIoError', () => {
+  it.each([
+    [
+      'native rename failure (v0.16.x exact)',
+      'Runtime exception: IO exception: Error renaming file /repo/.gitnexus/lbug.wal to /repo/.gitnexus/lbug.wal.checkpoint. ErrorMessage: Permission denied',
+    ],
+    [
+      'native remove failure (v0.16.x exact)',
+      'Runtime exception: IO exception: Error removing directory or file /repo/.gitnexus/lbug.wal.checkpoint.  Error Message: Permission denied',
+    ],
+  ])('matches strict %s', (_label, msg) => {
+    expect(isLbugCheckpointIoError(msg)).toBe(true);
+    expect(isLbugCheckpointIoError(new Error(msg))).toBe(true);
+  });
+
+  it('matches permissive fallback for hypothetical message drift', () => {
+    // Permissive matcher accepts any IO-exception-shaped message mentioning .wal.checkpoint.
+    const drift =
+      'Some new wrapper preamble :: IO exception when finalizing /repo/.gitnexus/lbug.wal.checkpoint';
+    expect(isLbugCheckpointIoError(drift)).toBe(true);
+  });
+
+  it('does NOT match unrelated IO errors', () => {
+    expect(
+      isLbugCheckpointIoError(
+        'Runtime exception: IO exception: Error renaming file /repo/data.tmp to /repo/data.tmp.bak',
+      ),
+    ).toBe(false);
+    expect(isLbugCheckpointIoError('Some other error')).toBe(false);
+    expect(isLbugCheckpointIoError(undefined)).toBe(false);
+  });
+});
+
+// ─── #2631: page-size-scaled pool sizing (granule accounting) ───────────────
+describe('page-size-scaled buffer pool sizing (#2631)', () => {
+  const MiB = 1024 * 1024;
+  const GiB = 1024 * MiB;
+  const bufferPoolArg = (Database: ReturnType<typeof vi.fn>): unknown => Database.mock.calls[0][1];
+
+  afterEach(() => {
+    setBufferPoolSizeHint(undefined);
+    _setOsPageSizeForTests(undefined);
+    vi.unstubAllEnvs();
+  });
+
+  it.each([
+    ['64 KiB pages scale the floor ×16', 65536, 41, 16 * 256 * MiB],
+    [
+      '64 KiB pages scale the estimate ×16 (100k × 4 KiB × 16 = 6.4 GB)',
+      65536,
+      100_000,
+      100_000 * 4 * 1024 * 16,
+    ],
+    ['16 KiB pages (Apple Silicon) scale the floor ×4', 16384, 41, 4 * 256 * MiB],
+    ['4 KiB pages are byte-identical to the unscaled behavior', 4096, 100_000, 100_000 * 4 * 1024],
+  ])('%s', (_label, pageSize, elements, expected) => {
+    const totalmemSpy = vi.spyOn(os, 'totalmem').mockReturnValue(32 * GiB);
+    try {
+      _setOsPageSizeForTests(pageSize);
+      expect(estimateBufferPool(elements)).toBe(expected);
+    } finally {
+      totalmemSpy.mockRestore();
+    }
+  });
+
+  it('the scaled cap is still bounded by 80% of RAM (64 KiB pages, huge graph)', () => {
+    const totalmemSpy = vi.spyOn(os, 'totalmem').mockReturnValue(32 * GiB);
+    try {
+      _setOsPageSizeForTests(65536);
+      // min(2 GiB × 16, 0.8 × 32 GiB) = min(32 GiB, 25.6 GiB) = 25.6 GiB
+      expect(estimateBufferPool(100_000_000)).toBe(Math.floor(0.8 * 32 * GiB));
+    } finally {
+      totalmemSpy.mockRestore();
+    }
+  });
+
+  it('an undetectable page size behaves exactly like 4 KiB (ratio 1)', () => {
+    const totalmemSpy = vi.spyOn(os, 'totalmem').mockReturnValue(32 * GiB);
+    try {
+      _setOsPageSizeForTests(null);
+      expect(estimateBufferPool(100_000)).toBe(100_000 * 4 * 1024);
+    } finally {
+      totalmemSpy.mockRestore();
+    }
+  });
+
+  it('the hintless default passed to the Database ctor stays at the unscaled #2557 cap on 64 KiB hosts', () => {
+    // The guard for the #2557 OOM protection: MCP serve / doctor / any open
+    // without a per-run hint must NOT inherit the page-size-scaled budget —
+    // the pool is an eager allocation at DB open.
+    const totalmemSpy = vi.spyOn(os, 'totalmem').mockReturnValue(32 * GiB);
+    try {
+      _setOsPageSizeForTests(65536);
+      const Database = vi.fn(function (this: any) {});
+      createLbugDatabase({ Database } as any, '/tmp/lbug-pool-64k');
+      expect(bufferPoolArg(Database)).toBe(2 * GiB);
+    } finally {
+      totalmemSpy.mockRestore();
+    }
+  });
+
+  it('the analyze hint path DOES scale on 64 KiB hosts (scaled floor, bounded by 80% RAM)', () => {
+    const totalmemSpy = vi.spyOn(os, 'totalmem').mockReturnValue(32 * GiB);
+    try {
+      _setOsPageSizeForTests(65536);
+      setBufferPoolSizeHint(estimateBufferPool(41));
+      const Database = vi.fn(function (this: any) {});
+      createLbugDatabase({ Database } as any, '/tmp/lbug-pool-64k-hint');
+      // 41 elements → below the scaled COPY floor → 16 × 256 MiB = 4 GiB
+      expect(bufferPoolArg(Database)).toBe(16 * 256 * MiB);
+    } finally {
+      totalmemSpy.mockRestore();
+    }
+  });
+
+  it('GITNEXUS_LBUG_BUFFER_POOL_SIZE stays absolute on 64 KiB hosts (incl. 0 = native default)', () => {
+    _setOsPageSizeForTests(65536);
+    vi.stubEnv('GITNEXUS_LBUG_BUFFER_POOL_SIZE', String(512 * MiB));
+    const Database = vi.fn(function (this: any) {});
+    createLbugDatabase({ Database } as any, '/tmp/lbug-pool-64k-env');
+    expect(bufferPoolArg(Database)).toBe(512 * MiB);
+  });
+});
+
+// ─── #2631: actionable pool-exhaustion remedy ───────────────────────────────
+describe('bufferPoolExhaustionRemedy (#2631)', () => {
+  afterEach(() => _setOsPageSizeForTests(undefined));
+
+  const EXHAUSTION =
+    'Buffer manager exception: Unable to allocate memory! The buffer pool is full and no memory could be freed!';
+
+  it('names the override knob for the exhaustion error', () => {
+    _setOsPageSizeForTests(4096);
+    const remedy = bufferPoolExhaustionRemedy(EXHAUSTION);
+    expect(remedy).toContain('GITNEXUS_LBUG_BUFFER_POOL_SIZE');
+    expect(remedy).toContain('buffer pool');
+    // ratio 1 → no page-size amplification note
+    expect(remedy).not.toContain('OS page size');
+  });
+
+  it('explains the granule amplification on a 64 KiB-page host', () => {
+    _setOsPageSizeForTests(65536);
+    const remedy = bufferPoolExhaustionRemedy(EXHAUSTION);
+    expect(remedy).toContain('64 KiB OS page size');
+    expect(remedy).toContain('16×');
+    expect(remedy).toContain('GITNEXUS_LBUG_BUFFER_POOL_SIZE');
+  });
+
+  it('is silent for non-exhaustion errors', () => {
+    _setOsPageSizeForTests(65536);
+    expect(
+      bufferPoolExhaustionRemedy('Binder exception: Table CodeEmbedding does not exist.'),
+    ).toBeUndefined();
+  });
+
+  it('labels the 0 sentinel as the native default instead of "0 MiB"', () => {
+    _setOsPageSizeForTests(4096);
+    vi.stubEnv('GITNEXUS_LBUG_BUFFER_POOL_SIZE', '0');
+    try {
+      const remedy = bufferPoolExhaustionRemedy(EXHAUSTION);
+      expect(remedy).toContain('native 80%-of-RAM default');
+      expect(remedy).not.toContain('(0 MiB)');
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+});
+
+describe('GITNEXUS_LBUG_MAX_DB_SIZE power-of-two normalization (#3529)', () => {
+  const DEFAULT_MAX_DB_SIZE = 2 ** 34;
+
+  describe('parseMaxDbSize', () => {
+    it.each([
+      ['unset', undefined, DEFAULT_MAX_DB_SIZE],
+      ['exact power of two (default)', '17179869184', 2 ** 34],
+      ['exact power of two (256 GiB)', '274877906944', 2 ** 38],
+      ['rounds 300 GB up', '300000000000', 2 ** 39],
+      ['rounds 2^34 + 1 up', '17179869185', 2 ** 35],
+      ['rounds 2^40 + 1 up', '1099511627777', 2 ** 41],
+      ['floors a fraction before rounding', '17179869184.5', 2 ** 34],
+      ['non-numeric falls back', 'abc', DEFAULT_MAX_DB_SIZE],
+      ['zero falls back', '0', DEFAULT_MAX_DB_SIZE],
+      ['negative falls back', '-5', DEFAULT_MAX_DB_SIZE],
+      ['beyond the safe-integer range falls back', '1e30', DEFAULT_MAX_DB_SIZE],
+      ['empty falls back', '', DEFAULT_MAX_DB_SIZE],
+    ])('%s', (_label, raw, expected) => {
+      expect(parseMaxDbSize(raw).value).toBe(expected);
+    });
+
+    it.each([
+      ['300000000000', 300000000000],
+      ['17179869185', 17179869185],
+    ])('records the raw value when %s is rounded', (raw, rawNumber) => {
+      expect(parseMaxDbSize(raw).roundedFrom).toBe(rawNumber);
+    });
+
+    it.each([['17179869184'], ['274877906944'], ['abc'], [undefined]])(
+      'records no rounding for %s',
+      (raw) => {
+        expect(parseMaxDbSize(raw).roundedFrom).toBeUndefined();
+      },
+    );
+  });
+
+  describe('resolveMaxDbSize', () => {
+    /** Runs the resolver under a captured logger; returns the value and the max-size warnings. */
+    const resolveCapturingWarnings = (raw: string | undefined) => {
+      const cap = _captureLogger();
+      try {
+        const value = resolveMaxDbSize(raw);
+        const warnings = cap
+          .records()
+          .filter((r) => typeof r.msg === 'string' && r.msg.includes('GITNEXUS_LBUG_MAX_DB_SIZE'));
+        return { value, warnings };
+      } finally {
+        cap.restore();
+      }
+    };
+
+    it('warns once with the raw and effective values when it rounds', () => {
+      const { value, warnings } = resolveCapturingWarnings('300000000000');
+      expect(value).toBe(2 ** 39);
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0].msg).toContain('300000000000');
+      expect(warnings[0].msg).toContain(String(2 ** 39));
+    });
+
+    it('reports the operator value as supplied, not its floored integer', () => {
+      const { value, warnings } = resolveCapturingWarnings('300000000000.9');
+      expect(value).toBe(2 ** 39);
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0].msg).toContain('GITNEXUS_LBUG_MAX_DB_SIZE=300000000000.9 ');
+    });
+
+    it.each([['17179869184'], ['abc'], [undefined]])('does not warn for %s', (raw) => {
+      expect(resolveCapturingWarnings(raw).warnings).toHaveLength(0);
+    });
+  });
+
+  // `LBUG_MAX_DB_SIZE` is resolved when lbug-config loads, so the env must be
+  // staged and the module freshly imported (logger included, so its capture is
+  // the one the fresh module logs to). Calling `parseMaxDbSize` directly — as
+  // the cases above do — cannot show that the ROUNDED value is what the native
+  // constructor receives.
+  it('hands the rounded value to the native constructor and warns exactly once', async () => {
+    vi.stubEnv('GITNEXUS_LBUG_MAX_DB_SIZE', '300000000000');
+    vi.resetModules();
+    const { _captureLogger: captureFreshLogger } = await import('../../src/core/logger.js');
+    const cap = captureFreshLogger();
+    try {
+      const fresh = await import('../../src/core/lbug/lbug-config.js');
+      const Database = vi.fn(function (this: unknown, ..._ctorArgs: unknown[]) {});
+      const lbugModule = { Database } as unknown as Parameters<typeof fresh.createLbugDatabase>[0];
+
+      fresh.createLbugDatabase(lbugModule, '/tmp/lbug-max-db-size');
+
+      const MAX_DB_SIZE_ARG = 4;
+      expect(Database.mock.calls[0][MAX_DB_SIZE_ARG]).toBe(2 ** 39);
+      const warnings = cap
+        .records()
+        .filter((r) => typeof r.msg === 'string' && r.msg.includes('GITNEXUS_LBUG_MAX_DB_SIZE'));
+      expect(warnings).toHaveLength(1);
+    } finally {
+      cap.restore();
+      vi.unstubAllEnvs();
+      vi.resetModules();
+    }
+  });
+});
+
+describe('size-ceiling and past-EOF remedies (#3529, #3530)', () => {
+  const REACHED_3529 =
+    'Buffer manager exception: Maximum database size of 274877906944 bytes has been reached.';
+  const EOF_3530 =
+    'Failed to delete stale embedding rows — aborting to prevent vector-index corruption: ' +
+    'Batch execution failed for rows 1-4: IO exception: Cannot read from file: ' +
+    '/repo/.gitnexus/lbug.staging.abc fileDescriptor: 19 numBytesRead: 0 ' +
+    'numBytesToRead: 4096 position: 8011825152 (MATCH (e:CodeEmbedding {nodeId: $nodeId}) DELETE e)';
+  const OFF_SWITCH = 'GITNEXUS_ATOMIC_INCREMENTAL=0';
+  // The cost of taking the off-switch; it must travel with every mention of it.
+  const OFF_SWITCH_COST = 'leave the live index partly written, and the next run then rebuilds it';
+
+  describe('maxDbSizeReachedRemedy', () => {
+    it('explains the verbatim #3529 message as an address-space ceiling', () => {
+      const remedy = maxDbSizeReachedRemedy(REACHED_3529, 'in-place');
+      expect(remedy).toContain('274877906944');
+      expect(remedy).toContain('engine reported');
+      expect(remedy).toContain('GITNEXUS_LBUG_MAX_DB_SIZE');
+      expect(remedy).toContain('rounded up');
+      expect(remedy).toContain('not disk usage');
+    });
+
+    it('does not claim the configured size must itself be a power of 2', () => {
+      const remedy = maxDbSizeReachedRemedy(REACHED_3529, 'in-place');
+      expect(remedy).not.toContain('must be a power of 2');
+      expect(remedy).toContain('not a power of 2 is rounded up');
+      // The example must show a value actually being rounded, not one already a power of 2.
+      expect(remedy).toContain(`300000000000 becomes ${2 ** 39}`);
+    });
+
+    it.each([
+      ['staged-incremental', true],
+      ['staged-rebuild', false],
+      ['in-place', false],
+    ] as const)('names the off-switch only where it applies: %s', (mode, namesOffSwitch) => {
+      const remedy = maxDbSizeReachedRemedy(REACHED_3529, mode);
+      expect(remedy?.includes(OFF_SWITCH)).toBe(namesOffSwitch);
+      expect(remedy?.includes(OFF_SWITCH_COST)).toBe(namesOffSwitch);
+    });
+
+    it.each([
+      ['staged-incremental', true],
+      ['staged-rebuild', true],
+      ['in-place', false],
+    ] as const)(
+      'says the live index is untouched only for a staged build: %s',
+      (mode, untouched) => {
+        expect(
+          maxDbSizeReachedRemedy(REACHED_3529, mode)?.includes('live index is untouched'),
+        ).toBe(untouched);
+      },
+    );
+
+    it.each([
+      ['the generic wording the engine does not emit', 'Maximum database size exceeded'],
+      ['an unrelated error', 'Binder exception: Table CodeEmbedding does not exist.'],
+      ['the past-EOF message', EOF_3530],
+    ])('returns undefined for %s', (_label, message) => {
+      expect(maxDbSizeReachedRemedy(message, 'staged-incremental')).toBeUndefined();
+    });
+  });
+
+  describe('pastEofReadRemedy', () => {
+    it.each([
+      ['staged-incremental', true],
+      ['staged-rebuild', false],
+    ] as const)(
+      'staged build, %s: live index untouched, off-switch only where it applies',
+      (mode, namesOffSwitch) => {
+        const remedy = pastEofReadRemedy(EOF_3530, mode);
+        expect(remedy).toContain('live index is untouched');
+        expect(remedy?.includes(OFF_SWITCH)).toBe(namesOffSwitch);
+        expect(remedy?.includes(OFF_SWITCH_COST)).toBe(namesOffSwitch);
+      },
+    );
+
+    it('treats an in-place failure as possible index damage with a rebuild remedy', () => {
+      const remedy = pastEofReadRemedy(EOF_3530, 'in-place');
+      expect(remedy).toContain('analyze --force');
+      expect(remedy).not.toContain('live index is untouched');
+      expect(remedy).not.toContain(OFF_SWITCH);
+      expect(remedy).not.toContain(OFF_SWITCH_COST);
+    });
+
+    it.each([
+      ['a short read', EOF_3530.replace('numBytesRead: 0 ', 'numBytesRead: 512 ')],
+      [
+        'a nonzero count that starts with 0',
+        EOF_3530.replace('numBytesRead: 0 ', 'numBytesRead: 04096 '),
+      ],
+      ['the size-ceiling message', REACHED_3529],
+      ['an unrelated error', 'Binder exception: Table CodeEmbedding does not exist.'],
+    ])('returns undefined for %s', (_label, message) => {
+      expect(pastEofReadRemedy(message, 'staged-incremental')).toBeUndefined();
+    });
+  });
+
+  it.each([
+    ['size ceiling', () => maxDbSizeReachedRemedy(REACHED_3529, 'staged-incremental')],
+    ['past-EOF', () => pastEofReadRemedy(EOF_3530, 'staged-incremental')],
+  ])('the %s remedy never recommends lowering the WAL checkpoint threshold', (_label, remedy) => {
+    expect(remedy()).not.toContain('GITNEXUS_WAL_CHECKPOINT_THRESHOLD');
   });
 });

@@ -2,21 +2,41 @@ import * as path from 'node:path';
 import * as fs from 'node:fs/promises';
 import { glob } from 'glob';
 import Parser from 'tree-sitter';
-import C from 'tree-sitter-c';
 import Cpp from 'tree-sitter-cpp';
+import { requireVendoredGrammar } from '../../tree-sitter/vendored-grammars.js';
+
+// `tree-sitter-c` is vendored (#2116), loaded from `vendor/` by absolute path
+// (NEVER copied into node_modules — see vendored-grammars.ts / #2111). Load it
+// via a guarded call rather than a top-level `import C from 'tree-sitter-c'`,
+// which would throw ERR_MODULE_NOT_FOUND at module-load and crash analyze
+// (#2091/#2093). It may be absent on a platform without a prebuild; when the
+// binding is absent, `getLanguageForFile` returns null for `.c`/`.h` so C
+// include-extraction is skipped (C++ is unaffected — its binding always ships).
+let C: Parser.Language | null = null;
+try {
+  C = requireVendoredGrammar('tree-sitter-c');
+} catch {
+  /* C grammar unavailable — C include extraction degrades to a no-op. */
+}
 import type { ContractExtractor, CypherExecutor } from '../contract-extractor.js';
 import type { ExtractedContract, RepoHandle } from '../types.js';
 import { readSafe } from './fs-utils.js';
-import { buildSuffixIndex, type SuffixIndex } from '../../ingestion/import-resolvers/utils.js';
+import { buildSuffixIndex, type SuffixIndex } from '../../ingestion/utils/suffix-index.js';
 import { createIgnoreFilter } from '../../../config/ignore-service.js';
 import { getMaxFileSizeBytes } from '../../ingestion/utils/max-file-size.js';
+import {
+  getIncludeDotDirs,
+  indexableGlobPatterns,
+  dotDirectoryIgnoreFilter,
+  filterDotDirectorySymlinks,
+} from '../../ingestion/utils/include-dot-dirs.js';
 import { parseSourceSafe } from '../../tree-sitter/safe-parse.js';
 import { logger } from '../../logger.js';
 
 /**
  * Cross-repo C/C++ `#include` dependency extractor.
  *
- * **Provider side:** registers every `.h/.hpp/.hxx/.hh` file in the repo
+ * **Provider side:** registers every `.h/.hpp/.hxx/.hh/.cuh` file in the repo
  * as a provider contract with `include::<relative-path>`.
  *
  * **Consumer side:** parses all C/C++ source/header files for `#include "…"`
@@ -31,13 +51,20 @@ import { logger } from '../../logger.js';
 
 // ---------- constants ----------
 
-const HEADER_EXTENSIONS = new Set(['.h', '.hpp', '.hxx', '.hh']);
+const HEADER_EXTENSIONS = new Set(['.h', '.hpp', '.hxx', '.hh', '.cuh']);
 
-// Source = headers (provider-eligible) ∪ implementation files (.c/.cpp/.cc/.cxx).
+// Source = headers (provider-eligible) ∪ implementation files (.c/.cpp/.cc/.cxx/.cu).
 // Spread keeps the subset relationship explicit so a future contributor adding
 // a new header extension to HEADER_EXTENSIONS does not have to remember to
 // also add it here.
-const SOURCE_EXTENSIONS = new Set<string>([...HEADER_EXTENSIONS, '.c', '.cpp', '.cc', '.cxx']);
+const SOURCE_EXTENSIONS = new Set<string>([
+  ...HEADER_EXTENSIONS,
+  '.c',
+  '.cpp',
+  '.cc',
+  '.cxx',
+  '.cu',
+]);
 
 const INCLUDE_QUERY_SRC = '(preproc_include path: (_) @import.source) @import';
 
@@ -249,7 +276,7 @@ function isHeaderFile(filePath: string): boolean {
   return HEADER_EXTENSIONS.has(path.extname(filePath).toLowerCase());
 }
 
-function getLanguageForFile(filePath: string): unknown | null {
+function getLanguageForFile(filePath: string): Parser.Language | null {
   const ext = path.extname(filePath).toLowerCase();
   switch (ext) {
     case '.c':
@@ -261,6 +288,8 @@ function getLanguageForFile(filePath: string): unknown | null {
     case '.hpp':
     case '.hxx':
     case '.hh':
+    case '.cu':
+    case '.cuh':
       return Cpp;
     default:
       return null;
@@ -284,7 +313,7 @@ function getLanguageForFile(filePath: string): unknown | null {
 function isLocalInclude(cleaned: string, suffixIndex: SuffixIndex): boolean {
   const candidates = [cleaned];
   if (!/\.[a-zA-Z0-9]+$/.test(cleaned)) {
-    for (const ext of ['.h', '.hpp', '.hxx', '.hh']) candidates.push(cleaned + ext);
+    for (const ext of HEADER_EXTENSIONS) candidates.push(cleaned + ext);
   }
   for (const c of candidates) {
     if (suffixIndex.get(c) || suffixIndex.getInsensitive(c)) return true;
@@ -341,6 +370,9 @@ export class IncludeExtractor implements ContractExtractor {
    *   - `createIgnoreFilter` honors `.gitignore`, `.gitnexusignore`, the
    *     hardcoded ignore list, and `.gitnexusignore` last-match-wins
    *     negation.
+   *   - `indexableGlobPatterns` adds the `GITNEXUS_INCLUDE_DOT_DIRS`
+   *     directories to the non-hidden file set.
+   *   - Only regular file targets are indexable (file symlinks are retained).
    *   - `getMaxFileSizeBytes()` drops files larger than the cap so we
    *     never emit `File:<rel>` UIDs for files ingestion would skip.
    *
@@ -349,7 +381,7 @@ export class IncludeExtractor implements ContractExtractor {
    * and parallelism gains are not worth the import-graph weight.
    *
    * MAINTENANCE: if `walkRepositoryPaths` changes its glob options, ignore
-   * filter shape, or size-cap logic, mirror those changes here. The two
+   * filter shape, regular-file rule, or size-cap logic, mirror those changes here. The two
    * implementations exist because the consumers need different return
    * shapes (string[] vs ScannedFile[]) and different concurrency, but
    * they MUST agree on which files are reachable — that is what makes
@@ -358,18 +390,25 @@ export class IncludeExtractor implements ContractExtractor {
   private async discoverIndexableFiles(repoPath: string): Promise<string[]> {
     const ignoreFilter = await createIgnoreFilter(repoPath);
     const maxFileSizeBytes = getMaxFileSizeBytes();
+    const includeDotDirs = getIncludeDotDirs();
+    const patterns = indexableGlobPatterns(includeDotDirs);
 
-    const candidates = await glob('**/*', {
+    const candidates = await glob(patterns, {
       cwd: repoPath,
       nodir: true,
       dot: false,
-      ignore: ignoreFilter,
+      ignore: includeDotDirs.length > 0 ? dotDirectoryIgnoreFilter(ignoreFilter) : ignoreFilter,
     });
 
     const survivors: string[] = [];
-    for (const rel of candidates) {
+    const filtered =
+      includeDotDirs.length > 0
+        ? await filterDotDirectorySymlinks(repoPath, candidates)
+        : candidates;
+    for (const rel of filtered) {
       try {
         const stat = await fs.stat(path.join(repoPath, rel));
+        if (!stat.isFile()) continue;
         if (stat.size > maxFileSizeBytes) continue;
         survivors.push(rel);
       } catch (err) {
@@ -414,21 +453,39 @@ export class IncludeExtractor implements ContractExtractor {
     try {
       const rows = await db(
         `MATCH (f:File)
-         WHERE f.filePath =~ '.*\\\\.(h|hpp|hxx|hh)$'
+         WHERE f.filePath =~ '.*\\\\.(h|hpp|hxx|hh|cuh)$'
          RETURN f.filePath AS filePath, f.id AS fileId`,
       );
-      // gitnexus analyze stores absolute paths in the File.filePath column.
       // Provider contract IDs MUST be repo-relative — otherwise the consumer
       // emits `include::map/base/view.h` and the provider emits
       // `include::/abs/path/to/repo/map/base/view.h`, which never match
       // through runExactMatch and the cross-link silently disappears.
       // (PR #1156 follow-up review: graph provider absolute-path bug.)
+      //
+      // Current `gitnexus analyze` does NOT store absolute paths here, contrary
+      // to what this comment used to claim: File.filePath is built from the
+      // walker's repo-relative, forward-slash paths (filesystem-walker.ts →
+      // processStructure), and a full self-index at 89bbdcf5 had 0 of 239,070
+      // nodes with an absolute or backslash-bearing filePath (#2667). The
+      // relativisation below therefore stays as a guard against rows this
+      // process did not write — an index built by an older version, or one
+      // carried over from another machine — not as a description of what
+      // analyze currently emits.
       const normalizedRepoPath = path.resolve(repoPath);
       const out: ExtractedContract[] = [];
       for (const r of rows) {
         if (typeof r.filePath !== 'string' || !r.filePath) continue;
         const absolute = r.filePath as string;
-        const rel = path.relative(normalizedRepoPath, absolute);
+        // Only relativise a row that is actually absolute. Current analyze writes
+        // repo-relative paths (above), and `path.relative(repoRoot, 'src/a.h')`
+        // resolves the second argument against the PROCESS CWD — so from any cwd
+        // other than the repo root every relative row came back `..`-prefixed and
+        // was dropped by the guard below, silently emptying this strategy (#2667
+        // review). Absolute rows still go through `path.relative` so the
+        // containment check keeps rejecting foreign and escaping paths.
+        const rel = path.isAbsolute(absolute)
+          ? path.relative(normalizedRepoPath, absolute)
+          : absolute;
         // Skip rows that resolve outside the repo (e.g., system headers
         // somehow indexed, or stale absolute paths from a different machine).
         // path.relative returns a `..`-prefixed path or an absolute path

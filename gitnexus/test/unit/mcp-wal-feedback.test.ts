@@ -3,17 +3,13 @@
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { lbugMocks, platformMocks, repoMocks } = vi.hoisted(() => ({
+const { lbugMocks, repoMocks } = vi.hoisted(() => ({
   lbugMocks: {
     initLbug: vi.fn().mockResolvedValue(undefined),
     executeQuery: vi.fn(),
     executeParameterized: vi.fn(),
     closeLbug: vi.fn().mockResolvedValue(undefined),
     isLbugReady: vi.fn().mockReturnValue(true),
-    isWriteQuery: vi.fn().mockReturnValue(false),
-  },
-  platformMocks: {
-    isVectorExtensionSupportedByPlatform: vi.fn().mockReturnValue(true),
   },
   repoMocks: {
     listRegisteredRepos: vi.fn(),
@@ -21,12 +17,12 @@ const { lbugMocks, platformMocks, repoMocks } = vi.hoisted(() => ({
 }));
 
 vi.mock('../../src/core/lbug/pool-adapter.js', async (importOriginal) => {
-  const actual = await importOriginal();
+  const actual = await importOriginal<typeof import('../../src/core/lbug/pool-adapter.js')>();
   return { ...actual, ...lbugMocks };
 });
 
 vi.mock('../../src/mcp/core/lbug-adapter.js', async (importOriginal) => {
-  const actual = await importOriginal();
+  const actual = await importOriginal<typeof import('../../src/mcp/core/lbug-adapter.js')>();
   return { ...actual, ...lbugMocks };
 });
 
@@ -40,14 +36,6 @@ vi.mock('../../src/core/git-staleness.js', () => ({
   checkStaleness: vi.fn().mockReturnValue({ isStale: false, commitsBehind: 0 }),
   checkCwdMatch: vi.fn().mockResolvedValue({ match: 'none' }),
 }));
-
-vi.mock('../../src/core/platform/capabilities.js', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../../src/core/platform/capabilities.js')>();
-  return {
-    ...actual,
-    isVectorExtensionSupportedByPlatform: platformMocks.isVectorExtensionSupportedByPlatform,
-  };
-});
 
 vi.mock('../../src/core/search/bm25-index.js', () => ({
   searchFTSFromLbug: vi.fn().mockResolvedValue([]),
@@ -81,7 +69,6 @@ describe('WAL corruption feedback in MCP responses (#1402)', () => {
     lbugMocks.executeQuery.mockResolvedValue([]);
     lbugMocks.executeParameterized.mockResolvedValue([]);
     lbugMocks.isLbugReady.mockReturnValue(true);
-    lbugMocks.isWriteQuery.mockReturnValue(false);
     repoMocks.listRegisteredRepos.mockResolvedValue([MOCK_REPO_ENTRY]);
   });
 
@@ -106,7 +93,7 @@ describe('WAL corruption feedback in MCP responses (#1402)', () => {
 
   it('cypher returns WAL recoverySuggestion on corrupted WAL error', async () => {
     const backend = await makeBackend();
-    lbugMocks.executeQuery.mockRejectedValueOnce(new Error('Corrupted wal file'));
+    lbugMocks.executeParameterized.mockRejectedValueOnce(new Error('Corrupted wal file'));
 
     const result = await backend.callTool('cypher', {
       repo: 'test-repo',

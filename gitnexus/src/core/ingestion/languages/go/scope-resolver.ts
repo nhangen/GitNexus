@@ -3,7 +3,6 @@ import { SupportedLanguages } from 'gitnexus-shared';
 import { buildMro, defaultLinearize } from '../../scope-resolution/passes/mro.js';
 import { populateGoOwners, populateGoWorkspaceOwners } from './method-owners.js';
 import type { ScopeResolver } from '../../scope-resolution/contract/scope-resolver.js';
-import { loadGoModulePath } from '../../language-config.js';
 import { goProvider } from '../go.js';
 import {
   goArityCompatibility,
@@ -15,16 +14,34 @@ import {
 import { detectGoInterfaceImplementations } from './interface-impls.js';
 import { populateGoRangeBindings } from './range-binding.js';
 import { expandGoWildcardNames } from './expand-wildcards.js';
+import { goMapValueType, goQualifiedTypeLookupSpelling } from './interpret.js';
+import { goIsGlobalNameFallbackPlausible } from './name-fallback-visibility.js';
+import { goIsNamespaceMemberVisible } from './namespace-member-visibility.js';
+import { resolveGoImportBinding } from './import-binding.js';
+import { captureGoWorkspaceConfig, loadGoWorkspaceConfig } from './workspace-config.js';
+import { emitMethodOwnerEdges } from '../../scope-resolution/graph-bridge/ownership.js';
+
+/** Slice `[]T` and array `[N]T` / `[...]T` → the element spelling. Hoisted —
+ *  a literal inside the hook would mint a fresh RegExp per folded subscript. */
+const GO_SLICE_ELEMENT_RE = /^\[[^\]]*\]\s*(.+)$/;
 
 export const goScopeResolver: ScopeResolver = {
   language: SupportedLanguages.Go,
   languageProvider: goProvider,
   importEdgeReason: 'go-scope: import',
 
-  loadResolutionConfig: (repoPath: string) => loadGoModulePath(repoPath),
+  // Every go.mod / go.work, not only the root's: modules nest, sit in
+  // directories named unlike their paths, and a repo may have no root module.
+  // Captured from the scan's path list during analyze; a rename refresh is
+  // handed only source paths, so it rescans for the manifests instead.
+  loadResolutionConfig: loadGoWorkspaceConfig,
+  captureResolutionConfig: captureGoWorkspaceConfig,
+  refreshResolutionConfig: (repoPath: string) => loadGoWorkspaceConfig(repoPath),
 
   resolveImportTarget: (targetRaw, fromFile, allFilePaths, resolutionConfig) =>
     resolveGoImportTarget(targetRaw, fromFile, allFilePaths, resolutionConfig),
+
+  resolveImportBinding: resolveGoImportBinding,
 
   expandsWildcardTo: (targetModuleScope, parsedFiles) =>
     expandGoWildcardNames(targetModuleScope, parsedFiles),
@@ -33,11 +50,52 @@ export const goScopeResolver: ScopeResolver = {
 
   arityCompatibility: (callsite, def) => goArityCompatibility(def, callsite),
 
+  // Only `*` — a pointer leaves the method set reachable by selector unchanged,
+  // so `*Host` and `Host` name the same class for receiver typing. `[]` and
+  // `map[…]` are deliberately NOT stripped here: they are containers whose
+  // member set differs from the element's, and unwrapping them belongs to the
+  // index step that consumed a subscript. (Field bindings never reach this
+  // anyway — `normalizeGoTypeName` already strips them at capture. The one
+  // binding that arrives decorated is the receiver self-binding, kept raw on
+  // purpose for `method-owners.ts`.)
+  stripTypePreservingDecoration: (typeName) =>
+    typeName.startsWith('*') ? typeName.slice(1).trim() : undefined,
+
+  // `normalizeGoTypeName` drops the package qualifier from every binding but a
+  // return type, so `models.User` and `api.User` both arrive as `User`. This
+  // recovers `models.User` from the written spelling for receiver typing.
+  qualifiedTypeLookupSpelling: goQualifiedTypeLookupSpelling,
+
+  // The subscript counterpart of the stripper above, and the reason the two are
+  // separate hooks: `*` is safe to strip at any class lookup, `[]` / `map[K]`
+  // only where the source actually indexed. Answers the `index` route only —
+  // Go has no property-style collection view.
+  //
+  // Reads the AS-WRITTEN spelling (`[]*User`), not the capture-normalized name:
+  // `normalizeGoTypeName` already collapsed that to `User`, which is exactly the
+  // ambiguity that made an unanswered index step fold onto the container. The
+  // element is returned STILL DECORATED (`*User`) — the index step looks it up
+  // through `stripTypePreservingDecoration` above, so the pointer resolves.
+  elementTypeOf: (containerType, via) => {
+    if (via.kind !== 'index') return undefined;
+    const t = containerType.trim();
+    // `map[K]V` — a subscript yields V. Literally the same matcher
+    // `normalizeGoTypeName` uses, so the two cannot disagree on what a map
+    // spelling is.
+    const mapValue = goMapValueType(t);
+    if (mapValue !== undefined) return mapValue;
+    // Slice `[]T` and array `[N]T` / `[...]T`.
+    const sliceMatch = GO_SLICE_ELEMENT_RE.exec(t);
+    if (sliceMatch !== null) return sliceMatch[1]!.trim();
+    return undefined;
+  },
+
   buildMro: (graph, parsedFiles, nodeLookup) =>
     buildMro(graph, parsedFiles, nodeLookup, defaultLinearize),
 
   populateOwners: (parsed: ParsedFile) => populateGoOwners(parsed),
   populateWorkspaceOwners: (parsedFiles, ctx) => populateGoWorkspaceOwners(parsedFiles, ctx),
+  emitPostResolutionEdges: emitMethodOwnerEdges,
 
   isSuperReceiver: () => false,
 
@@ -45,11 +103,13 @@ export const goScopeResolver: ScopeResolver = {
   hoistTypeBindingsToModule: true,
   propagatesReturnTypesAcrossImports: true,
   allowGlobalFreeCallFallback: true,
+  isGlobalNameFallbackPlausible: goIsGlobalNameFallbackPlausible,
+  isNamespaceMemberVisible: goIsNamespaceMemberVisible,
 
   populateNamespaceSiblings: populateGoPackageSiblings,
   mirrorNamespaceTypeBindings: mirrorGoNamespaceTypeBindings,
-  // Staged/V2: registered but not yet wired in run.ts — method-name-only
-  // matching produces false IMPLEMENTS edges; awaits signature-level comparison.
+  // Go has structural interfaces: implementations are inferred by signature,
+  // then fed into generic MRO/interface-dispatch.
   detectInterfaceImplementations: detectGoInterfaceImplementations,
   populateRangeBindings: populateGoRangeBindings,
 };

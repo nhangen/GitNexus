@@ -33,6 +33,10 @@ export interface FieldExtractionConfig {
   bodyNodeTypes: string[];
   /** Default visibility when no modifier is present */
   defaultVisibility: FieldVisibility;
+  /** Extract owner type name from a type declaration node. */
+  extractOwnerName?: (node: SyntaxNode, filePath?: string) => string | undefined;
+  /** Find body nodes inside a type declaration node. */
+  findBodyNodes?: (node: SyntaxNode) => SyntaxNode[];
   /**
    * Extract field name from a field declaration node.
    * Use this for nodes that declare exactly one field.
@@ -47,8 +51,30 @@ export interface FieldExtractionConfig {
   extractNames?: (node: SyntaxNode) => string[];
   /** Extract type annotation from a field declaration node */
   extractType: (node: SyntaxNode) => string | undefined;
+  /**
+   * Extract the verbatim declared-type source text (trimmed) from a field
+   * declaration node, preserving generic arguments (`List<Shape>` stays
+   * `List<Shape>`). Unlike `extractType`, the result bypasses
+   * `normalizeType`/`resolveType` entirely — it is the untouched source text.
+   */
+  extractRawType?: (node: SyntaxNode) => string | undefined;
+  /**
+   * Extract the type a field's initializer constructs (`= new Config()` ->
+   * `Config`). Consulted only when `extractType` found no declared type, so it
+   * can never stand in for one. Optional — only languages whose fields can be
+   * typed by their initializer alone implement it.
+   */
+  extractInitializerType?: (node: SyntaxNode) => string | undefined;
+  /**
+   * Extract `'@Name'`-prefixed annotation names from a field declaration
+   * node (e.g. `['@Autowired']`). Optional — only languages with
+   * field-level annotations implement it.
+   */
+  extractAnnotations?: (node: SyntaxNode) => string[];
   /** Extract visibility from a field declaration node */
   extractVisibility: (node: SyntaxNode) => FieldVisibility;
+  /** Extract visibility for one field name from a multi-name declaration. */
+  extractVisibilityForName?: (node: SyntaxNode, name: string) => FieldVisibility;
   /** Check if a field is static */
   isStatic: (node: SyntaxNode) => boolean;
   /** Check if a field is readonly/final/const */
@@ -84,10 +110,10 @@ export function createFieldExtractor(config: FieldExtractionConfig): FieldExtrac
     extract(node: SyntaxNode, context: FieldExtractorContext): ExtractedFields | null {
       if (!this.isTypeDeclaration(node)) return null;
 
-      const nameNode = node.childForFieldName('name');
-      if (!nameNode) return null;
+      const ownerFqn =
+        config.extractOwnerName?.(node, context.filePath) ?? node.childForFieldName('name')?.text;
+      if (!ownerFqn) return null;
 
-      const ownerFqn = nameNode.text;
       const fields: FieldInfo[] = [];
 
       // Find body container(s)
@@ -110,6 +136,8 @@ export function createFieldExtractor(config: FieldExtractionConfig): FieldExtrac
     // ------------------------------------------------------------------
 
     private findBodies(node: SyntaxNode): SyntaxNode[] {
+      if (config.findBodyNodes) return config.findBodyNodes(node);
+
       const result: SyntaxNode[] = [];
       // Try named 'body' field first
       const bodyField = node.childForFieldName('body');
@@ -127,6 +155,17 @@ export function createFieldExtractor(config: FieldExtractionConfig): FieldExtrac
       // Fallback: use the body field even if its type is not in bodyNodeSet
       if (result.length === 0 && bodyField) {
         result.push(bodyField);
+      }
+      // Grammars with no body wrapper at all: a config that declares NO
+      // `bodyNodeTypes` (tree-sitter-zig's struct_declaration holds its
+      // container_field children directly) uses the type-declaration node
+      // itself as the body. The downstream walk filters by `fieldNodeTypes`,
+      // so unrelated children are ignored. Deliberately NOT a fallback for
+      // configs that do declare body wrappers: for them a node without its
+      // wrapper is a bodiless declaration, and scanning it would change every
+      // such language for no field it could find.
+      if (result.length === 0 && bodyNodeSet.size === 0) {
+        result.push(node);
       }
       return result;
     }
@@ -176,14 +215,51 @@ export function createFieldExtractor(config: FieldExtractionConfig): FieldExtrac
         if (resolved) type = resolved;
       }
 
+      // Raw declared type deliberately bypasses normalizeType/resolveType —
+      // it is the verbatim source text (generics preserved).
+      let rawDeclaredType: string | undefined;
+      try {
+        rawDeclaredType = config.extractRawType?.(node);
+      } catch {
+        // A throw here (an unexpected tree-sitter node shape, a config bug)
+        // must NOT propagate — it would escape processFileGroup to the
+        // language-group catch, which treats any throw as "parser unavailable"
+        // and silently drops every remaining file in the group. Degrade to a
+        // field without the raw type instead. Mirrors the descriptionExtractor
+        // / extractTemplateConstraints guards in parse-worker.ts (#2286 review).
+        rawDeclaredType = undefined;
+      }
+
+      let annotations: string[] | undefined;
+      try {
+        annotations = config.extractAnnotations?.(node);
+      } catch {
+        // Same group-drop rationale as the extractRawType guard above —
+        // degrade to a field without annotations (#2286 review).
+        annotations = undefined;
+      }
+
+      let initializerType: string | undefined;
+      try {
+        initializerType = type === null ? config.extractInitializerType?.(node) : undefined;
+      } catch {
+        // Same group-drop rationale as the extractRawType guard above —
+        // degrade to a field without an initializer type.
+        initializerType = undefined;
+      }
+
       return {
         name,
         type,
-        visibility: config.extractVisibility(node),
+        ...(rawDeclaredType !== undefined ? { rawDeclaredType } : {}),
+        ...(initializerType !== undefined ? { initializerType } : {}),
+        ...(annotations !== undefined && annotations.length > 0 ? { annotations } : {}),
+        visibility: config.extractVisibilityForName?.(node, name) ?? config.extractVisibility(node),
         isStatic: config.isStatic(node),
         isReadonly: config.isReadonly(node),
         sourceFile: context.filePath,
         line: node.startPosition.row + 1,
+        column: node.startPosition.column,
       };
     }
   }

@@ -33,6 +33,26 @@ export interface FieldInfo {
   name: string;
   /** Resolved type (may be primitive, FQN, or generic) */
   type: string | null;
+  /**
+   * Verbatim declared-type source text (trimmed), preserving generic
+   * arguments and qualifiers — e.g. `List<Shape>` where `type` is `List`.
+   * Never passes through simple-name extraction or type resolution.
+   */
+  rawDeclaredType?: string;
+  /**
+   * The type the field's INITIALIZER constructs, recorded only for a field that
+   * declares no type (`static DEFAULT = new Config()` -> `Config`). Omitted when
+   * `type` is set, when the initializer constructs nothing nameable, and for
+   * every language whose config does not read initializers.
+   */
+  initializerType?: string;
+  /**
+   * Annotation names found on the field declaration, `'@Name'`-prefixed
+   * (e.g. `['@Autowired']`), matching the method-extractor convention.
+   * Omitted when the language config does not extract annotations or the
+   * field has none.
+   */
+  annotations?: string[];
   /** Visibility modifier */
   visibility: FieldVisibility;
   /** Is this a static member? */
@@ -43,6 +63,8 @@ export interface FieldInfo {
   sourceFile: string;
   /** Line number */
   line: number;
+  /** Zero-based declaration column, when the extractor has an AST position. */
+  column?: number;
 }
 
 /**

@@ -13,11 +13,14 @@
 // We use createRequire to load the CommonJS vendored files in ESM context.
 import Graph from 'graphology';
 import type { AbstractGraph, Attributes } from 'graphology-types';
+import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
-import type { NodeLabel } from 'gitnexus-shared';
+import { Worker } from 'node:worker_threads';
+import type { GraphNode, NodeLabel } from 'gitnexus-shared';
 import { KnowledgeGraph } from '../graph/types.js';
+import { isHeuristicEdgeReason } from '../graph/edge-reasons.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -27,12 +30,9 @@ const _require = createRequire(import.meta.url);
 /** Graphology Graph instance type (AbstractGraph from graphology-types avoids CJS/ESM interop namespace issue) */
 type GraphInstance = AbstractGraph<Attributes, Attributes, Attributes>;
 
-const leiden: LeidenModule = _require(leidenPath);
-
-/** Vendored Leiden algorithm module shape */
-interface LeidenModule {
-  detailed: (graph: GraphInstance, options: Record<string, unknown>) => LeidenDetailedResult;
-}
+// The Leiden worker loads its own copy; this load keeps a missing vendor/ asset
+// failing at import time and keeps it visible to dockerfile-runtime-asset-parity.
+_require(leidenPath);
 
 /** Result returned by leiden.detailed() */
 interface LeidenDetailedResult {
@@ -40,6 +40,111 @@ interface LeidenDetailedResult {
   count: number;
   modularity: number;
 }
+
+type CommunityEngine = 'graphology' | 'icebug';
+export type CommunityDetectionEngine = CommunityEngine | 'auto';
+
+export interface CommunityDetectionOptions {
+  /**
+   * Graphology is the supported default. `icebug`/`auto` are **experimental**:
+   * they route through the optional `@ladybugmem/icebug` native Leiden (#2337)
+   * and fall back to Graphology if it is not installed, cannot load, or
+   * predates the thread/seed controls determinism requires. The two engines
+   * partition differently, so switching changes community IDs — and with them
+   * any generated context keyed on those IDs. No stability guarantee.
+   */
+  engine?: CommunityDetectionEngine;
+  icebug?: {
+    threads?: number;
+    seed?: number;
+    iterations?: number;
+    gamma?: number;
+    randomize?: boolean;
+  };
+}
+
+export interface CommunityProjectionNode {
+  id: string;
+  name: unknown;
+  filePath: unknown;
+  type: NodeLabel;
+}
+
+export interface CommunityProjection {
+  nodes: CommunityProjectionNode[];
+  edges: Array<readonly [number, number]>;
+  symbolCount: number;
+  isLarge: boolean;
+}
+
+export interface CommunityCsr {
+  indptr: BigUint64Array;
+  indices: BigUint64Array;
+}
+
+interface CommunityEngineResult extends LeidenDetailedResult {
+  engine: CommunityEngine;
+  engineRequested: CommunityDetectionEngine;
+  fallbackReason?: string;
+}
+
+interface IcebugWorkerSuccess {
+  ok: true;
+  /** `Leiden.getPartition().membership` — a Float64Array over the worker boundary. */
+  partition: ArrayLike<number>;
+  modularity: number;
+}
+
+interface IcebugWorkerFailure {
+  ok: false;
+  error: string;
+}
+
+/**
+ * Deterministic PRNG (mulberry32) seed for the vendored Leiden algorithm.
+ * Vendored Leiden defaults `rng: Math.random`, which makes community
+ * assignment non-deterministic across runs. Passing a seeded RNG gives us
+ * reproducible community/modularity output, which is required for the
+ * incremental-indexing equivalence test (incremental ≡ full rebuild).
+ */
+const LEIDEN_SEED = 0xc0de;
+
+const COMMUNITY_ENGINE_ENV = 'GITNEXUS_COMMUNITY_ENGINE';
+/**
+ * Not a declared dependency: the prebuilds need system Arrow 24, libomp and
+ * glibc >= 2.38, so it stays an opt-in `npm i @ladybugmem/icebug` alongside
+ * GitNexus rather than 30MB every install pays for.
+ */
+const ICEBUG_MODULE = '@ladybugmem/icebug';
+const DEFAULT_COMMUNITY_ENGINE: CommunityEngine = 'graphology';
+const LEIDEN_TIMEOUT_MS = 60_000;
+const ICEBUG_TIMEOUT_MS = 60_000;
+const MIN_CONFIDENCE_LARGE = 0.5;
+
+/**
+ * Whether a large graph's projection may include this edge.
+ *
+ * The confidence floor alone lets every global-name-fallback edge through — it
+ * is emitted at exactly `MIN_CONFIDENCE_LARGE`, so `confidence <` never
+ * excludes it. Clustering on unique-name guesses fuses unrelated areas into one
+ * community, which is precisely the noise the large-graph floor exists to
+ * remove, so the reason is checked too — see `graph/edge-reasons.ts`.
+ */
+const isLargeGraphEligible = (confidence: number, reason: string): boolean =>
+  confidence >= MIN_CONFIDENCE_LARGE && !isHeuristicEdgeReason(reason);
+
+export const resolveCommunityDetectionEngine = (
+  raw = process.env[COMMUNITY_ENGINE_ENV],
+): CommunityDetectionEngine => {
+  if (raw === undefined || raw.trim() === '') return DEFAULT_COMMUNITY_ENGINE;
+
+  const normalized = raw.trim().toLowerCase();
+  if (normalized === 'graphology' || normalized === 'icebug' || normalized === 'auto') {
+    return normalized;
+  }
+
+  return DEFAULT_COMMUNITY_ENGINE;
+};
 
 // ============================================================================
 // TYPES
@@ -60,11 +165,17 @@ export interface CommunityMembership {
 
 export interface CommunityDetectionResult {
   communities: CommunityNode[];
+  /** Assignments to retained communities, safe to emit as MEMBER_OF edges. */
   memberships: CommunityMembership[];
+  /** All Leiden assignments, including filtered singletons. Optional for legacy producers. */
+  rawMemberships?: CommunityMembership[];
   stats: {
     totalCommunities: number;
     modularity: number;
     nodesProcessed: number;
+    engine?: CommunityEngine;
+    engineRequested?: CommunityDetectionEngine;
+    fallbackReason?: string;
   };
 }
 
@@ -104,30 +215,26 @@ export const getCommunityColor = (communityIndex: number): string => {
 export const processCommunities = async (
   knowledgeGraph: KnowledgeGraph,
   onProgress?: (message: string, progress: number) => void,
+  options: CommunityDetectionOptions = {},
 ): Promise<CommunityDetectionResult> => {
   onProgress?.('Building graph for community detection...', 0);
 
-  // Pre-check total symbol count to determine large-graph mode before building
-  let symbolCount = 0;
-  knowledgeGraph.forEachNode((node) => {
-    if (
-      node.label === 'Function' ||
-      node.label === 'Class' ||
-      node.label === 'Method' ||
-      node.label === 'Interface'
-    ) {
-      symbolCount++;
-    }
-  });
-  const isLarge = symbolCount > 10_000;
-
-  const graph = buildGraphologyGraph(knowledgeGraph, isLarge);
+  const engineRequested = options.engine ?? resolveCommunityDetectionEngine();
+  const projection = buildCommunityProjection(knowledgeGraph);
+  const graph = buildGraphologyGraph(projection);
 
   if (graph.order === 0) {
     return {
       communities: [],
       memberships: [],
-      stats: { totalCommunities: 0, modularity: 0, nodesProcessed: 0 },
+      rawMemberships: [],
+      stats: {
+        totalCommunities: 0,
+        modularity: 0,
+        nodesProcessed: 0,
+        engine: DEFAULT_COMMUNITY_ENGINE,
+        engineRequested,
+      },
     };
   }
 
@@ -135,136 +242,523 @@ export const processCommunities = async (
   const edgeCount = graph.size;
 
   onProgress?.(
-    `Running Leiden on ${nodeCount} nodes, ${edgeCount} edges${isLarge ? ` (filtered from ${symbolCount} symbols)` : ''}...`,
+    `Running Leiden on ${nodeCount} nodes, ${edgeCount} edges${projection.isLarge ? ` (filtered from ${projection.symbolCount} symbols)` : ''}...`,
     30,
   );
 
-  // Large graphs: higher resolution + capped iterations (matching Python leidenalg default of 2).
-  // The first 2 iterations capture ~95%+ of modularity; additional iterations have diminishing returns.
-  // Timeout: abort after 60s for pathological graph structures.
-  const LEIDEN_TIMEOUT_MS = 60_000;
-  let details: LeidenDetailedResult;
-  try {
-    details = await Promise.race([
-      Promise.resolve(
-        leiden.detailed(graph, {
-          resolution: isLarge ? 2.0 : 1.0,
-          maxIterations: isLarge ? 3 : 0,
-        }),
-      ),
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('Leiden timeout')), LEIDEN_TIMEOUT_MS),
-      ),
-    ]);
-  } catch (e: any) {
-    if (e.message === 'Leiden timeout') {
-      onProgress?.('Community detection timed out, using fallback...', 60);
-      // Fallback: assign all nodes to community 0
-      const communities: Record<string, number> = {};
-      graph.forEachNode((node: string) => {
-        communities[node] = 0;
-      });
-      details = { communities, count: 1, modularity: 0 };
-    } else {
-      throw e;
-    }
-  }
+  const details = await runCommunityEngine(graph, projection, engineRequested, options, onProgress);
 
   onProgress?.(`Found ${details.count} communities...`, 60);
 
   // Step 3: Create community nodes with heuristic labels
+  const communityIds = stableCommunityIds(details.communities);
   const communityNodes = createCommunityNodes(
     details.communities as Record<string, number>,
-    details.count,
+    communityIds,
     graph,
-    knowledgeGraph,
   );
 
   onProgress?.('Creating membership edges...', 80);
 
-  // Step 4: Create membership mappings
+  // Step 4: Preserve all assignments for skill generation, but only emit
+  // memberships for retained communities with a corresponding graph node.
+  const retainedCommunityIds = new Set(communityNodes.map((community) => community.id));
   const memberships: CommunityMembership[] = [];
-  Object.entries(details.communities).forEach(([nodeId, communityNum]) => {
-    memberships.push({
-      nodeId,
-      communityId: `comm_${communityNum}`,
-    });
-  });
+  const rawMemberships: CommunityMembership[] = [];
+  for (const nodeId of Object.keys(details.communities)) {
+    const communityNum = details.communities[nodeId];
+    const communityId = communityIds.get(communityNum)!;
+    const membership = { nodeId, communityId };
+    rawMemberships.push(membership);
+    if (retainedCommunityIds.has(communityId)) memberships.push(membership);
+  }
 
   onProgress?.('Community detection complete!', 100);
 
   return {
     communities: communityNodes,
     memberships,
+    rawMemberships,
     stats: {
       totalCommunities: details.count,
       modularity: details.modularity,
       nodesProcessed: graph.order,
+      engine: details.engine,
+      engineRequested: details.engineRequested,
+      fallbackReason: details.fallbackReason,
     },
   };
 };
 
 // ============================================================================
-// HELPER: Build graphology graph from knowledge graph
+// HELPER: Build community projection from knowledge graph
 // ============================================================================
 
 /**
- * Build a graphology graph containing only symbol nodes and clustering edges.
+ * Build a community projection containing only symbol nodes and clustering edges.
  * For large graphs (>10K symbols), filter out low-confidence fuzzy-global edges
  * and degree-1 nodes that add noise and massively increase Leiden runtime.
  */
-const MIN_CONFIDENCE_LARGE = 0.5;
+export const buildCommunityProjection = (knowledgeGraph: KnowledgeGraph): CommunityProjection => {
+  let symbolCount = 0;
+  knowledgeGraph.forEachNode((node) => {
+    if (isCommunitySymbol(node)) {
+      symbolCount++;
+    }
+  });
+  const isLarge = symbolCount > 10_000;
 
-const buildGraphologyGraph = (knowledgeGraph: KnowledgeGraph, isLarge: boolean): GraphInstance => {
+  const connectedNodes = new Set<string>();
+  const nodeDegree = new Map<string, number>();
+
+  // Field-wise scan (#2680): this walks every edge and reads only these five,
+  // so taking objects would allocate one per edge for nothing.
+  knowledgeGraph.forEachRelationshipFields((sourceId, targetId, type, confidence, reason) => {
+    if (!isClusteringRelationship(type) || sourceId === targetId) return;
+    // A name-guessed edge must not join two nodes into a community at ANY graph
+    // size — the rationale in `graph/edge-reasons.ts` is about what the edge
+    // claims, not about how many symbols surround it. Process tracing applies
+    // the same reason gate unconditionally (`process-processor.ts`).
+    if (isHeuristicEdgeReason(reason)) return;
+    if (isLarge && !isLargeGraphEligible(confidence, reason)) return;
+
+    connectedNodes.add(sourceId);
+    connectedNodes.add(targetId);
+    nodeDegree.set(sourceId, (nodeDegree.get(sourceId) || 0) + 1);
+    nodeDegree.set(targetId, (nodeDegree.get(targetId) || 0) + 1);
+  });
+
+  const nodes: CommunityProjectionNode[] = [];
+  const nodeIndexById = new Map<string, number>();
+  const eligibleNodes: GraphNode[] = [];
+
+  knowledgeGraph.forEachNode((node) => {
+    if (!isCommunitySymbol(node) || !connectedNodes.has(node.id)) return;
+    // For large graphs, skip degree-1 nodes — they just become singletons or
+    // get absorbed into their single neighbor's community, but cost iteration time.
+    if (isLarge && (nodeDegree.get(node.id) || 0) < 2) return;
+
+    eligibleNodes.push(node);
+  });
+
+  eligibleNodes.sort((left, right) => (left.id < right.id ? -1 : left.id > right.id ? 1 : 0));
+
+  for (const node of eligibleNodes) {
+    nodeIndexById.set(node.id, nodes.length);
+    nodes.push({
+      id: node.id,
+      name: node.properties.name,
+      filePath: node.properties.filePath,
+      type: node.label,
+    });
+  }
+
+  const seenEdges = new Set<string>();
+  const edges: Array<readonly [number, number]> = [];
+
+  knowledgeGraph.forEachRelationshipFields((sourceId, targetId, type, confidence, reason) => {
+    if (!isClusteringRelationship(type) || sourceId === targetId) return;
+    if (isHeuristicEdgeReason(reason)) return;
+    if (isLarge && !isLargeGraphEligible(confidence, reason)) return;
+
+    const sourceIndex = nodeIndexById.get(sourceId);
+    const targetIndex = nodeIndexById.get(targetId);
+    if (sourceIndex === undefined || targetIndex === undefined || sourceIndex === targetIndex)
+      return;
+
+    const [a, b] =
+      sourceIndex < targetIndex ? [sourceIndex, targetIndex] : [targetIndex, sourceIndex];
+    const edgeKey = `${a}:${b}`;
+    if (seenEdges.has(edgeKey)) return;
+
+    seenEdges.add(edgeKey);
+    edges.push([a, b]);
+  });
+  edges.sort(([leftA, leftB], [rightA, rightB]) => leftA - rightA || leftB - rightB);
+
+  return { nodes, edges, symbolCount, isLarge };
+};
+
+export const buildCommunityCsr = (projection: CommunityProjection): CommunityCsr => {
+  const adjacency = Array.from({ length: projection.nodes.length }, () => new Set<number>());
+
+  for (const [sourceIndex, targetIndex] of projection.edges) {
+    adjacency[sourceIndex].add(targetIndex);
+    adjacency[targetIndex].add(sourceIndex);
+  }
+
+  const edgeTraversalCount = adjacency.reduce((count, neighbors) => count + neighbors.size, 0);
+  const indptr = new BigUint64Array(projection.nodes.length + 1);
+  const indices = new BigUint64Array(edgeTraversalCount);
+
+  let cursor = 0;
+  for (let nodeIndex = 0; nodeIndex < adjacency.length; nodeIndex++) {
+    indptr[nodeIndex] = BigInt(cursor);
+    const neighbors = [...adjacency[nodeIndex]].sort((a, b) => a - b);
+    for (const neighbor of neighbors) {
+      indices[cursor++] = BigInt(neighbor);
+    }
+  }
+  indptr[projection.nodes.length] = BigInt(cursor);
+
+  return { indptr, indices };
+};
+
+export const buildGraphologyGraph = (projection: CommunityProjection): GraphInstance => {
   const GraphCtor = Graph as unknown as new (options: {
     type: string;
     allowSelfLoops: boolean;
   }) => GraphInstance;
   const graph = new GraphCtor({ type: 'undirected', allowSelfLoops: false });
 
-  const symbolTypes = new Set<NodeLabel>(['Function', 'Class', 'Method', 'Interface']);
-  const clusteringRelTypes = new Set(['CALLS', 'EXTENDS', 'IMPLEMENTS']);
-  const connectedNodes = new Set<string>();
-  const nodeDegree = new Map<string, number>();
-
-  knowledgeGraph.forEachRelationship((rel) => {
-    if (!clusteringRelTypes.has(rel.type) || rel.sourceId === rel.targetId) return;
-    if (isLarge && rel.confidence < MIN_CONFIDENCE_LARGE) return;
-
-    connectedNodes.add(rel.sourceId);
-    connectedNodes.add(rel.targetId);
-    nodeDegree.set(rel.sourceId, (nodeDegree.get(rel.sourceId) || 0) + 1);
-    nodeDegree.set(rel.targetId, (nodeDegree.get(rel.targetId) || 0) + 1);
-  });
-
-  knowledgeGraph.forEachNode((node) => {
-    if (!symbolTypes.has(node.label) || !connectedNodes.has(node.id)) return;
-    // For large graphs, skip degree-1 nodes — they just become singletons or
-    // get absorbed into their single neighbor's community, but cost iteration time.
-    if (isLarge && (nodeDegree.get(node.id) || 0) < 2) return;
-
+  for (const node of projection.nodes) {
     graph.addNode(node.id, {
-      name: node.properties.name,
-      filePath: node.properties.filePath,
-      type: node.label,
+      name: node.name,
+      filePath: node.filePath,
+      type: node.type,
     });
-  });
+  }
 
-  knowledgeGraph.forEachRelationship((rel) => {
-    if (!clusteringRelTypes.has(rel.type)) return;
-    if (isLarge && rel.confidence < MIN_CONFIDENCE_LARGE) return;
-    if (
-      graph.hasNode(rel.sourceId) &&
-      graph.hasNode(rel.targetId) &&
-      rel.sourceId !== rel.targetId
-    ) {
-      if (!graph.hasEdge(rel.sourceId, rel.targetId)) {
-        graph.addEdge(rel.sourceId, rel.targetId);
-      }
-    }
-  });
+  for (const [sourceIndex, targetIndex] of projection.edges) {
+    graph.addEdge(projection.nodes[sourceIndex].id, projection.nodes[targetIndex].id);
+  }
 
   return graph;
+};
+
+const isCommunitySymbol = (node: GraphNode): boolean =>
+  node.label === 'Function' ||
+  node.label === 'Class' ||
+  node.label === 'Method' ||
+  node.label === 'Interface';
+
+const isClusteringRelationship = (type: string): boolean =>
+  type === 'CALLS' || type === 'EXTENDS' || type === 'IMPLEMENTS';
+
+const runCommunityEngine = async (
+  graph: GraphInstance,
+  projection: CommunityProjection,
+  engineRequested: CommunityDetectionEngine,
+  options: CommunityDetectionOptions,
+  onProgress?: (message: string, progress: number) => void,
+): Promise<CommunityEngineResult> => {
+  if (engineRequested === 'graphology') {
+    return runGraphologyLeiden(graph, projection.isLarge, engineRequested);
+  }
+
+  // Announced on request, not just on fallback: a run that succeeds is the case
+  // where the user most needs to know the partition came from the experimental
+  // engine, since community IDs feed generated context.
+  onProgress?.(
+    `Experimental ${engineRequested} community engine requested — unsupported, and its ` +
+      'communities will not match the Graphology default.',
+    32,
+  );
+
+  try {
+    return await runIcebugLeiden(projection, engineRequested, options);
+  } catch (error) {
+    const fallbackReason = error instanceof Error ? error.message : String(error);
+    onProgress?.(
+      `Icebug community engine unavailable, falling back to Graphology: ${fallbackReason}`,
+      35,
+    );
+    const fallback = await runGraphologyLeiden(graph, projection.isLarge, engineRequested);
+    return {
+      ...fallback,
+      fallbackReason: fallback.fallbackReason
+        ? `${fallbackReason}; ${fallback.fallbackReason}`
+        : fallbackReason,
+    };
+  }
+};
+
+/**
+ * Runs the vendored Leiden in a worker so LEIDEN_TIMEOUT_MS can actually fire.
+ * leiden.detailed is synchronous and, on some graphs, never returns
+ * (graphology/graphology#557); a timer on the main thread cannot interrupt it.
+ * The worker is pure JS, so terminate() is safe (unlike the icebug N-API worker).
+ */
+const GRAPHOLOGY_WORKER_SOURCE = `
+const { parentPort, workerData } = require('node:worker_threads');
+try {
+  const Graph = require(workerData.graphologyPath);
+  const leiden = require(workerData.leidenPath);
+  const graph = Graph.from(workerData.graph);
+  const rng = (() => {
+    let s = workerData.seed >>> 0;
+    return () => {
+      s = (s + 0x6d2b79f5) >>> 0;
+      let t = Math.imul(s ^ (s >>> 15), 1 | s);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  })();
+  const d = leiden.detailed(graph, {
+    resolution: workerData.resolution,
+    maxIterations: workerData.maxIterations,
+    rng,
+  });
+  parentPort.postMessage({
+    ok: true,
+    communities: d.communities,
+    count: d.count,
+    modularity: d.modularity,
+  });
+} catch (error) {
+  parentPort.postMessage({ ok: false, error: error instanceof Error ? error.message : String(error) });
+}
+`;
+
+export const runGraphologyLeiden = async (
+  graph: GraphInstance,
+  isLarge: boolean,
+  engineRequested: CommunityDetectionEngine,
+  timeoutMs: number = LEIDEN_TIMEOUT_MS,
+): Promise<CommunityEngineResult> => {
+  try {
+    const details = await new Promise<LeidenDetailedResult>((resolve, reject) => {
+      const worker = new Worker(GRAPHOLOGY_WORKER_SOURCE, {
+        eval: true,
+        workerData: {
+          graphologyPath: _require.resolve('graphology'),
+          leidenPath,
+          graph: graph.export(),
+          seed: LEIDEN_SEED,
+          resolution: isLarge ? 2.0 : 1.0,
+          maxIterations: isLarge ? 3 : 0,
+        },
+      });
+      let settled = false;
+      const timeout = setTimeout(() => {
+        settled = true;
+        void worker.terminate();
+        reject(new Error('Leiden timeout'));
+      }, timeoutMs);
+      worker.once('message', (message) => {
+        settled = true;
+        clearTimeout(timeout);
+        if (message.ok === true) {
+          resolve({
+            communities: message.communities,
+            count: message.count,
+            modularity: message.modularity,
+          });
+        } else {
+          reject(new Error(message.error));
+        }
+      });
+      worker.once('error', (error) => {
+        settled = true;
+        clearTimeout(timeout);
+        reject(error);
+      });
+      worker.once('exit', (code) => {
+        if (settled) return;
+        clearTimeout(timeout);
+        reject(new Error(`Graphology Leiden worker exited with code ${code}`));
+      });
+    });
+    return { ...details, engine: 'graphology', engineRequested };
+  } catch (e: any) {
+    if (e.message !== 'Leiden timeout') {
+      throw e;
+    }
+
+    // Fallback: assign all nodes to community 0
+    const communities: Record<string, number> = {};
+    graph.forEachNode((node: string) => {
+      communities[node] = 0;
+    });
+    return {
+      communities,
+      count: 1,
+      modularity: 0,
+      engine: 'graphology',
+      engineRequested,
+      fallbackReason: 'Graphology Leiden timeout',
+    };
+  }
+};
+
+const runIcebugLeiden = async (
+  projection: CommunityProjection,
+  engineRequested: CommunityDetectionEngine,
+  options: CommunityDetectionOptions,
+): Promise<CommunityEngineResult> => {
+  const csr = buildCommunityCsr(projection);
+  const nativeResult = await runIcebugWorker(projection.nodes.length, csr, options);
+  const partition = nativeResult.partition;
+  if (!Number.isFinite(nativeResult.modularity)) {
+    throw new Error('optional icebug modularity was not finite');
+  }
+  if (partition.length !== projection.nodes.length || !isIntegerPartition(partition)) {
+    throw new Error(
+      `optional icebug partition was malformed for ${projection.nodes.length} projected nodes`,
+    );
+  }
+
+  const communities = normalizePartition(projection, partition);
+  return {
+    communities,
+    count: new Set(Object.values(communities)).size,
+    modularity: nativeResult.modularity,
+    engine: 'icebug',
+    engineRequested,
+  };
+};
+
+const isIntegerPartition = (partition: ArrayLike<number>): boolean => {
+  for (let index = 0; index < partition.length; index++) {
+    if (!Number.isSafeInteger(partition[index])) return false;
+  }
+  return true;
+};
+
+const runIcebugWorker = (
+  nodeCount: number,
+  csr: CommunityCsr,
+  options: CommunityDetectionOptions,
+): Promise<IcebugWorkerSuccess> => {
+  const threads = options.icebug?.threads ?? 1;
+  if (!Number.isSafeInteger(threads) || threads !== 1) {
+    throw new Error('optional icebug engine currently requires deterministic threads=1');
+  }
+  if (options.icebug?.randomize === true) {
+    throw new Error('optional icebug engine currently requires randomize=false');
+  }
+
+  const worker = new Worker(ICEBUG_WORKER_SOURCE, {
+    eval: true,
+    workerData: {
+      nodeCount,
+      indices: csr.indices,
+      indptr: csr.indptr,
+      threads,
+      seed: options.icebug?.seed ?? LEIDEN_SEED,
+      iterations: options.icebug?.iterations ?? 4,
+      gamma: options.icebug?.gamma ?? 1.0,
+      randomize: options.icebug?.randomize ?? false,
+    },
+  });
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timeout = setTimeout(() => {
+      settled = true;
+      // Deliberately NOT terminate(): every millisecond of this worker's life is
+      // spent inside an N-API call (dlopen, GraphR, Leiden, run), and killing a
+      // thread mid-N-API aborts the whole process — Napi::Error → std::terminate
+      // → SIGABRT (#2432, see worker-pool.ts `shutdownDrainMs`). A timeout must
+      // degrade to the Graphology fallback, not take analyze down with it.
+      // unref() so a wedged native run cannot hold the process open either.
+      worker.unref();
+      reject(new Error(`optional icebug community engine timed out after ${ICEBUG_TIMEOUT_MS}ms`));
+    }, ICEBUG_TIMEOUT_MS);
+
+    // No terminate() on the settled paths either: the worker script ends after
+    // its single postMessage, so the thread exits on its own.
+    worker.once('message', (message: IcebugWorkerSuccess | IcebugWorkerFailure) => {
+      settled = true;
+      clearTimeout(timeout);
+      if (message.ok === true) {
+        resolve(message);
+      } else {
+        reject(new Error(message.error));
+      }
+    });
+
+    worker.once('error', (error) => {
+      settled = true;
+      clearTimeout(timeout);
+      reject(error);
+    });
+
+    worker.once('exit', (code) => {
+      if (settled) return;
+      clearTimeout(timeout);
+      if (code === 0) {
+        reject(new Error('optional icebug worker exited before returning a partition'));
+        return;
+      }
+      reject(new Error(`optional icebug worker exited with code ${code}`));
+    });
+  });
+};
+
+/**
+ * Runs Leiden in a worker so a native crash cannot take the analyze process
+ * with it. Written against @ladybugmem/icebug's published surface (lib/index.js
+ * + index.d.ts): `GraphR(n, directed, outIndices, outIndptr)` pins the CSR
+ * buffers zero-copy, and `Leiden(graph, iterations, randomize, gamma)` — note
+ * `randomize` precedes `gamma` — returns `{membership, count}` from
+ * `getPartition()`.
+ *
+ * The thread/seed controls are required, not optional: community IDs feed
+ * generated context, so a build without them would give non-reproducible
+ * output. They exist at icebug-nodejs HEAD but are missing from the published
+ * 12.8.0 tarball, so today this guard is what trips and sends us back to
+ * Graphology.
+ */
+export const buildIcebugWorkerSource = (moduleSpecifier: string): string => `
+const { parentPort, workerData } = require('node:worker_threads');
+
+try {
+  const icebug = require(${JSON.stringify(moduleSpecifier)});
+
+  if (typeof icebug.setNumberOfThreads !== 'function' || typeof icebug.setSeed !== 'function') {
+    throw new Error(
+      'optional icebug build predates the deterministic thread/seed controls (icebug-nodejs#6)',
+    );
+  }
+
+  icebug.setNumberOfThreads(workerData.threads);
+  icebug.setSeed(workerData.seed, false);
+
+  const graph = new icebug.GraphR(
+    workerData.nodeCount,
+    false,
+    workerData.indices,
+    workerData.indptr,
+  );
+  const leiden = new icebug.Leiden(
+    graph,
+    workerData.iterations,
+    workerData.randomize,
+    workerData.gamma,
+  );
+  leiden.run();
+
+  parentPort.postMessage({
+    ok: true,
+    partition: leiden.getPartition().membership,
+    modularity: leiden.modularity(),
+  });
+} catch (error) {
+  parentPort.postMessage({ ok: false, error: error instanceof Error ? error.message : String(error) });
+}
+`;
+
+const ICEBUG_WORKER_SOURCE = buildIcebugWorkerSource(ICEBUG_MODULE);
+
+const normalizePartition = (
+  projection: CommunityProjection,
+  partition: ArrayLike<number>,
+): Record<string, number> => {
+  const remap = new Map<string, number>();
+  const communities: Record<string, number> = {};
+
+  for (let index = 0; index < projection.nodes.length; index++) {
+    const rawCommunity = String(partition[index]);
+    let communityId = remap.get(rawCommunity);
+    if (communityId === undefined) {
+      communityId = remap.size;
+      remap.set(rawCommunity, communityId);
+    }
+    communities[projection.nodes[index].id] = communityId;
+  }
+
+  return communities;
 };
 
 // ============================================================================
@@ -272,30 +766,48 @@ const buildGraphologyGraph = (knowledgeGraph: KnowledgeGraph, isLarge: boolean):
 // ============================================================================
 
 /**
- * Create Community nodes with auto-generated labels based on member file paths
+ * Anchor each community to its smallest member, independent of partition numbering.
+ * The ID stays stable while that anchor remains the smallest member. Adding a
+ * smaller member or removing the anchor changes it. Anchor order makes collision
+ * suffixes deterministic even when the engine renumbers or reorders its partition.
+ * The ID follows the anchor if clustering moves it to a different member set.
  */
+export const stableCommunityIds = (communities: Record<string, number>): Map<number, string> => {
+  const smallest = new Map<number, string>();
+  // Avoid allocating an entry tuple for every symbol in the partition.
+  for (const nodeId of Object.keys(communities)) {
+    const communityNum = communities[nodeId];
+    const current = smallest.get(communityNum);
+    if (current === undefined || nodeId < current) smallest.set(communityNum, nodeId);
+  }
+
+  const ids = new Map<number, string>();
+  const used = new Set<string>();
+  const ordered = [...smallest].sort(([, a], [, b]) => (a < b ? -1 : a > b ? 1 : 0));
+  for (const [communityNum, memberId] of ordered) {
+    const base = `comm_${createHash('sha1').update(memberId).digest('hex').slice(0, 12)}`;
+    let id = base;
+    for (let n = 2; used.has(id); n++) id = `${base}_${n}`;
+    used.add(id);
+    ids.set(communityNum, id);
+  }
+  return ids;
+};
+
+/** Create Community nodes with labels based on member file paths. */
 const createCommunityNodes = (
   communities: Record<string, number>,
-  communityCount: number,
+  communityIds: ReadonlyMap<number, string>,
   graph: GraphInstance,
-  knowledgeGraph: KnowledgeGraph,
 ): CommunityNode[] => {
   // Group node IDs by community
   const communityMembers = new Map<number, string[]>();
 
-  Object.entries(communities).forEach(([nodeId, commNum]) => {
-    if (!communityMembers.has(commNum)) {
-      communityMembers.set(commNum, []);
-    }
-    communityMembers.get(commNum)!.push(nodeId);
-  });
-
-  // Build node lookup for file paths
-  const nodePathMap = new Map<string, string>();
-  for (const node of knowledgeGraph.iterNodes()) {
-    if (node.properties.filePath) {
-      nodePathMap.set(node.id, node.properties.filePath);
-    }
+  for (const nodeId of Object.keys(communities)) {
+    const commNum = communities[nodeId];
+    const members = communityMembers.get(commNum);
+    if (members) members.push(nodeId);
+    else communityMembers.set(commNum, [nodeId]);
   }
 
   // Create community nodes - SKIP SINGLETONS (isolated nodes)
@@ -305,13 +817,14 @@ const createCommunityNodes = (
     // Skip singleton communities - they're just isolated nodes
     if (memberIds.length < 2) return;
 
-    const heuristicLabel = generateHeuristicLabel(memberIds, nodePathMap, graph, commNum);
+    const communityId = communityIds.get(commNum)!;
+    const heuristicLabel = generateHeuristicLabel(memberIds, graph, communityId);
 
     communityNodes.push({
-      id: `comm_${commNum}`,
+      id: communityId,
       label: heuristicLabel,
       heuristicLabel,
-      cohesion: calculateCohesion(memberIds, graph),
+      cohesion: calculateCohesion(memberIds, graph, communities, commNum),
       symbolCount: memberIds.length,
     });
   });
@@ -331,15 +844,14 @@ const createCommunityNodes = (
  */
 const generateHeuristicLabel = (
   memberIds: string[],
-  nodePathMap: Map<string, string>,
   graph: GraphInstance,
-  commNum: number,
+  communityId: string,
 ): string => {
   // Collect folder names from file paths
   const folderCounts = new Map<string, number>();
 
   memberIds.forEach((nodeId) => {
-    const filePath = nodePathMap.get(nodeId) || '';
+    const filePath: string = graph.getNodeAttribute(nodeId, 'filePath') || '';
     const parts = filePath.split('/').filter(Boolean);
 
     // Get the most specific folder (parent directory)
@@ -388,7 +900,7 @@ const generateHeuristicLabel = (
   }
 
   // Last resort: generic name with community ID for uniqueness
-  return `Cluster_${commNum}`;
+  return `Cluster_${communityId.slice('comm_'.length)}`;
 };
 
 /**
@@ -417,10 +929,13 @@ const findCommonPrefix = (strings: string[]): string => {
  * Estimate cohesion score (0-1) based on internal edge density.
  * Uses sampling for large communities to avoid O(N^2) cost.
  */
-const calculateCohesion = (memberIds: string[], graph: GraphInstance): number => {
+const calculateCohesion = (
+  memberIds: string[],
+  graph: GraphInstance,
+  communities: Record<string, number>,
+  communityNum: number,
+): number => {
   if (memberIds.length <= 1) return 1.0;
-
-  const memberSet = new Set(memberIds);
 
   // Sample up to 50 members for large communities
   const SAMPLE_SIZE = 50;
@@ -433,7 +948,7 @@ const calculateCohesion = (memberIds: string[], graph: GraphInstance): number =>
     if (!graph.hasNode(nodeId)) continue;
     graph.forEachNeighbor(nodeId, (neighbor: string) => {
       totalEdges++;
-      if (memberSet.has(neighbor)) {
+      if (communities[neighbor] === communityNum) {
         internalEdges++;
       }
     });

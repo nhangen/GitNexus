@@ -9,6 +9,7 @@ import type {
 } from '../../method-types.js';
 import { extractSimpleTypeName } from '../../type-extractors/shared.js';
 import type { SyntaxNode } from '../../utils/ast-helpers.js';
+import { memoizeDeclarationFact } from '../declaration-facts.js';
 
 // ---------------------------------------------------------------------------
 // PHP helpers
@@ -113,7 +114,6 @@ function extractPhpReturnType(node: SyntaxNode): string | undefined {
     'named_type',
     'union_type',
     'optional_type',
-    'nullable_type',
     'intersection_type',
   ]);
 
@@ -283,7 +283,7 @@ export const phpMethodConfig: MethodExtractionConfig = {
 
   extractReturnType: extractPhpReturnType,
 
-  extractParameters: extractPhpParameters,
+  extractParameters: memoizeDeclarationFact(extractPhpParameters),
 
   extractVisibility: findPhpVisibility,
 

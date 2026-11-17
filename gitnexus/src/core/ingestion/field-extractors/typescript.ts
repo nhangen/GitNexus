@@ -3,6 +3,7 @@
 import type { SyntaxNode } from '../utils/ast-helpers.js';
 import { SupportedLanguages } from 'gitnexus-shared';
 import { BaseFieldExtractor } from '../field-extractor.js';
+import { constructedTypeOfFieldInitializer } from './configs/typescript-javascript.js';
 import type {
   FieldExtractorContext,
   ExtractedFields,
@@ -29,6 +30,7 @@ export class TypeScriptFieldExtractor extends BaseFieldExtractor {
    * Node types that represent type declarations with fields in TypeScript
    */
   private static readonly TYPE_DECLARATION_NODES = new Set([
+    'class',
     'class_declaration',
     'interface_declaration',
     'abstract_class_declaration',
@@ -86,18 +88,6 @@ export class TypeScriptFieldExtractor extends BaseFieldExtractor {
       }
     }
 
-    // Check for modifier node (tree-sitter typescript may group these)
-    const modifiers = node.childForFieldName('modifiers');
-    if (modifiers) {
-      for (let i = 0; i < modifiers.childCount; i++) {
-        const modifier = modifiers.child(i);
-        const modText = modifier?.text.trim() as FieldVisibility | undefined;
-        if (modText && TypeScriptFieldExtractor.VISIBILITY_MODIFIERS.has(modText)) {
-          return modText;
-        }
-      }
-    }
-
     // TypeScript class members are public by default
     return 'public';
   }
@@ -113,16 +103,6 @@ export class TypeScriptFieldExtractor extends BaseFieldExtractor {
       }
     }
 
-    const modifiers = node.childForFieldName('modifiers');
-    if (modifiers) {
-      for (let i = 0; i < modifiers.childCount; i++) {
-        const modifier = modifiers.child(i);
-        if (modifier && modifier.text === 'static') {
-          return true;
-        }
-      }
-    }
-
     return false;
   }
 
@@ -134,16 +114,6 @@ export class TypeScriptFieldExtractor extends BaseFieldExtractor {
       const child = node.child(i);
       if (child && !child.isNamed && child.text.trim() === 'readonly') {
         return true;
-      }
-    }
-
-    const modifiers = node.childForFieldName('modifiers');
-    if (modifiers) {
-      for (let i = 0; i < modifiers.childCount; i++) {
-        const modifier = modifiers.child(i);
-        if (modifier && modifier.text === 'readonly') {
-          return true;
-        }
       }
     }
 
@@ -209,14 +179,18 @@ export class TypeScriptFieldExtractor extends BaseFieldExtractor {
       type = resolvedType ?? type;
     }
 
+    const initializerType = type === null ? constructedTypeOfFieldInitializer(node) : undefined;
+
     return {
       name,
       type,
+      ...(initializerType !== undefined ? { initializerType } : {}),
       visibility: this.extractVisibility(node),
       isStatic: this.isStatic(node),
       isReadonly: this.isReadonly(node),
       sourceFile: context.filePath,
       line: node.startPosition.row + 1,
+      column: node.startPosition.column,
     };
   }
 
@@ -285,7 +259,11 @@ export class TypeScriptFieldExtractor extends BaseFieldExtractor {
     const nestedTypes: string[] = [];
 
     // Handle different declaration types
-    if (node.type === 'class_declaration' || node.type === 'abstract_class_declaration') {
+    if (
+      node.type === 'class' ||
+      node.type === 'class_declaration' ||
+      node.type === 'abstract_class_declaration'
+    ) {
       // Find the class body
       const bodyNode = node.childForFieldName('body');
       if (bodyNode) {

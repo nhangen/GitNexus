@@ -13,6 +13,23 @@ node_modules/
 vendor/**/node_modules
 vendor/**/build
 
+# ── Lean publish (done via package.json `files`, not this file) ───────────────
+# Every vendored grammar now has 6/6 prebuilds, so the published tarball drops
+# generated source (parser.c etc.). node-gyp-build loads prebuilds without it.
+#
+# IMPORTANT: this CANNOT be done from this file. A broad `files: ["vendor"]`
+# allow-list OVERRIDES .npmignore for the vendor/ subtree (verified: an active
+# `vendor/**/src/parser.c` line here does NOT exclude it from `npm pack`). The
+# lever is the `files` field — non-source subpaths only (vendor/**/prebuilds/**,
+# vendor/**/bindings/node/index.js, vendor/**/src/node-types.json,
+# vendor/**/package.json, vendor/**/LICENSE, vendor/**/README.md, plus Leiden
+# and the FTS manifest).
+#
+# The prepack guard (scripts/assert-publish-grammar-coverage.cjs, also
+# `npm run assert-publish-coverage`) reads `files` and FAILS the publish
+# whenever a grammar with <6 prebuilds loses a source-build input. Do not
+# bypass it. Do not add a bare `vendor` entry back.
+
 # Package lock (consumers use their own)
 package-lock.json
 

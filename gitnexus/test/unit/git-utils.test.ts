@@ -8,7 +8,30 @@ import { describe, it, expect, vi } from 'vitest';
 import path from 'path';
 import os from 'os';
 import fs from 'fs';
-import { execSync } from 'child_process';
+import { execFileSync, execSync } from 'child_process';
+
+const gitExecutable = (() => {
+  if (process.platform !== 'win32') return 'git';
+  try {
+    return (
+      execFileSync('where.exe', ['git'], { encoding: 'utf8' }).split(/\r?\n/).find(Boolean) ?? 'git'
+    );
+  } catch {
+    return 'git';
+  }
+})();
+
+const isolatedTmpRoot = (() => {
+  const root =
+    process.platform === 'win32'
+      ? path.join(path.parse(os.tmpdir()).root, 'gitnexus-outside-git')
+      : path.join(os.tmpdir(), 'gitnexus-outside-git');
+  fs.mkdirSync(root, { recursive: true });
+  return root;
+})();
+
+const makeIsolatedTempDir = (prefix = 'gitnexus-test-'): string =>
+  fs.mkdtempSync(path.join(isolatedTmpRoot, prefix));
 
 // ─── hasGitDir ────────────────────────────────────────────────────────────
 //
@@ -71,7 +94,7 @@ describe('hasGitDir', () => {
 describe('isGitRepo', () => {
   it('returns false for a plain (non-git) directory', async () => {
     const { isGitRepo } = await import('../../src/storage/git.js');
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gitnexus-test-'));
+    const tmpDir = makeIsolatedTempDir();
     try {
       expect(isGitRepo(tmpDir)).toBe(false);
     } finally {
@@ -124,7 +147,7 @@ describe('getCurrentCommit', () => {
 describe('getGitRoot', () => {
   it('returns null for a plain temp directory', async () => {
     const { getGitRoot } = await import('../../src/storage/git.js');
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gitnexus-test-'));
+    const tmpDir = makeIsolatedTempDir();
     try {
       expect(getGitRoot(tmpDir)).toBeNull();
     } finally {
@@ -146,21 +169,37 @@ describe('getGitRoot', () => {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
+
+  it('preserves a trailing-space repository directory name (#2190)', async () => {
+    const { getGitRoot } = await import('../../src/storage/git.js');
+    const parentDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gitnexus-space-root-'));
+    const initDir = path.join(parentDir, 'repo-init');
+    const repoDir = path.join(parentDir, 'repo ');
+    try {
+      fs.mkdirSync(initDir);
+      execFileSync(gitExecutable, ['init', '-q'], { cwd: initDir, stdio: 'ignore' });
+      fs.renameSync(initDir, repoDir);
+
+      expect(getGitRoot(repoDir)).toBe(path.resolve(repoDir));
+    } finally {
+      fs.rmSync(parentDir, { recursive: true, force: true });
+    }
+  });
 });
 
 // ─── getRemoteUrl ─────────────────────────────────────────────────────────
 
-describe('getRemoteUrl', () => {
-  const setupRepoWithRemote = (remoteUrl: string): string => {
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gitnexus-remote-'));
-    // Use real fs paths and shellouts — the helper itself shells out to
-    // `git config`, so we need a real git repo for the assertion to be
-    // meaningful.
-    execSync('git init -q', { cwd: tmpDir });
-    execSync(`git remote add origin ${remoteUrl}`, { cwd: tmpDir });
-    return tmpDir;
-  };
+const setupRepoWithRemote = (remoteUrl: string): string => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gitnexus-remote-'));
+  // Use real fs paths and shellouts — the helper itself shells out to
+  // `git config`, so we need a real git repo for the assertion to be
+  // meaningful.
+  execSync('git init -q', { cwd: tmpDir });
+  execSync(`git remote add origin ${remoteUrl}`, { cwd: tmpDir });
+  return tmpDir;
+};
 
+describe('getRemoteUrl', () => {
   it('returns undefined for a non-git directory', async () => {
     const { getRemoteUrl } = await import('../../src/storage/git.js');
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gitnexus-test-'));
@@ -216,6 +255,80 @@ describe('getRemoteUrl', () => {
   });
 });
 
+// ─── credentials in remote URLs (#2914) ──────────────────────────────────
+//
+// `git config remote.origin.url` hands back whatever CI or a credential
+// helper configured, including `https://x-access-token:<token>@host/…`.
+// That value is persisted (registry.json, the per-repo meta) and echoed by
+// MCP `list_repos`, so it must lose its userinfo at capture time. Every
+// credential below is an obviously fake constant.
+
+describe('remote URL credentials (#2914)', () => {
+  const FAKE_TOKEN = 'ExAmPle-FAKE-SECRET';
+
+  it('strips userinfo from an HTTPS remote before it can be persisted', async () => {
+    const { getRemoteUrl } = await import('../../src/storage/git.js');
+    const tmpDir = setupRepoWithRemote(
+      `https://x-access-token:${FAKE_TOKEN}@github.com/example/project.git`,
+    );
+    try {
+      expect(getRemoteUrl(tmpDir)).toBe('https://github.com/example/project');
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('strips a username-only HTTPS remote (the PAT-as-username form)', async () => {
+    const { getRemoteUrl } = await import('../../src/storage/git.js');
+    const tmpDir = setupRepoWithRemote(`https://${FAKE_TOKEN}@github.com/example/project.git`);
+    try {
+      expect(getRemoteUrl(tmpDir)).toBe('https://github.com/example/project');
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('leaves plain HTTPS, SSH-URL and SCP-like remotes untouched', async () => {
+    const { stripUrlCredentials } = await import('../../src/storage/git.js');
+    // The SSH forms carry a user NAME, not a secret, and are part of the
+    // remote's identity — rewriting them would repoint the #2054 fingerprint.
+    expect(stripUrlCredentials('https://github.com/example/project.git')).toBe(
+      'https://github.com/example/project.git',
+    );
+    expect(stripUrlCredentials('ssh://git@github.com/example/project.git')).toBe(
+      'ssh://git@github.com/example/project.git',
+    );
+    expect(stripUrlCredentials('git@github.com:example/project.git')).toBe(
+      'git@github.com:example/project.git',
+    );
+    // An `@` in the PATH is not userinfo — the authority ends at the first `/`.
+    expect(stripUrlCredentials('https://github.com/example/pro@ject')).toBe(
+      'https://github.com/example/pro@ject',
+    );
+  });
+
+  it('removes a password containing @ whole, leaving no tail behind', async () => {
+    const { stripUrlCredentials } = await import('../../src/storage/git.js');
+    expect(stripUrlCredentials(`https://user:pa@ss-${FAKE_TOKEN}@host.example/o/r`)).toBe(
+      'https://host.example/o/r',
+    );
+  });
+
+  it('keeps the same fingerprint for credentialed and clean clones of one repo', async () => {
+    const { getRemoteUrl } = await import('../../src/storage/git.js');
+    const withCreds = setupRepoWithRemote(
+      `https://x-access-token:${FAKE_TOKEN}@example.com/foo/bar.git`,
+    );
+    const clean = setupRepoWithRemote('https://example.com/foo/bar');
+    try {
+      expect(getRemoteUrl(withCreds)).toBe(getRemoteUrl(clean));
+    } finally {
+      fs.rmSync(withCreds, { recursive: true, force: true });
+      fs.rmSync(clean, { recursive: true, force: true });
+    }
+  });
+});
+
 // ─── getCanonicalRepoRoot (#1259) ────────────────────────────────────────
 //
 // Critical for the worktree-naming bug: when `gitnexus analyze` runs from a
@@ -227,7 +340,7 @@ describe('getRemoteUrl', () => {
 describe('getCanonicalRepoRoot', () => {
   it('returns null for a plain temp directory (not a git repo)', async () => {
     const { getCanonicalRepoRoot } = await import('../../src/storage/git.js');
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gitnexus-canonical-'));
+    const tmpDir = makeIsolatedTempDir('gitnexus-canonical-');
     try {
       expect(getCanonicalRepoRoot(tmpDir)).toBeNull();
     } finally {
@@ -262,7 +375,7 @@ describe('getCanonicalRepoRoot', () => {
     const { getCanonicalRepoRoot, getGitRoot } = await import('../../src/storage/git.js');
     const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gitnexus-canonical-wt-'));
     try {
-      execSync('git init -q', { cwd: repoDir });
+      execFileSync(gitExecutable, ['init', '-q'], { cwd: repoDir, stdio: 'ignore' });
       // `git worktree add` requires at least one commit on a real branch.
       execSync('git config user.email "test@example.com"', { cwd: repoDir });
       execSync('git config user.name "Test"', { cwd: repoDir });
@@ -299,6 +412,890 @@ describe('getCanonicalRepoRoot', () => {
         // ignore — fall through to recursive rm
       }
       fs.rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('resolveRepoIdentityRoot', () => {
+  it.each(['ordinary', 'GIT_DIR', 'GIT_COMMON_DIR', 'commondir', 'symlink'] as const)(
+    'preserves Git identity for %s checkouts',
+    async (layout) => {
+      const { getCanonicalRepoRoot, resolveRepoIdentityRoot } =
+        await import('../../src/storage/git.js');
+      const root = fs.realpathSync.native(makeIsolatedTempDir('gitnexus-identity-'));
+      let repo = path.join(root, 'repo');
+      const other = path.join(root, 'other');
+      vi.stubEnv('GIT_DIR', undefined);
+      vi.stubEnv('GIT_COMMON_DIR', undefined);
+      try {
+        for (const directory of [repo, other]) {
+          fs.mkdirSync(directory);
+          execFileSync(gitExecutable, ['init', '-q'], { cwd: directory, stdio: 'pipe' });
+        }
+        if (layout === 'GIT_DIR' || layout === 'GIT_COMMON_DIR')
+          vi.stubEnv(layout, path.join(other, '.git'));
+        else if (layout === 'commondir')
+          fs.writeFileSync(path.join(repo, '.git', 'commondir'), path.join(other, '.git') + '\n');
+        else if (layout === 'symlink') {
+          const link = path.join(root, 'linked-name');
+          fs.symlinkSync(repo, link, 'junction');
+          repo = link;
+        }
+        const canonical = getCanonicalRepoRoot(repo);
+        expect(canonical).not.toBeNull();
+        expect(resolveRepoIdentityRoot(repo)).toBe(canonical);
+        const subdir = path.join(repo, 'subdir');
+        fs.mkdirSync(subdir);
+        expect(resolveRepoIdentityRoot(subdir)).toBe(path.resolve(subdir));
+      } finally {
+        vi.unstubAllEnvs();
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+});
+
+// ─── selfCommitContextFiles (#2639) ────────────────────────────────────────
+
+describe('selfCommitContextFiles', () => {
+  const initRepo = (): string => {
+    const repoDir = makeIsolatedTempDir('gitnexus-self-commit-');
+    execFileSync(gitExecutable, ['init', '-q'], { cwd: repoDir, stdio: 'ignore' });
+    execSync('git config user.email "test@example.com"', { cwd: repoDir });
+    execSync('git config user.name "Test"', { cwd: repoDir });
+    return repoDir;
+  };
+
+  const lastCommitMessage = (repoDir: string): string =>
+    execSync('git log -1 --format=%s', { cwd: repoDir, encoding: 'utf8' }).trim();
+
+  const commitCount = (repoDir: string): number =>
+    Number(execSync('git rev-list --count HEAD', { cwd: repoDir, encoding: 'utf8' }).trim());
+
+  const stagedFiles = (repoDir: string): string[] =>
+    execSync('git diff --cached --name-only', { cwd: repoDir, encoding: 'utf8' })
+      .split('\n')
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+  // Most tests below aren't exercising snapshotSelfCommitSafety itself (that
+  // has its own describe block); they just need "everything is safe to
+  // commit," matching a normal run where nothing was dirty beforehand.
+  const allSafe = (names: string[]): Map<string, boolean> =>
+    new Map(names.map((name) => [name, true]));
+
+  it('commits only the changed candidate file, scoped by name (never git add -A)', async () => {
+    const { selfCommitContextFiles } = await import('../../src/storage/git.js');
+    const repoDir = initRepo();
+    try {
+      fs.writeFileSync(path.join(repoDir, 'AGENTS.md'), 'v1\n');
+      execSync('git add AGENTS.md', { cwd: repoDir });
+      execSync('git commit -q -m "initial"', { cwd: repoDir });
+
+      // Dirty AGENTS.md (candidate) plus an unrelated untracked file that
+      // must never be swept in.
+      fs.writeFileSync(path.join(repoDir, 'AGENTS.md'), 'v2\n');
+      fs.writeFileSync(path.join(repoDir, 'unrelated.txt'), 'should stay untouched\n');
+
+      selfCommitContextFiles(
+        repoDir,
+        ['AGENTS.md', 'CLAUDE.md'],
+        allSafe(['AGENTS.md', 'CLAUDE.md']),
+      );
+
+      expect(commitCount(repoDir)).toBe(2);
+      expect(lastCommitMessage(repoDir)).toBe('chore(gitnexus): refresh index stats [skip ci]');
+      const status = execSync('git status --porcelain', { cwd: repoDir, encoding: 'utf8' });
+      // unrelated.txt is still untracked/dirty — proves the commit was scoped.
+      expect(status).toContain('unrelated.txt');
+      expect(status).not.toContain('AGENTS.md');
+    } finally {
+      fs.rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
+
+  it('no-ops (no new commit) when neither candidate file changed', async () => {
+    const { selfCommitContextFiles } = await import('../../src/storage/git.js');
+    const repoDir = initRepo();
+    try {
+      fs.writeFileSync(path.join(repoDir, 'AGENTS.md'), 'v1\n');
+      execSync('git add AGENTS.md', { cwd: repoDir });
+      execSync('git commit -q -m "initial"', { cwd: repoDir });
+
+      selfCommitContextFiles(
+        repoDir,
+        ['AGENTS.md', 'CLAUDE.md'],
+        allSafe(['AGENTS.md', 'CLAUDE.md']),
+      );
+
+      expect(commitCount(repoDir)).toBe(1);
+    } finally {
+      fs.rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
+
+  it('commits newly-created (untracked) candidate files, not just modified ones', async () => {
+    // Regression guard: a first-time `analyze --self-commit` run creates
+    // AGENTS.md/CLAUDE.md fresh — they are untracked, not modified. An
+    // implementation based on `git diff --quiet` misses untracked files
+    // entirely and would silently skip this case.
+    const { selfCommitContextFiles } = await import('../../src/storage/git.js');
+    const repoDir = initRepo();
+    try {
+      execSync('git commit -q --allow-empty -m "initial"', { cwd: repoDir });
+
+      fs.writeFileSync(path.join(repoDir, 'AGENTS.md'), 'fresh from analyze\n');
+
+      selfCommitContextFiles(
+        repoDir,
+        ['AGENTS.md', 'CLAUDE.md'],
+        allSafe(['AGENTS.md', 'CLAUDE.md']),
+      );
+
+      expect(commitCount(repoDir)).toBe(2);
+      expect(lastCommitMessage(repoDir)).toBe('chore(gitnexus): refresh index stats [skip ci]');
+      const status = execSync('git status --porcelain', { cwd: repoDir, encoding: 'utf8' });
+      expect(status.trim()).toBe('');
+    } finally {
+      fs.rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
+
+  it('no-ops when neither candidate file exists on disk', async () => {
+    const { selfCommitContextFiles } = await import('../../src/storage/git.js');
+    const repoDir = initRepo();
+    try {
+      execSync('git commit -q --allow-empty -m "initial"', { cwd: repoDir });
+
+      expect(() =>
+        selfCommitContextFiles(
+          repoDir,
+          ['AGENTS.md', 'CLAUDE.md'],
+          allSafe(['AGENTS.md', 'CLAUDE.md']),
+        ),
+      ).not.toThrow();
+      expect(commitCount(repoDir)).toBe(1);
+    } finally {
+      fs.rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
+
+  it('never throws when repoPath is not a git repository', async () => {
+    const { selfCommitContextFiles } = await import('../../src/storage/git.js');
+    const tmpDir = makeIsolatedTempDir('gitnexus-self-commit-nongit-');
+    try {
+      fs.writeFileSync(path.join(tmpDir, 'AGENTS.md'), 'not a git repo\n');
+      expect(() =>
+        selfCommitContextFiles(
+          tmpDir,
+          ['AGENTS.md', 'CLAUDE.md'],
+          allSafe(['AGENTS.md', 'CLAUDE.md']),
+        ),
+      ).not.toThrow();
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('commits both files when both changed, still scoped (no -A)', async () => {
+    const { selfCommitContextFiles } = await import('../../src/storage/git.js');
+    const repoDir = initRepo();
+    try {
+      fs.writeFileSync(path.join(repoDir, 'AGENTS.md'), 'v1\n');
+      fs.writeFileSync(path.join(repoDir, 'CLAUDE.md'), 'v1\n');
+      execSync('git add AGENTS.md CLAUDE.md', { cwd: repoDir });
+      execSync('git commit -q -m "initial"', { cwd: repoDir });
+
+      fs.writeFileSync(path.join(repoDir, 'AGENTS.md'), 'v2\n');
+      fs.writeFileSync(path.join(repoDir, 'CLAUDE.md'), 'v2\n');
+
+      selfCommitContextFiles(
+        repoDir,
+        ['AGENTS.md', 'CLAUDE.md'],
+        allSafe(['AGENTS.md', 'CLAUDE.md']),
+      );
+
+      expect(commitCount(repoDir)).toBe(2);
+      const status = execSync('git status --porcelain', { cwd: repoDir, encoding: 'utf8' });
+      expect(status.trim()).toBe('');
+    } finally {
+      fs.rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
+
+  it('logs a warning (never throws) when the commit step fails, e.g. no git identity', async () => {
+    const { selfCommitContextFiles } = await import('../../src/storage/git.js');
+    const { _captureLogger } = await import('../../src/core/logger.js');
+    const repoDir = initRepo();
+    try {
+      fs.writeFileSync(path.join(repoDir, 'AGENTS.md'), 'v1\n');
+      execSync('git add AGENTS.md', { cwd: repoDir });
+      execSync('git commit -q -m "initial"', { cwd: repoDir });
+      fs.writeFileSync(path.join(repoDir, 'AGENTS.md'), 'v2\n');
+
+      // useConfigOnly forces git to error on a missing identity instead of
+      // guessing from OS user/hostname; HOME/XDG_CONFIG_HOME are redirected
+      // and GIT_CONFIG_NOSYSTEM disables the system config, so no ambient
+      // global identity on the CI runner can leak in and make git succeed
+      // anyway. Together these deterministically reproduce "no git identity
+      // configured" regardless of the machine running the test.
+      execSync('git config user.useConfigOnly true', { cwd: repoDir });
+      execSync('git config --unset user.name', { cwd: repoDir });
+      execSync('git config --unset user.email', { cwd: repoDir });
+
+      const savedHome = process.env.HOME;
+      const savedXdg = process.env.XDG_CONFIG_HOME;
+      const savedNoSystem = process.env.GIT_CONFIG_NOSYSTEM;
+      process.env.HOME = makeIsolatedTempDir('gitnexus-self-commit-noidentity-home-');
+      process.env.XDG_CONFIG_HOME = process.env.HOME;
+      process.env.GIT_CONFIG_NOSYSTEM = '1';
+
+      const cap = _captureLogger();
+      try {
+        expect(() =>
+          selfCommitContextFiles(
+            repoDir,
+            ['AGENTS.md', 'CLAUDE.md'],
+            allSafe(['AGENTS.md', 'CLAUDE.md']),
+          ),
+        ).not.toThrow();
+      } finally {
+        if (savedHome === undefined) delete process.env.HOME;
+        else process.env.HOME = savedHome;
+        if (savedXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+        else process.env.XDG_CONFIG_HOME = savedXdg;
+        if (savedNoSystem === undefined) delete process.env.GIT_CONFIG_NOSYSTEM;
+        else process.env.GIT_CONFIG_NOSYSTEM = savedNoSystem;
+      }
+      const warning = cap
+        .records()
+        .find((r) => r.msg.includes('--self-commit failed to commit context files'));
+      cap.restore();
+
+      expect(warning).toBeDefined();
+      expect(commitCount(repoDir)).toBe(1); // commit never landed
+    } finally {
+      fs.rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
+
+  it('skips (and logs) a candidate that already had an uncommitted edit before this run, never sweeping it into the generated commit', async () => {
+    // Regression for #2640 review round 1/2: without snapshotSelfCommitSafety,
+    // a pre-existing unstaged user edit in AGENTS.md and this run's stats
+    // refresh are indistinguishable — both just show up as "AGENTS.md is
+    // dirty" — so the old implementation silently committed both together.
+    const { selfCommitContextFiles, snapshotSelfCommitSafety } =
+      await import('../../src/storage/git.js');
+    const { _captureLogger } = await import('../../src/core/logger.js');
+    const repoDir = initRepo();
+    try {
+      fs.writeFileSync(path.join(repoDir, 'AGENTS.md'), 'v1\n');
+      fs.writeFileSync(path.join(repoDir, 'CLAUDE.md'), 'v1\n');
+      execSync('git add AGENTS.md CLAUDE.md', { cwd: repoDir });
+      execSync('git commit -q -m "initial"', { cwd: repoDir });
+
+      // A user edit lands in AGENTS.md BEFORE analyze/self-commit ever runs.
+      fs.writeFileSync(path.join(repoDir, 'AGENTS.md'), 'user note\n');
+
+      // The real call sequence: snapshot safety first (this is what
+      // analyze.ts does before writing), THEN simulate analyze's own write
+      // on top of the user's pre-existing edit, for both candidates.
+      const safety = snapshotSelfCommitSafety(repoDir, ['AGENTS.md', 'CLAUDE.md']);
+      fs.writeFileSync(path.join(repoDir, 'AGENTS.md'), 'user note\ngenerated stats refresh\n');
+      fs.writeFileSync(path.join(repoDir, 'CLAUDE.md'), 'generated stats refresh\n');
+
+      const cap = _captureLogger();
+      selfCommitContextFiles(repoDir, ['AGENTS.md', 'CLAUDE.md'], safety);
+      const warning = cap
+        .records()
+        .find((r) => r.msg.includes('skipping file(s) with uncommitted changes'));
+      cap.restore();
+
+      expect(warning).toBeDefined();
+      // CLAUDE.md was clean pre-run (safe) and got committed; AGENTS.md was
+      // already dirty pre-run (unsafe) and must stay out of the commit and
+      // out of the index entirely — proving its edit wasn't swept in.
+      expect(commitCount(repoDir)).toBe(2);
+      expect(lastCommitMessage(repoDir)).toBe('chore(gitnexus): refresh index stats [skip ci]');
+      const diffTreeFiles = execSync('git diff-tree --no-commit-id --name-only -r HEAD', {
+        cwd: repoDir,
+        encoding: 'utf8',
+      })
+        .split('\n')
+        .map((s) => s.trim())
+        .filter(Boolean);
+      expect(diffTreeFiles).toEqual(['CLAUDE.md']);
+      const status = execSync('git status --porcelain -- AGENTS.md', {
+        cwd: repoDir,
+        encoding: 'utf8',
+      });
+      expect(status.trim()).not.toBe(''); // AGENTS.md's edit is still there, untouched
+    } finally {
+      fs.rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
+
+  it('restores the index for exactly the staged files when commit fails after git add (no leftover staged state)', async () => {
+    // Regression for #2640 review round 2: `git add` runs before `git commit`;
+    // if commit then fails (e.g. missing identity), the old implementation
+    // left the candidate staged even though it reported nothing happened —
+    // silently mutating the user's index on a run that "did nothing."
+    const { selfCommitContextFiles } = await import('../../src/storage/git.js');
+    const repoDir = initRepo();
+    try {
+      execSync('git commit -q --allow-empty -m "initial"', { cwd: repoDir });
+      fs.writeFileSync(path.join(repoDir, 'AGENTS.md'), 'fresh from analyze\n');
+
+      execSync('git config user.useConfigOnly true', { cwd: repoDir });
+      execSync('git config --unset user.name', { cwd: repoDir });
+      execSync('git config --unset user.email', { cwd: repoDir });
+
+      const savedHome = process.env.HOME;
+      const savedXdg = process.env.XDG_CONFIG_HOME;
+      const savedNoSystem = process.env.GIT_CONFIG_NOSYSTEM;
+      process.env.HOME = makeIsolatedTempDir('gitnexus-self-commit-noidentity-home2-');
+      process.env.XDG_CONFIG_HOME = process.env.HOME;
+      process.env.GIT_CONFIG_NOSYSTEM = '1';
+      try {
+        selfCommitContextFiles(
+          repoDir,
+          ['AGENTS.md', 'CLAUDE.md'],
+          allSafe(['AGENTS.md', 'CLAUDE.md']),
+        );
+      } finally {
+        if (savedHome === undefined) delete process.env.HOME;
+        else process.env.HOME = savedHome;
+        if (savedXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+        else process.env.XDG_CONFIG_HOME = savedXdg;
+        if (savedNoSystem === undefined) delete process.env.GIT_CONFIG_NOSYSTEM;
+        else process.env.GIT_CONFIG_NOSYSTEM = savedNoSystem;
+      }
+
+      expect(commitCount(repoDir)).toBe(1); // commit never landed
+      expect(stagedFiles(repoDir)).toEqual([]); // and nothing was left staged
+      // The file itself is still there, unstaged, exactly as analyze left it.
+      const status = execSync('git status --porcelain -- AGENTS.md', {
+        cwd: repoDir,
+        encoding: 'utf8',
+      });
+      expect(status.trim()).toBe('?? AGENTS.md');
+    } finally {
+      fs.rmSync(repoDir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ─── isWorkingTreeDirty ───────────────────────────────────────────────────
+//
+// analyze's fast-path gate. GitNexus writes to .gitnexus/, .claude/, .cursor/,
+// AGENTS.md, CLAUDE.md, and the repo-local .agents/ skill mirror during a run;
+// those writes must never count as "dirty" or the up-to-date fast path is
+// defeated on every re-run. Real temporary git repos exercise the actual
+// `git status --porcelain` pathspec exclude list.
+
+/** Create a fresh git repo in an isolated temp dir and return its path. */
+function makeIsolatedGitRepo(): string {
+  const dir = makeIsolatedTempDir('gn-dirty-');
+  execSync('git init -q', { cwd: dir, stdio: 'ignore' });
+  // Set a stable identity so commit doesn't fail on environments without
+  // global git config (CI containers, fresh sandboxes).
+  execSync('git config user.email t@t', { cwd: dir, stdio: 'ignore' });
+  execSync('git config user.name t', { cwd: dir, stdio: 'ignore' });
+  return dir;
+}
+
+describe('isWorkingTreeDirty', () => {
+  it('returns false for a clean tree with only GitNexus-managed paths written', async () => {
+    const { isWorkingTreeDirty } = await import('../../src/storage/git.js');
+    const repo = makeIsolatedGitRepo();
+    try {
+      // Initial commit so the tree has a HEAD.
+      fs.writeFileSync(path.join(repo, 'README.md'), 'hi');
+      execSync('git add -A && git commit -q -m init', { cwd: repo, stdio: 'ignore' });
+
+      // Simulate GitNexus writing its managed outputs.
+      fs.mkdirSync(path.join(repo, '.gitnexus'), { recursive: true });
+      fs.writeFileSync(path.join(repo, '.gitnexus', 'meta.json'), '{}');
+      fs.mkdirSync(path.join(repo, '.claude', 'skills', 'gitnexus-cli'), { recursive: true });
+      fs.writeFileSync(path.join(repo, '.claude', 'skills', 'gitnexus-cli', 'SKILL.md'), 'x');
+      fs.mkdirSync(path.join(repo, '.agents', 'skills', 'gitnexus-area-auth'), {
+        recursive: true,
+      });
+      fs.writeFileSync(path.join(repo, '.agents', 'skills', 'gitnexus-area-auth', 'SKILL.md'), 'x');
+      fs.writeFileSync(path.join(repo, 'AGENTS.md'), 'x');
+      fs.writeFileSync(path.join(repo, 'CLAUDE.md'), 'x');
+
+      expect(isWorkingTreeDirty(repo)).toBe(false);
+    } finally {
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('returns true when a real source file changes (regression: excludes must not mask real edits)', async () => {
+    const { isWorkingTreeDirty } = await import('../../src/storage/git.js');
+    const repo = makeIsolatedGitRepo();
+    try {
+      fs.writeFileSync(path.join(repo, 'README.md'), 'hi');
+      execSync('git add -A && git commit -q -m init', { cwd: repo, stdio: 'ignore' });
+
+      // A real business-file edit alongside GitNexus writes.
+      fs.mkdirSync(path.join(repo, 'src'), { recursive: true });
+      fs.writeFileSync(path.join(repo, 'src', 'foo.ts'), 'export const x = 2;');
+      fs.mkdirSync(path.join(repo, '.agents', 'skills', 'x'), { recursive: true });
+      fs.writeFileSync(path.join(repo, '.agents', 'skills', 'x', 'SKILL.md'), 'x');
+
+      expect(isWorkingTreeDirty(repo)).toBe(true);
+    } finally {
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('treats the entire .agents/ tree as excluded (root file, nested skills, deep paths)', async () => {
+    const { isWorkingTreeDirty } = await import('../../src/storage/git.js');
+    const repo = makeIsolatedGitRepo();
+    try {
+      fs.writeFileSync(path.join(repo, 'README.md'), 'hi');
+      execSync('git add -A && git commit -q -m init', { cwd: repo, stdio: 'ignore' });
+
+      // Root-level file under .agents/.
+      fs.mkdirSync(path.join(repo, '.agents'), { recursive: true });
+      fs.writeFileSync(path.join(repo, '.agents', 'foo.txt'), 'x');
+      // Deep nested mirror path.
+      fs.mkdirSync(path.join(repo, '.agents', 'skills', 'gitnexus-area-auth'), {
+        recursive: true,
+      });
+      fs.writeFileSync(path.join(repo, '.agents', 'skills', 'gitnexus-area-auth', 'SKILL.md'), 'x');
+
+      expect(isWorkingTreeDirty(repo)).toBe(false);
+    } finally {
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('does not error when .agents/ does not exist (no pathspec failure)', async () => {
+    const { isWorkingTreeDirty } = await import('../../src/storage/git.js');
+    const repo = makeIsolatedGitRepo();
+    try {
+      fs.writeFileSync(path.join(repo, 'README.md'), 'hi');
+      execSync('git add -A && git commit -q -m init', { cwd: repo, stdio: 'ignore' });
+
+      expect(isWorkingTreeDirty(repo)).toBe(false);
+    } finally {
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('does not error when .agents is a file rather than a directory', async () => {
+    const { isWorkingTreeDirty } = await import('../../src/storage/git.js');
+    const repo = makeIsolatedGitRepo();
+    try {
+      fs.writeFileSync(path.join(repo, 'README.md'), 'hi');
+      execSync('git add -A && git commit -q -m init', { cwd: repo, stdio: 'ignore' });
+
+      // .agents exists as a regular file (e.g. user created it by mistake).
+      fs.writeFileSync(path.join(repo, '.agents'), 'not a directory');
+
+      // Must not throw; the tree is otherwise clean so it is not dirty.
+      expect(isWorkingTreeDirty(repo)).toBe(false);
+    } finally {
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('does NOT exclude prefix-colliding names like .agentsrc or .claudefoo', async () => {
+    // pathspec `:(exclude).agents` must not swallow `.agentsrc` (no path
+    // separator). A change to such a colliding name still counts as dirty.
+    const { isWorkingTreeDirty } = await import('../../src/storage/git.js');
+    const repo = makeIsolatedGitRepo();
+    try {
+      fs.writeFileSync(path.join(repo, 'README.md'), 'hi');
+      execSync('git add -A && git commit -q -m init', { cwd: repo, stdio: 'ignore' });
+
+      fs.writeFileSync(path.join(repo, '.agentsrc'), 'x');
+      fs.writeFileSync(path.join(repo, '.claudefoo'), 'x');
+
+      expect(isWorkingTreeDirty(repo)).toBe(true);
+    } finally {
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('does NOT exclude a nested .agents/ inside a subdirectory (root-relative pathspec)', async () => {
+    // `:(exclude).agents` is relative to the repo root; a subdirectory's
+    // .agents/ is unrelated and must still count as dirty.
+    const { isWorkingTreeDirty } = await import('../../src/storage/git.js');
+    const repo = makeIsolatedGitRepo();
+    try {
+      fs.writeFileSync(path.join(repo, 'README.md'), 'hi');
+      execSync('git add -A && git commit -q -m init', { cwd: repo, stdio: 'ignore' });
+
+      fs.mkdirSync(path.join(repo, 'subdir', '.agents'), { recursive: true });
+      fs.writeFileSync(path.join(repo, 'subdir', '.agents', 'x'), 'x');
+
+      expect(isWorkingTreeDirty(repo)).toBe(true);
+    } finally {
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('returns true (conservative) when called outside a git repository', async () => {
+    const { isWorkingTreeDirty } = await import('../../src/storage/git.js');
+    const dir = makeIsolatedTempDir('gn-nongit-');
+    try {
+      // No git init — git status fails, and the gate must fail closed (dirty).
+      expect(isWorkingTreeDirty(dir)).toBe(true);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('returns true (conservative) when git is not on PATH', async () => {
+    // PATH cleared so `git` cannot be found. The catch block must return true
+    // (fail closed) rather than silently treating the tree as clean — a clean
+    // false-positive would skip re-indexing of a genuinely-changed repo.
+    const { isWorkingTreeDirty } = await import('../../src/storage/git.js');
+    const repo = makeIsolatedGitRepo();
+    const savedPath = process.env.PATH;
+    try {
+      fs.writeFileSync(path.join(repo, 'README.md'), 'hi');
+      execSync('git add -A && git commit -q -m init', { cwd: repo, stdio: 'ignore' });
+      process.env.PATH = '';
+      expect(isWorkingTreeDirty(repo)).toBe(true);
+    } finally {
+      process.env.PATH = savedPath;
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('listWorkingTreeDirtyPaths', () => {
+  it('returns an empty list for a clean repository', async () => {
+    const { listWorkingTreeDirtyPaths } = await import('../../src/storage/git.js');
+    const repo = makeIsolatedGitRepo();
+    try {
+      fs.writeFileSync(path.join(repo, 'README.md'), 'hi');
+      execFileSync(gitExecutable, ['add', '--', 'README.md'], { cwd: repo, stdio: 'ignore' });
+      execFileSync(gitExecutable, ['commit', '-q', '-m', 'init'], {
+        cwd: repo,
+        stdio: 'ignore',
+      });
+
+      expect(listWorkingTreeDirtyPaths(repo)).toEqual([]);
+    } finally {
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('returns dirty source paths and omits GitNexus-managed writes', async () => {
+    const { listWorkingTreeDirtyPaths } = await import('../../src/storage/git.js');
+    const repo = makeIsolatedGitRepo();
+    try {
+      fs.writeFileSync(path.join(repo, 'README.md'), 'hi');
+      execSync('git add -A && git commit -q -m init', { cwd: repo, stdio: 'ignore' });
+      fs.mkdirSync(path.join(repo, 'src'), { recursive: true });
+      fs.writeFileSync(path.join(repo, 'src', 'foo.ts'), 'export const x = 1;');
+      fs.mkdirSync(path.join(repo, '.gitnexus'), { recursive: true });
+      fs.writeFileSync(path.join(repo, '.gitnexus', 'meta.json'), '{}');
+      fs.writeFileSync(path.join(repo, 'AGENTS.md'), 'x');
+
+      expect(listWorkingTreeDirtyPaths(repo)).toEqual(['src/foo.ts']);
+    } finally {
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('still reports nested lookalikes that are not GitNexus-managed', async () => {
+    const { isWorkingTreeDirty, listWorkingTreeDirtyPaths } =
+      await import('../../src/storage/git.js');
+    const repo = makeIsolatedGitRepo();
+    try {
+      fs.mkdirSync(path.join(repo, 'docs'), { recursive: true });
+      fs.writeFileSync(path.join(repo, 'docs', 'AGENTS.md'), 'project notes');
+      execFileSync(gitExecutable, ['add', '--', 'docs/AGENTS.md'], { cwd: repo, stdio: 'ignore' });
+      execFileSync(gitExecutable, ['commit', '-q', '-m', 'init'], {
+        cwd: repo,
+        stdio: 'ignore',
+      });
+      fs.writeFileSync(path.join(repo, 'docs', 'AGENTS.md'), 'edited notes');
+
+      expect(isWorkingTreeDirty(repo)).toBe(true);
+      expect(listWorkingTreeDirtyPaths(repo)).toEqual(['docs/AGENTS.md']);
+    } finally {
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('returns null (not an empty list) outside a git repository', async () => {
+    const { listWorkingTreeDirtyPaths } = await import('../../src/storage/git.js');
+    const dir = makeIsolatedTempDir('gn-nongit-paths-');
+    try {
+      expect(listWorkingTreeDirtyPaths(dir)).toBeNull();
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves non-ASCII, newline, and arrow-shaped filenames exactly', async () => {
+    const { listWorkingTreeDirtyPaths } = await import('../../src/storage/git.js');
+    const repo = makeIsolatedGitRepo();
+    const names = ['src/ä.ts'];
+    if (process.platform !== 'win32') {
+      names.push('src/a -> b.ts', 'src/line\nbreak.ts', 'src/tab\tname.ts', 'src/back\\slash.ts');
+    }
+    try {
+      for (const name of names) {
+        fs.mkdirSync(path.dirname(path.join(repo, name)), { recursive: true });
+        fs.writeFileSync(path.join(repo, name), 'before');
+      }
+      execFileSync(gitExecutable, ['add', '--', ...names], { cwd: repo, stdio: 'ignore' });
+      execFileSync(gitExecutable, ['commit', '-q', '-m', 'init'], { cwd: repo, stdio: 'ignore' });
+      for (const name of names) fs.writeFileSync(path.join(repo, name), 'after');
+
+      expect(listWorkingTreeDirtyPaths(repo)?.sort()).toEqual([...names].sort());
+    } finally {
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(process.platform === 'win32')(
+    'returns both paths for a rename without parsing filename text',
+    async () => {
+      const { listWorkingTreeDirtyPaths } = await import('../../src/storage/git.js');
+      const repo = makeIsolatedGitRepo();
+      const before = 'src/before -> literal.ts';
+      const after = 'src/after -> literal.ts';
+      try {
+        fs.mkdirSync(path.join(repo, 'src'), { recursive: true });
+        fs.writeFileSync(path.join(repo, before), 'content');
+        execFileSync(gitExecutable, ['add', '--', before], { cwd: repo, stdio: 'ignore' });
+        execFileSync(gitExecutable, ['commit', '-q', '-m', 'init'], { cwd: repo, stdio: 'ignore' });
+        execFileSync(gitExecutable, ['mv', '--', before, after], { cwd: repo, stdio: 'ignore' });
+
+        expect(listWorkingTreeDirtyPaths(repo)?.sort()).toEqual([after, before].sort());
+      } finally {
+        fs.rmSync(repo, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.each(['--assume-unchanged', '--skip-worktree'])(
+    'includes paths hidden by git update-index %s',
+    async (flag) => {
+      const { listWorkingTreeDirtyPaths } = await import('../../src/storage/git.js');
+      const repo = makeIsolatedGitRepo();
+      try {
+        fs.writeFileSync(path.join(repo, 'hidden.ts'), 'before');
+        execFileSync(gitExecutable, ['add', '--', 'hidden.ts'], { cwd: repo, stdio: 'ignore' });
+        execFileSync(gitExecutable, ['commit', '-q', '-m', 'init'], {
+          cwd: repo,
+          stdio: 'ignore',
+        });
+        execFileSync(gitExecutable, ['update-index', flag, '--', 'hidden.ts'], {
+          cwd: repo,
+          stdio: 'ignore',
+        });
+        fs.writeFileSync(path.join(repo, 'hidden.ts'), 'after');
+
+        expect(listWorkingTreeDirtyPaths(repo)).toContain('hidden.ts');
+      } finally {
+        fs.rmSync(repo, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.each(['--assume-unchanged', '--skip-worktree'])(
+    'omits GitNexus-managed paths hidden by git update-index %s',
+    async (flag) => {
+      const { listWorkingTreeDirtyPaths } = await import('../../src/storage/git.js');
+      const repo = makeIsolatedGitRepo();
+      try {
+        fs.writeFileSync(path.join(repo, 'README.md'), 'hi');
+        fs.writeFileSync(path.join(repo, 'AGENTS.md'), 'before');
+        execFileSync(gitExecutable, ['add', '--', 'README.md', 'AGENTS.md'], {
+          cwd: repo,
+          stdio: 'ignore',
+        });
+        execFileSync(gitExecutable, ['commit', '-q', '-m', 'init'], {
+          cwd: repo,
+          stdio: 'ignore',
+        });
+        execFileSync(gitExecutable, ['update-index', flag, '--', 'AGENTS.md'], {
+          cwd: repo,
+          stdio: 'ignore',
+        });
+        fs.writeFileSync(path.join(repo, 'AGENTS.md'), 'after');
+
+        expect(listWorkingTreeDirtyPaths(repo)).toEqual([]);
+      } finally {
+        fs.rmSync(repo, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.skipIf(process.platform === 'win32')(
+    'preserves exact unusual names hidden by index bits, including both bits',
+    async () => {
+      const { listWorkingTreeDirtyPaths } = await import('../../src/storage/git.js');
+      const repo = makeIsolatedGitRepo();
+      const names = ['ä.ts', 'a -> b.ts', 'tab\tname.ts', 'line\nbreak.ts'];
+      try {
+        for (const name of names) fs.writeFileSync(path.join(repo, name), 'before');
+        execFileSync(gitExecutable, ['add', '--', ...names], { cwd: repo, stdio: 'ignore' });
+        execFileSync(gitExecutable, ['commit', '-q', '-m', 'init'], {
+          cwd: repo,
+          stdio: 'ignore',
+        });
+        execFileSync(gitExecutable, ['update-index', '--assume-unchanged', '--', names[0]], {
+          cwd: repo,
+          stdio: 'ignore',
+        });
+        execFileSync(gitExecutable, ['update-index', '--skip-worktree', '--', names[1]], {
+          cwd: repo,
+          stdio: 'ignore',
+        });
+        execFileSync(gitExecutable, ['update-index', '--assume-unchanged', '--', names[2]], {
+          cwd: repo,
+          stdio: 'ignore',
+        });
+        execFileSync(gitExecutable, ['update-index', '--skip-worktree', '--', names[2]], {
+          cwd: repo,
+          stdio: 'ignore',
+        });
+        execFileSync(gitExecutable, ['update-index', '--skip-worktree', '--', names[3]], {
+          cwd: repo,
+          stdio: 'ignore',
+        });
+        for (const name of names) fs.writeFileSync(path.join(repo, name), 'after');
+
+        expect(listWorkingTreeDirtyPaths(repo)?.sort()).toEqual([...names].sort());
+      } finally {
+        fs.rmSync(repo, { recursive: true, force: true });
+      }
+    },
+  );
+});
+
+// ─── isWorkingTreePristine ────────────────────────────────────────────────
+//
+// The shared-store publish gate (#3374): a graph built from a working tree
+// that hides committed content (sparse checkout, index bits, an uninitialized
+// submodule) must never become the commit graph other checkouts reuse.
+
+/** A repo with two committed files, `a.ts` and `lib/b.ts`. */
+function makeCommittedRepo(): string {
+  const repo = makeIsolatedGitRepo();
+  fs.writeFileSync(path.join(repo, 'a.ts'), 'export const a = 1;');
+  fs.mkdirSync(path.join(repo, 'lib'));
+  fs.writeFileSync(path.join(repo, 'lib', 'b.ts'), 'export const b = 1;');
+  execFileSync(gitExecutable, ['add', '-A'], { cwd: repo, stdio: 'ignore' });
+  execFileSync(gitExecutable, ['commit', '-q', '-m', 'init'], { cwd: repo, stdio: 'ignore' });
+  return repo;
+}
+
+const gitIn = (repo: string, ...args: string[]): string =>
+  execFileSync(gitExecutable, args, { cwd: repo, encoding: 'utf8' }).trim();
+
+describe('isWorkingTreePristine', () => {
+  it('is true for a clean checkout, ignoring GitNexus-managed writes', async () => {
+    const { isWorkingTreePristine } = await import('../../src/storage/git.js');
+    const repo = makeCommittedRepo();
+    try {
+      fs.mkdirSync(path.join(repo, '.gitnexus'));
+      fs.writeFileSync(path.join(repo, '.gitnexus', 'meta.json'), '{}');
+      fs.writeFileSync(path.join(repo, 'AGENTS.md'), 'x');
+
+      expect(isWorkingTreePristine(repo)).toBe(true);
+    } finally {
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('is false with an untracked source file', async () => {
+    const { isWorkingTreePristine } = await import('../../src/storage/git.js');
+    const repo = makeCommittedRepo();
+    try {
+      fs.writeFileSync(path.join(repo, 'new.ts'), 'export const n = 1;');
+
+      expect(isWorkingTreePristine(repo)).toBe(false);
+    } finally {
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['--assume-unchanged', '--skip-worktree'])(
+    'is false when git update-index %s hides a path, even with unchanged content',
+    async (flag) => {
+      const { isWorkingTreePristine } = await import('../../src/storage/git.js');
+      const repo = makeCommittedRepo();
+      try {
+        gitIn(repo, 'update-index', flag, '--', 'a.ts');
+
+        expect(isWorkingTreePristine(repo)).toBe(false);
+      } finally {
+        fs.rmSync(repo, { recursive: true, force: true });
+      }
+    },
+  );
+
+  // Every sparse mode marks the left-out entries skip-worktree, which is what
+  // the check reads; a sparse index still expands for `git ls-files -v`.
+  it.each([
+    ['no-cone', ['set', '--no-cone', '/a.ts']],
+    ['cone', ['set', '--cone']],
+    ['cone with a sparse index', ['set', '--cone', '--sparse-index']],
+  ])('is false in a %s sparse checkout that leaves committed files out', async (_mode, args) => {
+    const { isWorkingTreePristine } = await import('../../src/storage/git.js');
+    const repo = makeCommittedRepo();
+    try {
+      gitIn(repo, 'sparse-checkout', ...args);
+
+      expect(fs.existsSync(path.join(repo, 'lib', 'b.ts'))).toBe(false);
+      expect(isWorkingTreePristine(repo)).toBe(false);
+    } finally {
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('is false with a registered but uninitialized submodule', async () => {
+    const { isWorkingTreePristine } = await import('../../src/storage/git.js');
+    const repo = makeCommittedRepo();
+    try {
+      const head = gitIn(repo, 'rev-parse', 'HEAD');
+      gitIn(repo, 'update-index', '--add', '--cacheinfo', `160000,${head},vendor/dep`);
+      gitIn(repo, 'commit', '-q', '-m', 'add gitlink');
+
+      expect(isWorkingTreePristine(repo)).toBe(false);
+    } finally {
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('is true with a checked-out submodule', async () => {
+    const { isWorkingTreePristine } = await import('../../src/storage/git.js');
+    const repo = makeCommittedRepo();
+    try {
+      const sub = path.join(repo, 'vendor', 'dep');
+      fs.mkdirSync(sub, { recursive: true });
+      gitIn(sub, 'init', '-q');
+      fs.writeFileSync(path.join(sub, 'c.ts'), 'export const c = 1;');
+      gitIn(sub, 'add', '-A');
+      gitIn(sub, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', 'sub');
+      gitIn(repo, 'add', 'vendor/dep');
+      gitIn(repo, 'commit', '-q', '-m', 'add submodule');
+
+      expect(isWorkingTreePristine(repo)).toBe(true);
+    } finally {
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it('is false (fails closed) outside a git repository', async () => {
+    const { isWorkingTreePristine } = await import('../../src/storage/git.js');
+    const dir = makeIsolatedTempDir('gn-nongit-pristine-');
+    try {
+      expect(isWorkingTreePristine(dir)).toBe(false);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
     }
   });
 });

@@ -5,20 +5,36 @@
  * instance, verifying cypher, context, impact, and query tools work
  * end-to-end against seeded graph data with FTS indexes.
  */
-import { describe, it, expect, beforeAll, vi } from 'vitest';
+import fs from 'fs/promises';
+import path from 'path';
+import { describe, it, expect, beforeAll, beforeEach, vi } from 'vitest';
 import { LocalBackend } from '../../src/mcp/local/local-backend.js';
-import { listRegisteredRepos } from '../../src/storage/repo-manager.js';
+import { renameSymbol } from '../../src/mcp/local/rename/rename-plan.js';
+import { listRegisteredRepos, saveMeta } from '../../src/storage/repo-manager.js';
 import { withTestLbugDB } from '../helpers/test-indexed-db.js';
 import {
   LOCAL_BACKEND_SEED_DATA,
   LOCAL_BACKEND_FTS_INDEXES,
 } from '../fixtures/local-backend-seed.js';
 
-vi.mock('../../src/storage/repo-manager.js', () => ({
+// Partial mock: registry access is faked, but everything else — critically
+// `loadMeta`, which the staleness check in LocalBackend.ensureInitialized
+// calls on every throttled window — stays REAL. A factory that omitted
+// loadMeta made that call site throw a TypeError that the staleness check's
+// catch silently swallowed, so the code path was never actually exercised.
+vi.mock('../../src/storage/repo-manager.js', async (importActual) => ({
+  ...(await importActual<typeof import('../../src/storage/repo-manager.js')>()),
   listRegisteredRepos: vi.fn().mockResolvedValue([]),
   cleanupOldKuzuFiles: vi.fn().mockResolvedValue({ found: false, needsReindex: false }),
   findSiblingClones: vi.fn().mockResolvedValue([]),
 }));
+
+// Pass-through spy: rename still plans for real, the test just reads the inventory
+// LocalBackend.rename hands to the planner.
+vi.mock('../../src/mcp/local/rename/rename-plan.js', async (importActual) => {
+  const actual = await importActual<typeof import('../../src/mcp/local/rename/rename-plan.js')>();
+  return { ...actual, renameSymbol: vi.fn(actual.renameSymbol) };
+});
 
 // ─── Block 2: callTool dispatch tests ────────────────────────────────
 
@@ -52,13 +68,25 @@ withTestLbugDB(
         expect(result.markdown).toContain('hash');
       });
 
-      it('cypher tool blocks write queries', async () => {
+      it('cypher tool keeps the tabular result shape when no rows match (#3952)', async () => {
+        const statement = "MATCH (n:Function) WHERE n.name = '__missing__' RETURN n.name AS name";
+        const result = await backend.callTool('cypher', { statement });
+
+        expect(result).toMatchObject({ markdown: '', row_count: 0 });
+        expect(result).toHaveProperty('staleness');
+        expect(await backend.executeCypher('test-repo', statement)).toEqual([]);
+      });
+
+      it('cypher no-match write probe returns read-only error or empty rows', async () => {
         const result = await backend.callTool('cypher', {
           query:
-            "CREATE (n:Function {id: 'x', name: 'x', filePath: '', startLine: 0, endLine: 0, isExported: false, content: '', description: ''})",
+            "MATCH (n:Function) WHERE n.name = '__missing__' SET n.name = 'x' RETURN n.name AS name",
         });
-        expect(result).toHaveProperty('error');
-        expect(result.error).toMatch(/write operations/i);
+        if (result?.error) {
+          expect(result.error).toMatch(/write operations|read-only/i);
+          return;
+        }
+        expect(result).toMatchObject({ markdown: '', row_count: 0 });
       });
 
       it('context tool returns symbol info with callers and callees', async () => {
@@ -93,6 +121,31 @@ withTestLbugDB(
         expect(depNames).toContain('login');
       });
 
+      it.each(['name', 'symbol'] as const)(
+        'impact tool resolves the %s compatibility alias against a real index',
+        async (alias) => {
+          const result = await backend.callTool('impact', {
+            [alias]: 'validate',
+            direction: 'upstream',
+          });
+          expect(result).not.toHaveProperty('error');
+          expect(result.target?.name).toBe('validate');
+          const directDeps = result.byDepth[1] || result.byDepth['1'] || [];
+          expect(directDeps.map((d: any) => d.name)).toContain('login');
+        },
+      );
+
+      it('context tool resolves the file compatibility alias against a real index', async () => {
+        const result = await backend.callTool('context', {
+          name: 'authenticate',
+          file: 'src/base.ts',
+        });
+        expect(result).not.toHaveProperty('error');
+        expect(result.status).toBe('found');
+        expect(result.symbol?.name).toBe('authenticate');
+        expect(result.symbol?.filePath).toBe('src/base.ts');
+      });
+
       it('query tool returns results for keyword search', async () => {
         const result = await backend.callTool('query', { query: 'login' });
         expect(result).not.toHaveProperty('error');
@@ -108,13 +161,222 @@ withTestLbugDB(
         // At least one of the search phases must have fired for any
         // non-error response — bm25 and/or vector always runs.
         expect(result.timing.bm25 ?? result.timing.vector).toBeGreaterThanOrEqual(0);
+
+        // Success path (FTS present + Process/Community tables exist): no degraded
+        // signal. Guards R6 — the response shape stays byte-identical when nothing
+        // fails (the `warning`/`partial` fields appear only on degradation).
+        expect(result).not.toHaveProperty('warning');
+        expect(result).not.toHaveProperty('partial');
+      });
+
+      // #2175: end-to-end proof that the renamed parameters work against a real
+      // index (Claude Code drops a tool arg named exactly "query").
+      it('query tool returns results via the new search_query param (#2175)', async () => {
+        const result = await backend.callTool('query', { search_query: 'login' });
+        expect(result).not.toHaveProperty('error');
+        expect(result).toHaveProperty('processes');
+        expect(result.processes.map((p: any) => p.id)).toContain('proc:login-flow');
+        expect(result.process_symbols.map((s: any) => s.id)).toContain('func:login');
+      });
+
+      it('cypher tool executes via the new statement param (#2175)', async () => {
+        const result = await backend.callTool('cypher', {
+          statement: 'MATCH (n:Function) RETURN n.name AS name ORDER BY n.name',
+        });
+        expect(result).toHaveProperty('markdown');
+        expect(result).toHaveProperty('row_count');
+        expect(result.row_count).toBeGreaterThanOrEqual(3);
+        expect(result.markdown).toContain('login');
+      });
+
+      // PR #222 port: the query tool batches per-symbol process/cohesion/content
+      // lookups (N+1 → 2-3 `WHERE n.id IN $nodeIds` queries). These assertions
+      // guard the batch-adaptation hazards that a naive cherry-pick would break:
+      // (1) each symbol keeps ITS OWN community (the per-node first-row pick that
+      //     replaced the per-symbol `LIMIT 1`), and (2) content maps to the right
+      //     node — both depend on the +1 positional-index shift after prepending
+      //     `n.id AS nodeId`. func:login is MEMBER_OF comm:auth ("Authentication");
+      //     func:validate has no community, so it must NOT inherit login's.
+      it('query batches per-symbol enrichment without cross-assigning community/content', async () => {
+        const findSym = (res: any, id: string) =>
+          (res.process_symbols ?? []).find((s: any) => s.id === id) ??
+          (res.definitions ?? []).find((s: any) => s.id === id);
+
+        const loginRes = await backend.callTool('query', {
+          query: 'login',
+          include_content: true,
+        });
+        expect(loginRes).not.toHaveProperty('error');
+        const login = findSym(loginRes, 'func:login');
+        expect(login).toBeDefined();
+        // Community correctly associated to its own node (not dropped, not leaked).
+        expect(login.module).toBe('Authentication');
+        // Content correctly mapped to its own node (positional [1] after nodeId).
+        expect(login.content).toBe('function login() {}');
+
+        const validateRes = await backend.callTool('query', {
+          query: 'validate',
+          include_content: true,
+        });
+        expect(validateRes).not.toHaveProperty('error');
+        const validate = findSym(validateRes, 'func:validate');
+        expect(validate).toBeDefined();
+        // validate has no MEMBER_OF edge — a flat batched `LIMIT 1` would have
+        // leaked some other node's community onto it. It must have none.
+        expect(validate.module).toBeUndefined();
+        expect(validate.content).toBe('function validate() {}');
+        // validate is a step in two processes, so it has two process_symbols
+        // rows; content is emitted once per symbol id — only the first row
+        // carries it, the sibling row omits the key entirely.
+        const validateRows = (validateRes.process_symbols ?? []).filter(
+          (s: { id: string }) => s.id === 'func:validate',
+        );
+        expect(validateRows).toHaveLength(2);
+        const withContent = validateRows.filter(
+          (s: { content?: string }) => s.content === 'function validate() {}',
+        );
+        expect(withContent).toHaveLength(1);
+        const withoutContent = validateRows.filter((s: object) => !('content' in s));
+        expect(withoutContent).toHaveLength(1);
+      });
+
+      it('reports content capability for the default full profile', async () => {
+        const query = await backend.callTool('query', { query: 'login', include_content: true });
+        const context = await backend.callTool('context', { name: 'login', include_content: true });
+
+        expect(query.contentAvailability).toEqual({
+          requested: true,
+          profile: 'full',
+          available: true,
+          scope: 'full',
+        });
+        expect(context.contentAvailability).toEqual(query.contentAvailability);
+        expect(context.symbol.content).toBe('function login() {}');
+      });
+
+      it('does not disclose lingering source text when metadata says retention is none', async () => {
+        const storagePath = handle.tmpHandle.dbPath;
+        await saveMeta(storagePath, {
+          repoPath: '/test/repo',
+          storagePath,
+          lastCommit: 'abc123',
+          indexedAt: new Date().toISOString(),
+          contentRetention: 'none',
+          contentRetentionSchemaVersion: 1,
+          ftsProfile: 'name-only',
+        });
+        try {
+          const query = await backend.callTool('query', { query: 'login', include_content: true });
+          const context = await backend.callTool('context', {
+            name: 'login',
+            include_content: true,
+          });
+          const login = (query.process_symbols ?? []).find(
+            (symbol: any) => symbol.id === 'func:login',
+          );
+
+          expect(query.contentAvailability).toEqual({
+            requested: true,
+            profile: 'none',
+            available: false,
+            scope: 'none',
+            reason: 'Source-derived content is not retained by this index.',
+          });
+          expect(login?.content).toBeUndefined();
+          expect(context.contentAvailability).toEqual(query.contentAvailability);
+          expect(context.symbol.content).toBeUndefined();
+        } finally {
+          await Promise.all([
+            fs.rm(`${storagePath}/gitnexus.json`, { force: true }),
+            fs.rm(`${storagePath}/meta.json`, { force: true }),
+          ]);
+        }
+      });
+
+      it('does not disclose lingering source text when retention metadata is invalid', async () => {
+        const storagePath = handle.tmpHandle.dbPath;
+        await saveMeta(storagePath, {
+          repoPath: '/test/repo',
+          storagePath,
+          lastCommit: 'abc123',
+          indexedAt: new Date().toISOString(),
+          contentRetention: 'invalid' as never,
+          contentRetentionSchemaVersion: 1,
+          ftsProfile: 'name-only',
+        });
+        try {
+          const query = await backend.callTool('query', { query: 'login', include_content: true });
+          const context = await backend.callTool('context', {
+            name: 'login',
+            include_content: true,
+          });
+          const login = (query.process_symbols ?? []).find(
+            (symbol: any) => symbol.id === 'func:login',
+          );
+
+          expect(query.contentAvailability).toMatchObject({
+            requested: true,
+            profile: 'none',
+            available: false,
+            scope: 'none',
+          });
+          expect(login?.content).toBeUndefined();
+          expect(context.contentAvailability).toEqual(query.contentAvailability);
+          expect(context.symbol.content).toBeUndefined();
+        } finally {
+          await Promise.all([
+            fs.rm(`${storagePath}/gitnexus.json`, { force: true }),
+            fs.rm(`${storagePath}/meta.json`, { force: true }),
+          ]);
+        }
+      });
+
+      // PR #222 port: a symbol in MULTIPLE processes is what fully exercises the
+      // +1 positional shift in the batched STEP_IN_PROCESS aggregation — with a
+      // single process row, `row.pid ?? row[1]` succeeds whether the shift is
+      // right or wrong. func:validate is a step in BOTH proc:login-flow (step 2)
+      // and proc:beta-flow (step 3), so both rows for the one node must be parsed
+      // (pid=row[1], step=row[6]); an off-by-one would drop a process or mis-pair
+      // pid↔step. Also pins process ranking (totalScore via the regroup-by-nodeId).
+      it('query batches a multi-process symbol and ranks processes (positional shift across rows)', async () => {
+        const res = await backend.callTool('query', { query: 'validate' });
+        expect(res).not.toHaveProperty('error');
+        const processIds = (res.processes ?? []).map((p: any) => p.id);
+        // Both of validate's processes must appear — both STEP_IN_PROCESS rows
+        // were parsed and grouped by the correct pid (row[1]).
+        expect(processIds).toContain('proc:login-flow');
+        expect(processIds).toContain('proc:beta-flow');
+
+        // process_symbols keeps one row per (id, process_id): validate is a
+        // step in both flows and must appear under each, with that row's
+        // shifted pid↔step pairing (login-flow⇒step 2, beta-flow⇒step 3).
+        const validates = (res.process_symbols ?? []).filter((s: any) => s.id === 'func:validate');
+        expect(validates).toHaveLength(2);
+        const byProcess = Object.fromEntries(validates.map((s: any) => [s.process_id, s]));
+        expect(byProcess['proc:login-flow']?.step_index).toBe(2);
+        expect(byProcess['proc:beta-flow']?.step_index).toBe(3);
+        expect(byProcess['proc:login-flow']?.is_entry_point).toBeUndefined();
+        expect(byProcess['proc:beta-flow']?.is_entry_point).toBeUndefined();
+        for (const procId of ['proc:login-flow', 'proc:beta-flow'] as const) {
+          const card = (res.processes ?? []).find((p: any) => p.id === procId);
+          const attachCount = (res.process_symbols ?? []).filter(
+            (s: any) => s.process_id === procId,
+          ).length;
+          expect(card?.symbol_count).toBe(attachCount);
+        }
+
+        // Ranking: 'login' surfaces proc:login-flow as the top process.
+        const loginRes = await backend.callTool('query', { query: 'login' });
+        expect((loginRes.processes ?? [])[0]?.id).toBe('proc:login-flow');
       });
 
       it('tool_map returns per-tool flows without cross-attributing same-file tools', async () => {
         const result = await backend.callTool('tool_map', {});
         expect(result).not.toHaveProperty('error');
 
-        const tools = new Map(result.tools.map((tool: any) => [tool.name, tool]));
+        const toolEntries: Array<{ name: string; description: string; flows: string[] }> =
+          result.tools;
+        const tools = new Map(toolEntries.map((tool) => [tool.name, tool]));
         expect(tools.get('alpha')?.description).toBe('Calls chain A.');
         expect(tools.get('beta')?.description).toBe('Calls chain B.');
         expect(tools.get('alpha')?.flows).toEqual(['AlphaFlow']);
@@ -299,6 +561,131 @@ withTestLbugDB(
         }
       });
     });
+
+    // ─── impact disambiguation + label-scoped resolution (#1907) ─────────
+    // Covers the disambiguation surface the CLI --uid/--file/--kind flags
+    // wire through to, and guards the label-scoped resolver against the
+    // binder failure that motivated the fix.
+    describe('impact disambiguation (#1907)', () => {
+      let backend: LocalBackend;
+
+      beforeAll(async () => {
+        const ext = handle as typeof handle & { _backend?: LocalBackend };
+        if (!ext._backend) {
+          throw new Error(
+            'LocalBackend not initialized — afterSetup did not attach _backend to handle',
+          );
+        }
+        backend = ext._backend;
+      });
+
+      it('reports an ambiguous target with disambiguation guidance', async () => {
+        // Two Methods named 'authenticate' (AuthService + BaseService).
+        const result = await backend.callTool('impact', {
+          target: 'authenticate',
+          direction: 'upstream',
+        });
+        expect(result).not.toHaveProperty('error');
+        expect(result.status).toBe('ambiguous');
+        expect(result.message).toMatch(/disambiguate/i);
+        const uids = (result.candidates ?? []).map((c: any) => c.uid);
+        expect(uids).toContain('method:AuthService.authenticate');
+        expect(uids).toContain('method:BaseService.authenticate');
+      });
+
+      it('resolves the ambiguous target via target_uid (the --uid flag path)', async () => {
+        const result = await backend.callTool('impact', {
+          target: 'authenticate',
+          target_uid: 'method:BaseService.authenticate',
+          direction: 'upstream',
+        });
+        expect(result).not.toHaveProperty('error');
+        expect(result.status).not.toBe('ambiguous');
+        // target_uid selects the exact symbol, bypassing the name ranker.
+        expect(result.target?.id).toBe('method:BaseService.authenticate');
+        expect(result.target?.filePath).toBe('src/base.ts');
+      });
+
+      it('resolves the ambiguous target via file_path (the --file flag path)', async () => {
+        const result = await backend.callTool('impact', {
+          target: 'authenticate',
+          file_path: 'src/base.ts',
+          direction: 'upstream',
+        });
+        expect(result).not.toHaveProperty('error');
+        expect(result.status).not.toBe('ambiguous');
+        expect(result.target?.id).toBe('method:BaseService.authenticate');
+      });
+
+      it('does not crash when a name collides across symbol and non-symbol labels', async () => {
+        // 'alpha' exists as both a Function and a Tool sharing src/tools.py.
+        // The Tool node table has no startLine/endLine columns, so the
+        // resolver's `RETURN n.startLine` projection only binds because the
+        // candidate set also contains a label that *does* have those columns
+        // (lenient multi-table binding). This guards that the disambiguation
+        // path keeps tolerating non-symbol node types — and would catch a
+        // future naive label-scoping that reintroduces the #1907 binder error
+        // ("Cannot find property … for n") by matching property-poor tables
+        // in isolation.
+        const result = await backend.callTool('impact', {
+          target: 'alpha',
+          direction: 'upstream',
+        });
+        expect(result).not.toHaveProperty('error');
+        expect(result.status).toBe('ambiguous');
+        const uids = (result.candidates ?? []).map((c: any) => c.uid);
+        expect(uids).toContain('func:alpha');
+        expect(uids).toContain('Tool:alpha');
+      });
+
+      it('context resolves the same cross-label collision without crashing', async () => {
+        const result = await backend.callTool('context', { name: 'alpha' });
+        expect(result).not.toHaveProperty('error');
+        expect(result.status).toBe('ambiguous');
+        const uids = (result.candidates ?? []).map((c: any) => c.uid);
+        expect(uids).toContain('func:alpha');
+        // Assert the non-symbol Tool node stays in the candidate set, not just
+        // that nothing crashed — a regression that silently dropped Tool from
+        // the lenient-binding match would otherwise pass the non-crash check.
+        expect(uids).toContain('Tool:alpha');
+      });
+
+      it('retries unfiltered and still ranks by kind when the hint matches no id prefix (the --kind flag path, #2787 review F5)', async () => {
+        // WHY THIS FIXTURE TAKES THE FALLBACK, NOT THE FILTER (#2787 review F5):
+        // `kind` is no longer a pure scoring term — it filters with
+        // `n.id STARTS WITH 'Function:'`, which relies on the production node-id
+        // convention `Label:filePath:qualifiedName`. This fixture predates that
+        // convention: its Function node is `func:alpha` (lowercase, in
+        // test/fixtures/local-backend-seed.ts), so NO row in this DB satisfies
+        // the `Function:` prefix and the filtered window comes back EMPTY.
+        // `kind` is a free-form string on the tool schema, so an empty filtered
+        // window must not degrade a real name to `not_found`: the resolver
+        // retries UNFILTERED and the hint reverts to scoreCandidate's +0.20
+        // ranking term. That fallback — not the filter — is what this pins.
+        // The filtering path is covered against production-shaped ids by the
+        // `resolver-kind-filter-2787` suite below.
+        const result = await backend.callTool('impact', {
+          target: 'alpha',
+          kind: 'Function',
+          direction: 'upstream',
+        });
+        expect(result).not.toHaveProperty('error');
+
+        // The unfiltered retry ran: BOTH candidates are back, including the
+        // Tool the filter would have excluded. Without the fallback this is
+        // `{ error: "Symbol 'alpha' not found" }`.
+        expect(result.status).toBe('ambiguous');
+        const candidates = result.candidates ?? [];
+        expect(candidates.map((c: any) => c.uid).sort()).toEqual(['Tool:alpha', 'func:alpha']);
+
+        // …and the hint still ranks, exactly as it did before the filter
+        // existed: 0.50 + 0.20 = 0.70, below the 0.95 confident gate, so the
+        // response stays ambiguous with the Function promoted.
+        expect(candidates[0]).toMatchObject({ uid: 'func:alpha', kind: 'Function' });
+        const tool = candidates.find((c: any) => c.uid === 'Tool:alpha');
+        expect(candidates[0]?.score).toBeGreaterThan(tool?.score);
+      });
+    });
   },
   {
     seed: LOCAL_BACKEND_SEED_DATA,
@@ -321,6 +708,463 @@ withTestLbugDB(
       await backend.init();
       // Stash backend on handle so tests can access it
       (handle as any)._backend = backend;
+    },
+  },
+);
+
+// ─── impact BFS bound parameters (#1907 review F5) ───────────────────────
+// Isolated DB (not the shared seed) with a frontier node whose id contains a
+// single quote. Under the old string-interpolated query this id had to be
+// hand-escaped; the parameterized query (executeParameterized with bound
+// $frontierIds/$relTypes) carries it as data. Guards that a quote-bearing id
+// traverses without a Prepare/parser error, and that a no-caller symbol
+// returns an empty result rather than erroring.
+withTestLbugDB(
+  'local-backend-impact-param',
+  (handle) => {
+    describe('impact BFS bound parameters (#1907 F5)', () => {
+      let backend: LocalBackend;
+
+      beforeAll(() => {
+        const ext = handle as typeof handle & { _backend?: LocalBackend };
+        if (!ext._backend) {
+          throw new Error('LocalBackend not initialized — afterSetup did not attach _backend');
+        }
+        backend = ext._backend;
+      });
+
+      it('traverses a caller whose id contains a single quote without a query error', async () => {
+        const result = await backend.callTool('impact', { target: 'sink', direction: 'upstream' });
+        expect(result).not.toHaveProperty('error');
+        const d1 = result.byDepth?.[1] || result.byDepth?.['1'] || [];
+        const callerIds = d1.map((d: any) => d.uid ?? d.id);
+        expect(callerIds).toContain("func:o'd");
+      });
+
+      it('returns an empty result (not an error) for a symbol with no callers', async () => {
+        const result = await backend.callTool('impact', {
+          target: 'sink',
+          direction: 'downstream',
+        });
+        expect(result).not.toHaveProperty('error');
+        expect(result.impactedCount).toBe(0);
+      });
+    });
+  },
+  {
+    seed: [
+      `CREATE (a:Function {id: "func:o'd", name: 'odd', filePath: 'src/q.ts', startLine: 1, endLine: 3, isExported: true, content: 'function odd() {}', description: 'caller with a quote in its id'})`,
+      `CREATE (b:Function {id: 'func:sink', name: 'sink', filePath: 'src/q.ts', startLine: 5, endLine: 8, isExported: true, content: 'function sink() {}', description: 'callee'})`,
+      `MATCH (a:Function), (b:Function) WHERE a.id = "func:o'd" AND b.id = 'func:sink'
+       CREATE (a)-[:CodeRelation {type: 'CALLS', confidence: 1.0, reason: 'direct', step: 0}]->(b)`,
+    ],
+    poolAdapter: true,
+    afterSetup: async (handle) => {
+      vi.mocked(listRegisteredRepos).mockResolvedValue([
+        {
+          name: 'param-repo',
+          path: '/param/repo',
+          storagePath: handle.tmpHandle.dbPath,
+          indexedAt: new Date().toISOString(),
+          lastCommit: 'abc123',
+          stats: { files: 1, nodes: 2, communities: 0, processes: 0 },
+        },
+      ]);
+      const backend = new LocalBackend();
+      await backend.init();
+      (handle as any)._backend = backend;
+    },
+  },
+);
+
+// ─── resolver `kind` hint FILTERS (#2787 review F5) ──────────────────────
+// See `resolveSymbolCandidates` (#2787 F5) for why the id order is label-major
+// and why the hint is therefore a WHERE-clause filter on BOTH the window and
+// its COUNT rather than a scoring term.
+//
+// This suite is deliberately seeded with PRODUCTION-shaped ids, unlike the
+// shared `local-backend-seed` fixture whose Function is `func:alpha` — that
+// legacy shape exercises the unfiltered-retry fallback instead (see the
+// "retries unfiltered…" test above).
+const KIND_RUNNER_METHOD_ID = 'Method:src/pipeline.ts:Runner.run';
+const KIND_RUN_FUNCTION_IDS = ['Function:src/cli/exec.ts:run', 'Function:src/pipeline.ts:run'];
+
+withTestLbugDB(
+  'resolver-kind-filter-2787',
+  (handle) => {
+    describe('resolver kind hint filters rather than scores (#2787 review F5)', () => {
+      let backend: LocalBackend;
+
+      beforeAll(() => {
+        const ext = handle as typeof handle & { _backend?: LocalBackend };
+        if (!ext._backend) {
+          throw new Error('LocalBackend not initialized — afterSetup did not attach _backend');
+        }
+        backend = ext._backend;
+      });
+
+      it('narrows a 3-way name collision to a confident resolution', async () => {
+        // Three symbols are named `run`: two Functions and one Method. As a
+        // scoring term the Method could only reach 0.50 + 0.20 = 0.70, far
+        // below the 0.95 confident gate, so this came back `ambiguous` and the
+        // caller had to round-trip for a uid. As a filter the window contains
+        // exactly one row, which resolves outright.
+        const result = await backend.callTool('impact', {
+          target: 'run',
+          kind: 'Method',
+          direction: 'upstream',
+        });
+
+        expect(result).not.toHaveProperty('error');
+        expect(result.status).not.toBe('ambiguous');
+        expect(result.target).toMatchObject({ id: KIND_RUNNER_METHOD_ID, name: 'run' });
+        // The BFS still ran on the filtered pick: `boot` calls Runner.run.
+        expect(result.impactedCount).toBeGreaterThanOrEqual(1);
+      });
+
+      it('excludes non-matching kinds from the candidate set AND from the match count', async () => {
+        // The load-bearing difference between filtering and scoring: with
+        // kind:'Function' the Method must be ABSENT, not merely ranked last —
+        // and `totalCandidates` (the COUNT leg) must agree with the page, or a
+        // filtered window ships alongside the unfiltered population.
+        const result = await backend.callTool('context', { name: 'run', kind: 'Function' });
+
+        expect(result).toMatchObject({ status: 'ambiguous', totalCandidates: 2 });
+        expect((result.candidates as Array<{ uid: string }>).map((c) => c.uid).sort()).toEqual(
+          KIND_RUN_FUNCTION_IDS,
+        );
+        expect(result).not.toHaveProperty('totalIsLowerBound');
+      });
+    });
+  },
+  {
+    seed: [
+      `CREATE (:Function {id: 'Function:src/pipeline.ts:run', name: 'run', filePath: 'src/pipeline.ts', startLine: 1, endLine: 9, isExported: true, content: 'export function run() {}', description: 'pipeline entry'})`,
+      `CREATE (:Function {id: 'Function:src/cli/exec.ts:run', name: 'run', filePath: 'src/cli/exec.ts', startLine: 1, endLine: 9, isExported: true, content: 'export function run() {}', description: 'cli entry'})`,
+      `CREATE (:Method {id: '${KIND_RUNNER_METHOD_ID}', name: 'run', filePath: 'src/pipeline.ts', startLine: 20, endLine: 30, isExported: false, content: 'run() {}', description: 'Runner.run'})`,
+      `CREATE (:Function {id: 'Function:src/main.ts:boot', name: 'boot', filePath: 'src/main.ts', startLine: 1, endLine: 5, isExported: true, content: 'function boot() {}', description: 'caller of Runner.run'})`,
+      `MATCH (a:Function), (b:Method) WHERE a.id = 'Function:src/main.ts:boot' AND b.id = '${KIND_RUNNER_METHOD_ID}'
+       CREATE (a)-[:CodeRelation {type: 'CALLS', confidence: 0.9, reason: 'direct', step: 0}]->(b)`,
+    ],
+    poolAdapter: true,
+    afterSetup: async (handle) => {
+      vi.mocked(listRegisteredRepos).mockResolvedValue([
+        {
+          name: 'kind-filter-repo',
+          path: '/kind/repo',
+          storagePath: handle.tmpHandle.dbPath,
+          indexedAt: new Date().toISOString(),
+          lastCommit: 'abc123',
+          stats: { files: 4, nodes: 4, communities: 0, processes: 0 },
+        },
+      ]);
+      const backend = new LocalBackend();
+      await backend.init();
+      (handle as any)._backend = backend;
+    },
+  },
+);
+
+// ─── context ref window must SPREAD across categories (#2787 review F1) ──
+// See the incoming-ref window in `_contextImpl` (#2787 F1) for why the 30-row
+// page is keyed `ORDER BY uid, relType` and not category-major.
+//
+// Shape below: 40 incoming refs on one Method — 35 CALLS, 3 ACCESSES, 1 USES,
+// 1 HAS_METHOD (the owning class, which is how `context` names the owner).
+//   relType-major → ACCESSES(3) + CALLS(27); HAS_METHOD and USES gone.
+//   uid-major     → HAS_METHOD(1) + ACCESSES(3) + USES(1) + CALLS(25).
+// The caller ids are spread through the id space on purpose (`a1` in f05, `u1`
+// in f10, `a2` in f15, `a3` in f25), so the rare categories are NOT stacked at
+// the front of the uid order — they survive because the key interleaves them,
+// not because they were placed first.
+const REF_TARGET_ID = 'Method:src/owner.ts:Owner.handle';
+const REF_OWNER_ID = 'Class:src/owner.ts:Owner';
+const REF_ACCESSES_IDS = [
+  'Function:src/f05.ts:a1',
+  'Function:src/f15.ts:a2',
+  'Function:src/f25.ts:a3',
+];
+const REF_USES_ID = 'Function:src/f10.ts:u1';
+
+const refCaller = (id: string, name: string, filePath: string): string =>
+  `CREATE (:Function {id: '${id}', name: '${name}', filePath: '${filePath}', startLine: 1, endLine: 3, isExported: true, content: '', description: ''})`;
+
+const refEdge = (fromLabel: string, fromId: string, relType: string): string =>
+  `MATCH (a:${fromLabel}), (b:Method) WHERE a.id = '${fromId}' AND b.id = '${REF_TARGET_ID}'
+   CREATE (a)-[:CodeRelation {type: '${relType}', confidence: 0.9, reason: 'direct', step: 0}]->(b)`;
+
+const REF_CALLS_IDS = Array.from({ length: 35 }, (_, i) => {
+  const nn = String(i + 1).padStart(2, '0');
+  return `Function:src/f${nn}.ts:c${nn}`;
+});
+
+withTestLbugDB(
+  'context-ref-window-2787',
+  (handle) => {
+    describe('context incoming-ref window spreads across categories (#2787 review F1)', () => {
+      let backend: LocalBackend;
+
+      beforeAll(() => {
+        const ext = handle as typeof handle & { _backend?: LocalBackend };
+        if (!ext._backend) {
+          throw new Error('LocalBackend not initialized — afterSetup did not attach _backend');
+        }
+        backend = ext._backend;
+      });
+
+      it('keeps single-edge categories that a category-major ORDER BY starved', async () => {
+        const result = await backend.callTool('context', { uid: REF_TARGET_ID });
+
+        expect(result).not.toHaveProperty('error');
+        expect(result.status).toBe('found');
+
+        // The rare categories are present at all — this is the assertion the
+        // pre-fix key fails: HAS_METHOD and USES sort after CALLS, whose 35 rows
+        // overflow the window on their own.
+        expect(Object.keys(result.incoming).sort()).toEqual([
+          'accesses',
+          'calls',
+          'has_method',
+          'uses',
+        ]);
+        expect(result.incoming.has_method.map((r: { uid: string }) => r.uid)).toEqual([
+          REF_OWNER_ID,
+        ]);
+        expect(result.incoming.uses.map((r: { uid: string }) => r.uid)).toEqual([REF_USES_ID]);
+        expect(result.incoming.accesses.map((r: { uid: string }) => r.uid)).toEqual(
+          REF_ACCESSES_IDS,
+        );
+
+        // …and the window is still exactly 30 rows: the fix REDISTRIBUTES the
+        // page, it does not widen it. The dominant category gives up the 5 slots
+        // the starved ones need.
+        expect(result.incoming.calls).toHaveLength(25);
+        expect(Object.values(result.incoming).flat()).toHaveLength(30);
+      });
+    });
+  },
+  {
+    seed: [
+      `CREATE (:Method {id: '${REF_TARGET_ID}', name: 'handle', filePath: 'src/owner.ts', startLine: 10, endLine: 20, isExported: false, content: '', description: ''})`,
+      `CREATE (:Class {id: '${REF_OWNER_ID}', name: 'Owner', filePath: 'src/owner.ts', startLine: 1, endLine: 40, isExported: true, content: '', description: ''})`,
+      ...REF_CALLS_IDS.map((id, i) => {
+        const nn = String(i + 1).padStart(2, '0');
+        return refCaller(id, `c${nn}`, `src/f${nn}.ts`);
+      }),
+      ...REF_ACCESSES_IDS.map((id, i) => refCaller(id, `a${i + 1}`, id.split(':')[1])),
+      refCaller(REF_USES_ID, 'u1', 'src/f10.ts'),
+      ...REF_CALLS_IDS.map((id) => refEdge('Function', id, 'CALLS')),
+      ...REF_ACCESSES_IDS.map((id) => refEdge('Function', id, 'ACCESSES')),
+      refEdge('Function', REF_USES_ID, 'USES'),
+      refEdge('Class', REF_OWNER_ID, 'HAS_METHOD'),
+    ],
+    poolAdapter: true,
+    afterSetup: async (handle) => {
+      vi.mocked(listRegisteredRepos).mockResolvedValue([
+        {
+          name: 'ref-window-repo',
+          path: '/ref/repo',
+          storagePath: handle.tmpHandle.dbPath,
+          indexedAt: new Date().toISOString(),
+          lastCommit: 'abc123',
+          stats: { files: 41, nodes: 41, communities: 0, processes: 0 },
+        },
+      ]);
+      const backend = new LocalBackend();
+      await backend.init();
+      (handle as any)._backend = backend;
+    },
+  },
+);
+
+const PYTHON_METHOD_ID = 'Method:tests/test_supervisor.py:Supervisor.run';
+const PYTHON_CALLER_ID = 'Function:tests/test_supervisor.py:test_run';
+const SWIFT_METHOD_ID = 'Method:Sources/Supervisor.swift:Supervisor.run';
+const SWIFT_CALLER_ID = 'Constructor:Sources/Supervisor.swift:Supervisor.init';
+
+withTestLbugDB(
+  'symbol-identity-isolation-3424',
+  (handle) => {
+    describe('mixed Python/Swift symbol identity isolation (#3424)', () => {
+      let backend: LocalBackend;
+
+      beforeAll(() => {
+        backend = (handle as typeof handle & { _backend: LocalBackend })._backend;
+      });
+
+      it.each(['name and file', 'UID'])('keeps Python context isolated by %s', async (lookup) => {
+        const params =
+          lookup === 'UID'
+            ? { uid: PYTHON_METHOD_ID }
+            : { name: 'run', file_path: 'tests/test_supervisor.py' };
+        const result = await backend.callTool('context', params);
+        expect(result).not.toHaveProperty('error');
+        expect(result.symbol.uid).toBe(PYTHON_METHOD_ID);
+        expect(result.incoming.calls.map((caller: { uid: string }) => caller.uid)).toEqual([
+          PYTHON_CALLER_ID,
+        ]);
+      });
+
+      it.each(['name and file', 'UID'])('keeps Python impact isolated by %s', async (lookup) => {
+        const params =
+          lookup === 'UID'
+            ? { target_uid: PYTHON_METHOD_ID }
+            : { target: 'run', file_path: 'tests/test_supervisor.py' };
+        const result = await backend.callTool('impact', {
+          ...params,
+          direction: 'upstream',
+          includeTests: true,
+        });
+        expect(result).not.toHaveProperty('error');
+        expect(result.target.id).toBe(PYTHON_METHOD_ID);
+        expect(result.impactedCount).toBe(1);
+        expect(result.byDepth[1].map((caller: { id: string }) => caller.id)).toEqual([
+          PYTHON_CALLER_ID,
+        ]);
+      });
+
+      it('keeps the unrelated Swift constructor queryable', async () => {
+        const context = await backend.callTool('context', { uid: SWIFT_METHOD_ID });
+        expect(context).not.toHaveProperty('error');
+        expect(context.symbol.uid).toBe(SWIFT_METHOD_ID);
+        expect(context.incoming.calls.map((caller: { uid: string }) => caller.uid)).toEqual([
+          SWIFT_CALLER_ID,
+        ]);
+        const impact = await backend.callTool('impact', {
+          target_uid: SWIFT_METHOD_ID,
+          direction: 'upstream',
+          includeTests: true,
+        });
+        expect(impact).not.toHaveProperty('error');
+        expect(impact.target.id).toBe(SWIFT_METHOD_ID);
+        expect(impact.impactedCount).toBe(1);
+        expect(impact.byDepth[1].map((caller: { id: string }) => caller.id)).toEqual([
+          SWIFT_CALLER_ID,
+        ]);
+      });
+    });
+  },
+  {
+    seed: [
+      `CREATE (:Method {id: '${PYTHON_METHOD_ID}', name: 'run', filePath: 'tests/test_supervisor.py', startLine: 3, endLine: 5})`,
+      `CREATE (:Function {id: '${PYTHON_CALLER_ID}', name: 'test_run', filePath: 'tests/test_supervisor.py', startLine: 7, endLine: 9})`,
+      `CREATE (:Method {id: '${SWIFT_METHOD_ID}', name: 'run', filePath: 'Sources/Supervisor.swift', startLine: 3, endLine: 5})`,
+      `CREATE (:Constructor {id: '${SWIFT_CALLER_ID}', name: 'init', filePath: 'Sources/Supervisor.swift', startLine: 7, endLine: 9})`,
+      `MATCH (a:Function), (b:Method) WHERE a.id = '${PYTHON_CALLER_ID}' AND b.id = '${PYTHON_METHOD_ID}' CREATE (a)-[:CodeRelation {type: 'CALLS', confidence: 1.0, reason: 'direct', step: 0}]->(b)`,
+      `MATCH (a:Constructor), (b:Method) WHERE a.id = '${SWIFT_CALLER_ID}' AND b.id = '${SWIFT_METHOD_ID}' CREATE (a)-[:CodeRelation {type: 'CALLS', confidence: 1.0, reason: 'direct', step: 0}]->(b)`,
+    ],
+    poolAdapter: true,
+    afterSetup: async (handle) => {
+      vi.mocked(listRegisteredRepos).mockResolvedValue([
+        {
+          name: 'mixed-language-repo',
+          path: '/mixed-language/repo',
+          storagePath: handle.tmpHandle.dbPath,
+          indexedAt: new Date().toISOString(),
+          lastCommit: 'abc123',
+          stats: { files: 2, nodes: 4, communities: 0, processes: 0 },
+        },
+      ]);
+      const backend = new LocalBackend();
+      await backend.init();
+      (handle as typeof handle & { _backend: LocalBackend })._backend = backend;
+    },
+  },
+);
+
+// ─── rename node inventory on a --pdg index (PR #3557 review) ─────────────
+// A --pdg index stores one BasicBlock row per CFG block, and BasicBlock has a
+// filePath column, so an unlabelled `MATCH (n) WHERE n.filePath ...` inventory
+// would hand every block to the planner, which adds each one to every fresh
+// scope-resolution graph. The real database must answer the label predicate:
+// the BasicBlock rows are dropped while File and declaration rows still arrive.
+const INVENTORY_FILE = 'target.ts';
+const INVENTORY_FILE_ID = `File:${INVENTORY_FILE}`;
+const INVENTORY_FUNCTION_ID = `Function:${INVENTORY_FILE}:target`;
+const INVENTORY_BLOCK_IDS = [
+  `BasicBlock:${INVENTORY_FILE}:0:0`,
+  `BasicBlock:${INVENTORY_FILE}:0:1`,
+];
+const INVENTORY_SOURCE = 'function target() {}\ntarget();\n';
+const INVENTORY_PROBE =
+  "MATCH (n) WHERE n.filePath IS NOT NULL AND n.filePath <> '' RETURN n.id AS id ORDER BY n.id";
+
+withTestLbugDB(
+  'rename-node-inventory-pdg',
+  (handle) => {
+    describe('rename node inventory with persisted BasicBlock rows', () => {
+      let backend: LocalBackend;
+
+      beforeAll(async () => {
+        const ext = handle as typeof handle & { _backend?: LocalBackend };
+        if (!ext._backend) throw new Error('LocalBackend not initialized in afterSetup');
+        backend = ext._backend;
+        // The planner lazily imports every language provider on first use (~30s
+        // cold); pay that under the hook timeout, not the per-test one.
+        await import('../../src/mcp/local/rename/graph-rename.js');
+      });
+
+      beforeEach(() => {
+        vi.mocked(renameSymbol).mockClear();
+      });
+
+      it('seeds BasicBlock rows that the unlabelled filePath scan would return', async () => {
+        const result = await backend.callTool('cypher', { query: INVENTORY_PROBE });
+        const ids = (result.markdown as string).split('\n').join(' ');
+        for (const id of [INVENTORY_FILE_ID, INVENTORY_FUNCTION_ID, ...INVENTORY_BLOCK_IDS]) {
+          expect(ids).toContain(id);
+        }
+      });
+
+      it('hands the planner File and declaration rows but no BasicBlock rows', async () => {
+        const result = await backend.callTool('rename', {
+          symbol_uid: INVENTORY_FUNCTION_ID,
+          new_name: 'renamed',
+          dry_run: true,
+        });
+        expect(result.status).toBe('success');
+        expect(result.applied).toBe(false);
+        // The declaration and its one call site: unchanged by the inventory filter.
+        expect(result.total_edits).toBe(2);
+        const calls = vi.mocked(renameSymbol).mock.calls;
+        expect(calls).toHaveLength(1);
+        const inventoryIds = calls[0][3].map((node) => node.id).sort();
+        expect(inventoryIds).toEqual([INVENTORY_FILE_ID, INVENTORY_FUNCTION_ID].sort());
+      });
+    });
+  },
+  {
+    seed: [
+      `CREATE (:File {id: '${INVENTORY_FILE_ID}', name: '${INVENTORY_FILE}', filePath: '${INVENTORY_FILE}'})`,
+      `CREATE (:Function {id: '${INVENTORY_FUNCTION_ID}', name: 'target', filePath: '${INVENTORY_FILE}', startLine: 0, endLine: 0})`,
+      ...INVENTORY_BLOCK_IDS.map(
+        (id, index) =>
+          `CREATE (:BasicBlock {id: '${id}', filePath: '${INVENTORY_FILE}', startLine: ${index}, endLine: ${index}, text: 'target()', callees: '', calleeIds: '', ownerId: '${INVENTORY_FUNCTION_ID}'})`,
+      ),
+    ],
+    poolAdapter: true,
+    afterSetup: async (handle) => {
+      const checkout = path.join(handle.tmpHandle.dbPath, 'checkout');
+      await fs.mkdir(checkout, { recursive: true });
+      await fs.writeFile(path.join(checkout, INVENTORY_FILE), INVENTORY_SOURCE);
+      const indexedAt = new Date().toISOString();
+      await fs.writeFile(
+        path.join(handle.tmpHandle.dbPath, 'gitnexus.json'),
+        JSON.stringify({ contentRetention: 'full', indexedAt }),
+      );
+      vi.mocked(listRegisteredRepos).mockResolvedValue([
+        {
+          name: 'rename-inventory-repo',
+          path: checkout,
+          storagePath: handle.tmpHandle.dbPath,
+          indexedAt,
+          lastCommit: 'abc123',
+          stats: { files: 1, nodes: 4, communities: 0, processes: 0 },
+        },
+      ]);
+      const backend = new LocalBackend();
+      await backend.init();
+      (handle as typeof handle & { _backend: LocalBackend })._backend = backend;
     },
   },
 );

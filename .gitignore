@@ -34,6 +34,13 @@ npm-debug.log*
 
 # Testing
 coverage/
+.vitest/
+.tmp-test/
+gitnexus/.tmp-test/
+# Mutation testing (gitnexus/tools/mutation). Prepared copies and run directories live
+# outside the checkout; these catch a Stryker run started inside it.
+.stryker-tmp/
+gitnexus/reports/mutation/
 
 # Misc
 *.local
@@ -66,13 +73,16 @@ repomix-output*
 # Playwright artifacts
 gitnexus-web/playwright-report/
 gitnexus-web/test-results/
+gitnexus-web/e2e/screenshots/
 
 # Python test artifacts
 eval/.coverage
 eval/.hypothesis/
 
-# Design docs (local only)
-docs/plans/
+# Local docs — planning output (gitnexus-plan / gitnexus-work) stays local, not tracked
+docs/*
+!docs/fork/
+!docs/fork/**
 
 gitnexus/test/fixtures/mini-repo/*.md
 gitnexus/test/fixtures/mini-repo/.claude
@@ -84,6 +94,7 @@ gitnexus/test/fixtures/lang-resolution/**/bin
 GitNexus.sln
 # Git worktrees
 .worktrees/
+.devcontainer/generated/
 
 # Vendored tree-sitter grammar build artifacts (created at install time,
 # never committed). See docs/plans/2026-04-15-002-fix-tree-sitter-proto-vendor-deps-plan.md
@@ -94,11 +105,24 @@ gitnexus/vendor/**/node_modules/
 
 .claude-flow/
 
-.claude/agents/
+.claude/agents/*
+!.claude/agents/gitnexus-*.md
 .claude/commands/
 .claude/helpers
-.claude/skills/
+.claude/skills/*
 !.claude/skills/gitnexus/
+!.claude/skills/gitnexus-cli/
+!.claude/skills/gitnexus-debugging/
+!.claude/skills/gitnexus-exploring/
+!.claude/skills/gitnexus-guide/
+!.claude/skills/gitnexus-impact-analysis/
+!.claude/skills/gitnexus-refactoring/
+!.claude/skills/gitnexus-pr-swarm-review/
+!.claude/skills/gitnexus-review/
+!.claude/skills/gitnexus-plan/
+!.claude/skills/gitnexus-work/
+!.claude/skills/gitnexus-lfg/
+!.claude/skills/pr-tri-review/
 
 .history/
 
@@ -107,7 +131,23 @@ gitnexus/vendor/**/node_modules/
 local_docs/
 
 # Local agent scratch / review prompts (never commit)
+# (.agents/plugins/marketplace.json is the checked-in Codex plugin
+# marketplace registry — the rest of .agents/ stays local scratch.)
 .tmp/
-.agents/
+.agents/*
+!.agents/plugins/
+.agents/plugins/*
+!.agents/plugins/marketplace.json
 .context/
 gitnexus/web/
+
+# Local copies of CI execution receipts.
+gitnexus/benchmarks.json
+gitnexus/preflight.json
+gitnexus/test-results.json
+gitnexus/windows-latest-*.json
+gitnexus/macos-latest-*.json
+gitnexus-web/web-test-results.json
+
+# Machine-local skill-evolution evidence (consumed by eval/workflow_bench/evolve.py)
+eval/workflow_bench/learnings.jsonl

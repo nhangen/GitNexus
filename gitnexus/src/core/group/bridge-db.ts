@@ -1,19 +1,32 @@
 import fsp from 'node:fs/promises';
 import path from 'node:path';
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import lbug from '@ladybugdb/core';
 import type { LbugValue } from '@ladybugdb/core';
-import type { BridgeHandle, BridgeMeta, StoredContract, CrossLink, RepoSnapshot } from './types.js';
+import type {
+  BridgeHandle,
+  BridgeMeta,
+  StoredContract,
+  CrossLink,
+  RepoSnapshot,
+  MatchType,
+} from './types.js';
 import { BRIDGE_SCHEMA_QUERIES, BRIDGE_SCHEMA_VERSION } from './bridge-schema.js';
+import { recordedMatchStages, recordedRepoList } from './completeness.js';
+import { closeQueryResults } from '../lbug/query-result-utils.js';
 import {
   closeLbugConnection,
   openLbugConnection,
   type LbugConnectionHandle,
 } from '../lbug/lbug-config.js';
 import { dedupeContracts, dedupeCrossLinks } from './normalization.js';
+import { withGroupSyncLock } from './group-lock.js';
 import { createLogger } from '../logger.js';
+import { retryRename, writeFileAtomic } from '../../storage/fs-atomic.js';
 
-const bridgeLogger = createLogger('bridge-db', { debugEnvVar: 'GITNEXUS_DEBUG_BRIDGE' });
+const bridgeLogger = createLogger('bridge-db', {
+  debugEnvVar: 'GITNEXUS_DEBUG_BRIDGE',
+});
 
 /**
  * Sidecar files that LadybugDB creates next to a `bridge.lbug` file.
@@ -32,6 +45,358 @@ const bridgeLogger = createLogger('bridge-db', { debugEnvVar: 'GITNEXUS_DEBUG_BR
  * cleaned up explicitly or the next writer trips the database-id check.
  */
 const LBUG_SIDECAR_SUFFIXES = ['.wal', '.shadow'] as const;
+
+/* ------------------------------------------------------------------ */
+/*  Read-only bridge handle cache                                     */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Cache of read-only bridge handles keyed by groupDir. Keeps one RO handle
+ * per groupDir alive across @group tool calls so a long-lived MCP server
+ * never reopens the same bridge.lbug in-process — reopening fails on Windows
+ * because the OS file handle isn't fully released before the next open races
+ * in (see PR #2269, #2274).
+ *
+ * deliberation: mtime-based invalidation was chosen over a simpler
+ * time-to-live or explicit-close model because:
+ *   1. TTL would force a reopen on a timer even when nothing changed.
+ *   2. Explicit-close requires every caller to know about the cache.
+ *   3. A cheap `fsp.stat` (uncached, but typically a single inode lookup on
+ *      modern kernels) before each `ensureBridgeReady` call detects external
+ *      writers (e.g. another process ran group sync) with zero false
+ *      positives and no timer complication.
+ *   4. Same-process writes invalidate explicitly via `invalidateBridgeCache`
+ *      before the atomic rename so the cached RO handle does not block it.
+ */
+interface CachedBridgeEntry {
+  handle: BridgeHandle;
+  mtime: number;
+  /**
+   * Active leases: callers between `getCachedBridgeReadOnly` (acquire, `refs++`)
+   * and `closeBridgeDb` (release, `refs--`). The native handle is never closed
+   * while `refs > 0` — a concurrent `@group` reader may still be querying it,
+   * and closing under a live query is a native use-after-free.
+   */
+  refs: number;
+  /** Set once the entry leaves the cache; the native close is deferred to the last release. */
+  evicted: boolean;
+  /** Guards `finalizeBridgeClose` so the native close runs exactly once. */
+  closeStarted: boolean;
+  /**
+   * Per-handle FIFO serialization tail. The cached RO handle is shared across
+   * concurrent `@group` callers, but a LadybugDB `Connection` is NOT safe for
+   * concurrent query execution (see `lbug/conn-lock.ts` — two queries on one
+   * connection corrupt the native heap). `queryBridge` runs each op on this
+   * chain so no two ever overlap on one handle. Per-handle (not a single global
+   * lock) so different groups — separate connections — stay parallel.
+   */
+  lockTail: Promise<void>;
+  /**
+   * Resolves when the native handle has actually been closed. `writeBridge` on
+   * Windows awaits this (bounded — see `WINDOWS_DRAIN_TIMEOUT_MS`) before its
+   * atomic rename, because Windows cannot rename over an open handle. On POSIX
+   * the rename succeeds over an open RO handle (the old inode survives for the
+   * in-flight reader), so the close stays fully non-blocking there.
+   */
+  drained: Promise<void>;
+  /** Resolver for {@link CachedBridgeEntry.drained}; called once by `finalizeBridgeClose`. */
+  resolveDrained: () => void;
+}
+
+/**
+ * Windows-only bound on how long `invalidateBridgeCache` waits for in-flight
+ * readers to release before letting `writeBridge` rename. Past this, it falls
+ * through and `retryRename` (EBUSY ×3) copes — so a pathologically long reader
+ * can never wedge `group_sync`. ponytail: fixed 5s ceiling; make it
+ * configurable if a real workload shows reads routinely outlasting it.
+ */
+const WINDOWS_DRAIN_TIMEOUT_MS = 5000;
+
+const cachedBridgeHandles = new Map<string, CachedBridgeEntry>();
+
+/**
+ * Reverse lookup: cache entry by its `BridgeHandle`. Lets `queryBridge` and
+ * `closeBridgeDb` find an entry from just the handle — including an *evicted*
+ * entry that is no longer in `cachedBridgeHandles` but whose native handle a
+ * lease still holds open. Uncached/writable handles (the `writeBridge` temp DB)
+ * are absent here, which is how those paths opt out of the lock and refcount.
+ */
+const bridgeEntryByHandle = new WeakMap<BridgeHandle, CachedBridgeEntry>();
+
+/**
+ * In-flight opens keyed by groupDir. Prevents the TOCTOU race where two
+ * concurrent cache-miss calls both open a fresh handle and the second
+ * overwrites the first in `cachedBridgeHandles` — leaking the first
+ * handle. Mirrors the `local-backend.ts:1293` reinitPromises pattern.
+ */
+const inFlightOpens = new Map<string, Promise<BridgeHandle | null>>();
+
+function bridgeCacheKey(groupDir: string): string {
+  return path.resolve(groupDir);
+}
+
+/**
+ * Serialize an operation on a cached handle's per-handle FIFO chain. Mirrors the
+ * promise-chain mechanic of `lbug/conn-lock.ts` (install a fresh unresolved
+ * tail, await the prior holder, release in `finally` so a throw never wedges the
+ * chain) — but keyed per handle, not a single global lock. No re-entry guard:
+ * `queryBridge` is a leaf (it never calls another locked bridge helper), and the
+ * native close runs outside the lock gated on `refs === 0`.
+ */
+export async function withHandleLock<T>(
+  lock: { lockTail: Promise<void> },
+  fn: () => Promise<T>,
+): Promise<T> {
+  const prior = lock.lockTail;
+  let release!: () => void;
+  lock.lockTail = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await prior;
+  try {
+    return await fn();
+  } finally {
+    release();
+  }
+}
+
+/**
+ * Close a cached entry's native handle exactly once. Guarded by `closeStarted`
+ * so the mtime-evict path, `invalidateBridgeCache`, the last lease release, and
+ * `closeAllCachedBridges` can all reach here and only one native close runs.
+ */
+async function finalizeBridgeClose(entry: CachedBridgeEntry): Promise<void> {
+  if (entry.closeStarted) return;
+  entry.closeStarted = true;
+  bridgeEntryByHandle.delete(entry.handle);
+  try {
+    await closeBridgeHandle(entry.handle);
+  } finally {
+    entry.resolveDrained();
+  }
+}
+
+/**
+ * Remove an entry from the cache and release its native handle. The native
+ * close is DEFERRED until in-flight leases drain (`refs === 0`): closing a
+ * handle a concurrent `@group` reader is still querying is a native
+ * use-after-free (the `conn-lock.ts` hazard). When `refs === 0` (the common
+ * single-threaded case — e.g. `group_sync` with no concurrent read) the close
+ * runs now and the returned promise resolves when it completes, so
+ * `writeBridge`'s atomic rename never races a live RO handle on Windows.
+ *
+ * When `refs > 0` (a concurrent reader holds a lease), the native close is
+ * deferred to the last `closeBridgeDb` release — closing now would be a
+ * use-after-free. Platform split for the rename that follows:
+ *   - POSIX: return immediately. The rename succeeds over the still-open RO
+ *     handle (old inode survives for the reader); no wait, no starvation.
+ *   - Windows: a rename over an open handle fails (EBUSY), so wait — bounded by
+ *     `WINDOWS_DRAIN_TIMEOUT_MS` — for the reader to release and the deferred
+ *     close to complete, then the rename is clean. On timeout, fall through and
+ *     let `retryRename` cope, so a slow reader can never wedge `group_sync`.
+ *
+ * This is the single eviction path for BOTH the mtime-change branch and
+ * `invalidateBridgeCache`.
+ */
+async function evictBridgeEntry(key: string, entry: CachedBridgeEntry): Promise<void> {
+  if (!entry.evicted) {
+    entry.evicted = true;
+    if (cachedBridgeHandles.get(key) === entry) cachedBridgeHandles.delete(key);
+  }
+  if (entry.refs <= 0) {
+    await finalizeBridgeClose(entry);
+    return;
+  }
+  // refs > 0: close deferred to the last closeBridgeDb release.
+  if (process.platform === 'win32') {
+    // Windows needs the handle closed before writeBridge renames. Wait (bounded)
+    // for readers to drain; on timeout, retryRename handles the residual EBUSY.
+    let timer: ReturnType<typeof setTimeout>;
+    const timeout = new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, WINDOWS_DRAIN_TIMEOUT_MS);
+    });
+    await Promise.race([entry.drained, timeout]).finally(() => clearTimeout(timer));
+  }
+}
+
+/**
+ * Close a BridgeHandle's native resources without touching the cache.
+ * Shared by `closeBridgeDb` (uncached handles) and the cache invalidation
+ * / shutdown paths so neither duplicates the close logic.
+ */
+async function closeBridgeHandle(handle: BridgeHandle): Promise<void> {
+  if (!handle._readOnly) {
+    try {
+      await closeQueryResults(await (handle._conn as lbug.Connection).query('CHECKPOINT'));
+    } catch {
+      /* ignore — older LadybugDB or schemaless DB may not accept it */
+    }
+  }
+  try {
+    await (handle._conn as lbug.Connection).close();
+  } catch {
+    /* ignore */
+  }
+  try {
+    await (handle._db as lbug.Database).close();
+  } catch {
+    /* ignore */
+  }
+}
+
+/**
+ * Get or create a cached read-only bridge handle for `groupDir`.
+ *
+ * - First call: delegates to `openBridgeDbReadOnly`, records the file's
+ *   `mtimeMs`, and caches the handle.
+ * - Subsequent calls (mtime unchanged): returns the cached handle — no
+ *   reopen, no OS file-handle churn.
+ * - After the file's mtime changes (external writer, e.g. another process
+ *   ran `gitnexus group sync`): closes the stale handle, opens a fresh
+ *   one, and updates the cache.
+ * - After the file disappears (ENOENT): invalidates cache, returns null.
+ *
+ * Returns `null` when the bridge file is missing, has an incompatible
+ * schema version, or cannot be opened even after the retry loop in
+ * `openBridgeDbReadOnly`.
+ */
+export async function getCachedBridgeReadOnly(groupDir: string): Promise<BridgeHandle | null> {
+  const key = bridgeCacheKey(groupDir);
+  const dbPath = path.join(groupDir, 'bridge.lbug');
+
+  // Fast path: cache hit, unchanged mtime → lease the cached handle.
+  const entry = cachedBridgeHandles.get(key);
+  if (entry) {
+    try {
+      const stat = await fsp.stat(dbPath);
+      // Re-check `evicted` AFTER the await: a concurrent writeBridge/invalidate
+      // may have evicted this entry while we awaited `stat`. Leasing an evicted
+      // (closing) handle would be a use-after-close. The `refs++` is the first
+      // synchronous statement after the check, so no evictor can slip between.
+      if (!entry.evicted && stat.mtimeMs === entry.mtime) {
+        entry.refs++;
+        return entry.handle;
+      }
+    } catch {
+      // File disappeared (ENOENT) — fall through to evict + reopen.
+    }
+    // mtime changed or file gone — evict (defers the native close if a
+    // concurrent reader still holds a lease; closes now otherwise).
+    if (!entry.evicted) await evictBridgeEntry(key, entry);
+  }
+
+  // TOCTOU guard: if another caller is already opening for this key, await
+  // their in-flight promise and take a lease on the result instead of opening
+  // a second handle.
+  const inFlight = inFlightOpens.get(key);
+  if (inFlight) {
+    const handle = await inFlight;
+    if (!handle) return null;
+    // Same post-await guard as the fast path: the opener's entry may have been
+    // evicted between caching and this awaiter resuming. Only lease a live,
+    // identity-matched entry; otherwise retry from the top for a fresh handle.
+    const opened = cachedBridgeHandles.get(key);
+    if (opened && !opened.evicted && opened.handle === handle) {
+      opened.refs++;
+      return handle;
+    }
+    return getCachedBridgeReadOnly(groupDir);
+  }
+
+  const openPromise: Promise<BridgeHandle | null> = (async () => {
+    try {
+      const handle = await openBridgeDbReadOnly(groupDir);
+      if (!handle) return null;
+
+      let mtime = 0;
+      try {
+        const stat = await fsp.stat(dbPath);
+        mtime = stat.mtimeMs;
+      } catch {
+        // bridge.lbug not stat-able right after open (rare race). Leaving
+        // mtime at 0 means the next call's fast-path comparison won't match
+        // (a real file's mtime is never 0), so it re-opens. Benign: the handle
+        // still works for this caller; we just don't cache-reuse it until a
+        // later open records a real mtime.
+      }
+
+      let resolveDrained!: () => void;
+      const drained = new Promise<void>((resolve) => {
+        resolveDrained = resolve;
+      });
+      const newEntry: CachedBridgeEntry = {
+        handle,
+        mtime,
+        refs: 0,
+        evicted: false,
+        closeStarted: false,
+        lockTail: Promise.resolve(),
+        drained,
+        resolveDrained,
+      };
+      cachedBridgeHandles.set(key, newEntry);
+      bridgeEntryByHandle.set(handle, newEntry);
+      return handle;
+    } finally {
+      inFlightOpens.delete(key);
+    }
+  })();
+  inFlightOpens.set(key, openPromise);
+
+  // Each caller (the opener and every awaiter) takes exactly one lease here, so
+  // refs counts callers correctly even under inFlightOpens coalescing.
+  const handle = await openPromise;
+  if (!handle) return null;
+  const opened = cachedBridgeHandles.get(key);
+  if (opened && !opened.evicted && opened.handle === handle) {
+    opened.refs++;
+    return handle;
+  }
+  return getCachedBridgeReadOnly(groupDir);
+}
+
+/**
+ * Invalidate the cached read-only handle for `groupDir`. Drops it from the
+ * cache immediately; the native close is deferred until any in-flight reader
+ * leases drain (see {@link evictBridgeEntry}). With no concurrent reader this
+ * resolves only after the handle is actually closed — which is why
+ * `writeBridge` awaits it before its atomic rename (Windows: a still-open RO
+ * handle would block the rename with EBUSY).
+ */
+export async function invalidateBridgeCache(groupDir: string): Promise<void> {
+  const key = bridgeCacheKey(groupDir);
+  const entry = cachedBridgeHandles.get(key);
+  if (entry) await evictBridgeEntry(key, entry);
+}
+
+/**
+ * Close ALL cached bridge handles. Call on process shutdown only — it force-
+ * closes regardless of refs (safe at `beforeExit`, which fires only at
+ * event-loop quiescence, so no query is in flight). Do NOT wire this to a
+ * SIGTERM/SIGINT handler that can fire mid-request: that would close a handle
+ * under a live query. Routes through `finalizeBridgeClose` for the close-once
+ * guarantee.
+ */
+export async function closeAllCachedBridges(): Promise<void> {
+  const entries = [...cachedBridgeHandles.values()];
+  cachedBridgeHandles.clear();
+  await Promise.all(entries.map((e) => finalizeBridgeClose(e)));
+}
+
+// Best-effort process-exit cleanup. 'beforeExit' fires before 'exit' and
+// lets async work drain (unlike 'exit' which is synchronous-only). It does
+// NOT fire on process.exit()/SIGTERM/SIGINT — but that is fine here: the OS
+// reclaims all handles on any exit path, and for read-only handles there is
+// no WAL to flush, so the only thing lost on signal death is a tidy close
+// (cosmetic). We deliberately do NOT register a SIGTERM/SIGINT handler: a
+// signal can fire mid-request, and closeAllCachedBridges force-closes
+// regardless of refs, which would close a handle under a live query. Shutdown
+// sequencing is the MCP server's responsibility — it should call
+// closeAllCachedBridges() at a quiescent point (also how tests get a
+// deterministic teardown).
+process.once('beforeExit', () => {
+  void closeAllCachedBridges();
+});
 
 async function removeLbugFile(basePath: string): Promise<void> {
   const candidates = [basePath, ...LBUG_SIDECAR_SUFFIXES.map((s) => `${basePath}${s}`)];
@@ -182,7 +547,7 @@ export async function ensureBridgeSchema(handle: BridgeHandle): Promise<void> {
   const conn = handle._conn as lbug.Connection;
   for (const q of BRIDGE_SCHEMA_QUERIES) {
     try {
-      await conn.query(q);
+      await closeQueryResults(await conn.query(q));
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       if (!msg.includes(LBUG_ALREADY_EXISTS_MSG)) throw err;
@@ -195,20 +560,35 @@ export async function queryBridge<T>(
   cypher: string,
   params?: Record<string, LbugValue>,
 ): Promise<T[]> {
-  const conn = handle._conn as lbug.Connection;
-  if (params && Object.keys(params).length > 0) {
-    const stmt = await conn.prepare(cypher);
-    if (!stmt.isSuccess()) {
-      const errMsg = await stmt.getErrorMessage();
-      throw new Error(`Bridge query prepare failed: ${errMsg}`);
+  const run = async (): Promise<T[]> => {
+    const conn = handle._conn as lbug.Connection;
+    let queryResult: lbug.QueryResult | lbug.QueryResult[];
+    if (params && Object.keys(params).length > 0) {
+      const stmt = await conn.prepare(cypher);
+      if (!stmt.isSuccess()) {
+        const errMsg = await stmt.getErrorMessage();
+        throw new Error(`Bridge query prepare failed: ${errMsg}`);
+      }
+      queryResult = await conn.execute(stmt, params);
+    } else {
+      queryResult = await conn.query(cypher);
     }
-    const queryResult = await conn.execute(stmt, params);
-    const result = unwrapQueryResult(queryResult);
-    return (await result.getAll()) as T[];
-  }
-  const queryResult = await conn.query(cypher);
-  const result = unwrapQueryResult(queryResult);
-  return (await result.getAll()) as T[];
+    try {
+      const result = unwrapQueryResult(queryResult);
+      return (await result.getAll()) as T[];
+    } finally {
+      // Native results retain the database even after conn/db.close(). Release
+      // them before the bridge is swapped and its file stamp is recorded.
+      await closeQueryResults(queryResult);
+    }
+  };
+  // Cached RO handles are shared across concurrent @group callers, so serialize
+  // conn ops per handle (a LadybugDB Connection is not safe for concurrent
+  // queries — conn-lock.ts). Uncached/writable handles (the writeBridge temp DB)
+  // are single-threaded — they're absent from bridgeEntryByHandle and skip the
+  // lock at zero cost.
+  const entry = bridgeEntryByHandle.get(handle);
+  return entry ? withHandleLock(entry, run) : run();
 }
 
 /**
@@ -230,86 +610,409 @@ function unwrapQueryResult(queryResult: lbug.QueryResult | lbug.QueryResult[]): 
   return queryResult;
 }
 
+/**
+ * Release a caller's reference to a bridge handle.
+ *
+ * - **Cache-owned handle** (returned by `getCachedBridgeReadOnly`): this is the
+ *   matching *release* for that acquire — it decrements the lease refcount, it
+ *   does NOT close the native handle. The cache owns the lifetime; the handle
+ *   closes on explicit `invalidateBridgeCache`, mtime-eviction, or process
+ *   shutdown. If the entry was already evicted and this is the last lease, the
+ *   deferred native close fires here (exactly once).
+ * - **Uncached/writable handle** (e.g. the `writeBridge` temp DB): closes the
+ *   native handle for real (CHECKPOINT-flush for writable handles).
+ *
+ * Contract: before renaming or deleting `bridge.lbug`, call
+ * `invalidateBridgeCache` (not this) — `closeBridgeDb` on a cache-owned handle
+ * is a lease release, so the file may stay open under other readers.
+ */
 export async function closeBridgeDb(handle: BridgeHandle): Promise<void> {
-  // CHECKPOINT before close so the WAL/.shadow contents are flushed into
-  // the main database file. Without this, LadybugDB 0.16.0's non-blocking
-  // checkpoint thread can outlive the close call and leave sidecar pages
-  // pending on disk, which makes a subsequent read-side open either race
-  // with the WAL replay or trip the database-id check on the sidecars.
-  // CHECKPOINT is a no-op when there's nothing pending, so it's cheap.
-  try {
-    await (handle._conn as lbug.Connection).query('CHECKPOINT');
-  } catch {
-    /* ignore — older LadybugDB or schemaless DB may not accept it */
+  const entry = bridgeEntryByHandle.get(handle);
+  if (!entry) {
+    // Uncached or writable handle — close for real.
+    await closeBridgeHandle(handle);
+    return;
   }
-  try {
-    await (handle._conn as lbug.Connection).close();
-  } catch {
-    /* ignore */
-  }
-  try {
-    await (handle._db as lbug.Database).close();
-  } catch {
-    /* ignore */
-  }
+  // Cache-owned handle: release this lease. Close only the evicted handle whose
+  // last lease just dropped (deferred-close completion); the live cached handle
+  // stays open for reuse.
+  if (entry.refs > 0) entry.refs--;
+  if (entry.evicted && entry.refs <= 0) await finalizeBridgeClose(entry);
 }
 
-/* ------------------------------------------------------------------ */
-/*  retryRename — handles transient EBUSY/EPERM/EACCES on Windows    */
-/* ------------------------------------------------------------------ */
-
-const RETRY_CODES = new Set(['EBUSY', 'EPERM', 'EACCES']);
-
-export async function retryRename(src: string, dst: string, attempts = 3): Promise<void> {
-  for (let i = 1; i <= attempts; i++) {
-    try {
-      await fsp.rename(src, dst);
-      return;
-    } catch (err: unknown) {
-      const code = (err as NodeJS.ErrnoException).code;
-      if (!code || !RETRY_CODES.has(code) || i === attempts) throw err;
-      await new Promise((r) => setTimeout(r, 100 * Math.pow(2, i - 1)));
-    }
-  }
-}
+// NOTE: Windows in-process write→read reopen of the SAME bridge.lbug is still a
+// known limitation (the writable close's OS file handle is not released before
+// the read open races; the existing open-side LBUG_OPEN_RETRY only retries
+// lock-pattern errors, not the post-rename sidecar database-id mismatch). The
+// bridge's close-then-reopen tests stay Windows-skipped. A close-side
+// waitForWindowsHandleRelease + finalizeLbugSidecarsAfterClose probe (mirroring
+// safeClose) was tried and did NOT close that gap on Windows CI, so it was
+// removed rather than carry latency/duplication for no Windows benefit.
+//
+// Scope of the RO bridge-handle cache (getCachedBridgeReadOnly): it removes the
+// PRODUCTION symptom — a long-lived MCP serve process reopening bridge.lbug on
+// every @group call — by keeping one RO handle alive for read→READ reuse.
+// It does NOT fix the write→READ reopen: the first @group read right after an
+// in-process group_sync is a cache miss → openBridgeDbReadOnly, i.e. the same
+// unfixed reopen, so on Windows that first post-sync read still returns null.
+// The read-only CHECKPOINT skip above remains the load-bearing fix on
+// Linux/macOS.
 
 /* ------------------------------------------------------------------ */
 /*  writeBridgeMeta / readBridgeMeta                                  */
 /* ------------------------------------------------------------------ */
 
 export async function writeBridgeMeta(groupDir: string, meta: BridgeMeta): Promise<void> {
-  const target = path.join(groupDir, 'meta.json');
-  // Unpredictable suffix + O_EXCL via `'wx'` flag closes the symlink/
-  // pre-create attack window. The third argument `0o600` is the
-  // user-only mode mask — CodeQL's `js/insecure-temporary-file` query
-  // sources its verdict from the `mode` argument, NOT from `flags`:
-  // its `isSecureMode(mode)` predicate requires the low 6 bits to be
-  // zero (no group/world bits). Without an explicit mode the file is
-  // created with the process umask (typically 0o644 = group/world
-  // readable), which the query treats as the actual vulnerability.
-  // Both `'wx'` (runtime O_EXCL) AND `0o600` (CodeQL-credited mode)
-  // are needed: one closes the symlink race, the other closes the
-  // permissions exposure.
-  const tmp = `${target}.tmp.${randomBytes(8).toString('hex')}`;
-  const handle = await fsp.open(tmp, 'wx', 0o600);
-  try {
-    await handle.writeFile(JSON.stringify(meta, null, 2), 'utf-8');
-  } finally {
-    await handle.close();
-  }
-  // Use retryRename for consistency with writeBridge's atomic swap — on
-  // Windows a concurrent reader can cause EBUSY/EPERM even on a tiny
-  // meta.json, and we don't want meta write to be less robust than the
-  // bridge.lbug swap it accompanies.
-  await retryRename(tmp, target);
+  // Strip the reader-only fields HERE rather than at each writer. `readBridgeMeta`
+  // sets both on what it returns, so any caller that reads-modifies-writes would
+  // round-trip them to disk — and `pairedWithDatabase` is the poisonous one:
+  // persisted, it tells every future reader the pair was verified when nothing
+  // verified it. That rule used to live in the body of the only such caller,
+  // which held exactly as long as there was one. There are now three writers and
+  // two of them read first. Enforced at the boundary, no writer can get it wrong.
+  const { repoListsUnreadable: _reader1, pairedWithDatabase: _reader2, ...persisted } = meta;
+  await writeFileAtomic(path.join(groupDir, 'meta.json'), JSON.stringify(persisted, null, 2));
 }
 
+const stampMatchesStat = (
+  stat: { size: number; mtimeMs: number },
+  meta: Pick<BridgeMeta, 'bridgeSize' | 'bridgeMtimeMs'>,
+): boolean =>
+  stat.size === meta.bridgeSize &&
+  // Do not `Math.round`: two same-size databases written in the same
+  // millisecond must still fail if their filesystem mtimes differ.
+  stat.mtimeMs === meta.bridgeMtimeMs;
+
+/**
+ * Does `meta` still describe the `bridge.lbug` sitting next to it?
+ *
+ * `writeBridge` stamps the database's size and mtime into the metadata it
+ * writes, so a metadata file left over from an earlier sync cannot match a
+ * database that was replaced after it. Callers whose answer depends on the
+ * metadata being true of THIS database (cross-repo impact reads completeness
+ * from it) must not treat a mismatch as fact.
+ *
+ * When BOTH halves of the stamp are absent the metadata predates stamping, and
+ * it is judged on the write order of the two files instead — see
+ * {@link unstampedMetaPairsByWriteOrder}. Failing every unstamped metadata
+ * closed would mark all pre-existing bridges as incomplete until re-synced,
+ * trading a narrow window for a repo-wide regression; accepting them all hands
+ * back "verified" for the very window this pairing exists to catch.
+ *
+ * A stamp is a PAIR, so exactly one half present is rejected rather than waved
+ * through. That is not the legacy shape: something wrote a stamp and did not
+ * finish, which is the very condition stamping was added to detect. Joining the
+ * two `undefined` checks with `||` returned "verified" for precisely the shape
+ * that most deserves suspicion.
+ *
+ * Returns `false` when the database itself cannot be stat'd, on either path,
+ * since metadata describing a file that is not there describes nothing.
+ *
+ * The checks are ORDERED by how strong their evidence is, strongest first, and
+ * each later one is reached only because every earlier one had nothing to say.
+ * `provenanceUnknown` therefore comes first: a metadata file whose own writer
+ * says it cannot vouch for the database beside it has settled the question, and
+ * neither the stamp nor the write-order heuristic may overturn that.
+ *
+ * The marker is not decoration. `refreshPreservedBridgeMeta` rewrites this file
+ * atomically without touching the database, which leaves `meta.mtime` newer —
+ * the write order a paired write produces, and the one the unstamped branch
+ * ACCEPTS. Reading the marker after that branch (or not at all) hands back
+ * "verified" for a pair the same code path had just found broken.
+ */
+export async function bridgeMetaMatchesFile(groupDir: string, meta: BridgeMeta): Promise<boolean> {
+  if (meta.provenanceUnknown) return false;
+  const stampedSize = meta.bridgeSize !== undefined;
+  const stampedMtime = meta.bridgeMtimeMs !== undefined;
+  if (!stampedSize && !stampedMtime) return unstampedMetaPairsByWriteOrder(groupDir);
+  if (!stampedSize || !stampedMtime) return false;
+  try {
+    const stat = await fsp.stat(path.join(groupDir, 'bridge.lbug'));
+    return stampMatchesStat(stat, meta);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Could the unstamped `meta.json` plausibly have been written by the sync that
+ * put this `bridge.lbug` beside it?
+ *
+ * `writeBridge` renames the database into place and writes the metadata AFTER,
+ * so `meta.mtime >= db.mtime` holds for any pair written together — including
+ * pairs written by builds from before the stamp existed, which is what makes
+ * this usable as back-compat rather than a repo-wide "re-sync everything".
+ * The only way to reach a database strictly NEWER than the metadata beside it
+ * is a swap whose metadata write did not land: the stale-meta-beside-a-new-
+ * database window, whose completeness `runGroupImpact` would otherwise spend as
+ * fact.
+ *
+ * This is a HEURISTIC ON WRITE ORDER, not proof of provenance. It answers "were
+ * these two written in the order a successful sync writes them?", and treats
+ * that as a proxy for "do these two belong together". It is wrong in two
+ * directions, and neither is theoretical:
+ *   - FALSE ACCEPT, from a non-monotonic wall clock. `mtimeMs` is realtime, not
+ *     monotonic, so an NTP step backwards, a VM snapshot restore or container
+ *     clock skew between the database write and the metadata write can leave a
+ *     genuinely mis-paired set reading as ordered. Anything that touches the
+ *     stale metadata after a swap does the same — a restore from backup, an
+ *     editor save, a copy that preserves only the database's times. The STAMP
+ *     is what actually closes this; a pair that has one never reaches here.
+ *
+ *     Coarse filesystem mtime granularity is NOT this hazard, despite looking
+ *     like it: it collapses a pair written together to equal times, and equal
+ *     is accepted, which is the correct verdict for that pair.
+ *
+ *   - FALSE REJECT, from anything that rewrites the database's mtime after the
+ *     metadata's — `cp -r`, `rsync` without `-t`, a machine move, a restore
+ *     that replays files in directory order. An intact legacy pair is then
+ *     demoted to a lower bound and stays there until the next successful sync
+ *     re-stamps it; there is no other recovery, because nothing on the read
+ *     path can distinguish it from the swap window it is imitating.
+ *
+ *     This direction is the safe one — it degrades an answer to a floor rather
+ *     than vouching for one — but it is a real, reachable cost, not a
+ *     theoretical one, and it is NOT true that the rule can only ever demote
+ *     pairs that were already broken.
+ *
+ * Equality counts as paired. On a filesystem with coarse mtime granularity both
+ * writes land in the same tick, and demanding a strictly newer metadata file
+ * would reject every legacy bridge there for a reason that is about the
+ * filesystem rather than about the bridge.
+ *
+ * A timestamp that cannot be measured is no match, the same convention the
+ * read-only handle cache applies to a bridge it could not stat: a comparison
+ * that could not be made is not a comparison that succeeded.
+ */
+async function unstampedMetaPairsByWriteOrder(groupDir: string): Promise<boolean> {
+  try {
+    const [dbStat, metaStat] = await Promise.all([
+      fsp.stat(path.join(groupDir, 'bridge.lbug')),
+      fsp.stat(path.join(groupDir, 'meta.json')),
+    ]);
+    return metaStat.mtimeMs >= dbStat.mtimeMs;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Read `meta.json`, validating the SHAPE of what it holds.
+ *
+ * The read and the parse have always been guarded — an absent or unparseable
+ * file answers `version: 0`, which every caller already treats as "no
+ * provenance". What was not guarded is a file that parses into something that
+ * is not this shape: `runGroupImpact` spread both repo lists directly into a
+ * `Set`, so a non-iterable there threw a TypeError out of the whole cross-repo
+ * query, from a point where the bridge lease had been taken and not yet
+ * released. A malformed file is a reason to answer "provenance unknown", never
+ * a reason to crash the question.
+ */
 export async function readBridgeMeta(groupDir: string): Promise<BridgeMeta> {
+  const unreadable: BridgeMeta = { version: 0, generatedAt: '', missingRepos: [] };
+  let parsed: unknown;
   try {
     const content = await fsp.readFile(path.join(groupDir, 'meta.json'), 'utf-8');
-    return JSON.parse(content) as BridgeMeta;
+    parsed = JSON.parse(content);
   } catch {
-    return { version: 0, generatedAt: '', missingRepos: [] };
+    return unreadable;
+  }
+  // `JSON.parse` succeeds on `null`, `7` and `[]` too, and none of them are
+  // metadata. Reading `.version` off the first of those is a thrown TypeError;
+  // reading it off the others silently yields `undefined`, which passes the
+  // version gate as if the bridge had been vouched for.
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return unreadable;
+
+  const raw = parsed as Partial<BridgeMeta>;
+  const missingRepos = recordedRepoList(raw.missingRepos);
+  const unreadableRepos = recordedRepoList(raw.unreadableRepos);
+  // Each list is judged on its own: a file whose `unreadableRepos` is garbage
+  // can still carry a `missingRepos` that was genuinely measured, and throwing
+  // that away would turn one unknown into two.
+  const repoListsUnreadable =
+    (raw.missingRepos !== undefined && missingRepos === undefined) ||
+    (raw.unreadableRepos !== undefined && unreadableRepos === undefined);
+
+  const meta: BridgeMeta = {
+    ...raw,
+    // A version that is not a number cannot be compared against
+    // BRIDGE_SCHEMA_VERSION; `0` is this file's existing word for "provenance
+    // unknown", which is exactly what such a file gives us.
+    // `0` is this file's word for "no provenance". A version that is not a
+    // positive integer is not a schema version, and letting one through splits
+    // the four gates that read this field: `ensureBridgeReady` and
+    // `openBridgeDbReadOnly` both compare `> 0 && !== CURRENT` and would open
+    // the bridge, `bridgeExists` compares `=== 0 || === CURRENT` and would say
+    // it is not there, and `bridgeProvenanceUnknown` compares `=== 0` and would
+    // call the answer complete. Normalizing here keeps all four agreeing
+    // instead of teaching each one the same new case.
+    version:
+      Number.isInteger(raw.version) && (raw.version as number) > 0 ? (raw.version as number) : 0,
+    generatedAt: typeof raw.generatedAt === 'string' ? raw.generatedAt : '',
+    missingRepos: missingRepos ?? [],
+  };
+  // Absent, not empty. `unreadableRepos` is optional and "not recorded" is a
+  // distinct state from "measured none", so an unusable value is dropped rather
+  // than carried through — `repoListsUnreadable` is what records that something
+  // was there and could not be read.
+  if (unreadableRepos) meta.unreadableRepos = unreadableRepos;
+  else delete meta.unreadableRepos;
+  // Same absent-vs-empty rule, through the one shared reader.
+  const suppressed = recordedMatchStages(raw.suppressedMatchStages);
+  if (suppressed) meta.suppressedMatchStages = suppressed;
+  else delete meta.suppressedMatchStages;
+  if (repoListsUnreadable) meta.repoListsUnreadable = true;
+  return meta;
+}
+
+/* ------------------------------------------------------------------ */
+/*  refreshPreservedBridgeMeta                                        */
+/* ------------------------------------------------------------------ */
+
+/**
+ * What a refresh did to `meta.json`.
+ *
+ * - `restamped`          — the pair still matched, so the lists were refreshed
+ *                          and the stamp re-taken from the database on disk.
+ * - `provenance-unknown` — the pair did NOT match (or there is no database to
+ *                          match), so the lists were refreshed and the metadata
+ *                          marked as unable to vouch for the file beside it.
+ * - `no-bridge`          — neither `meta.json` nor `bridge.lbug` exists, so
+ *                          there is no pair to keep honest and nothing written.
+ */
+export type PreservedBridgeMetaOutcome = 'restamped' | 'provenance-unknown' | 'no-bridge';
+
+async function fileExists(filePath: string): Promise<boolean> {
+  try {
+    await fsp.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Bring `meta.json`'s diagnostic lists up to date with a sync that PRESERVED
+ * the bridge instead of rebuilding it, without ever making the metadata claim
+ * more about the database than it did before.
+ *
+ * `syncGroup`'s total-failure path keeps the previous run's contracts and
+ * deliberately leaves `bridge.lbug` alone — the contracts that bridge holds are
+ * the ones being preserved. But `runGroupImpact` reads completeness from
+ * `meta.json`, not from `contracts.json`, so leaving the metadata alone too left
+ * the two files telling different stories: the registry said "this sync could
+ * not read svc/users" while a cross-repo query answered "complete, nothing
+ * depends on this" (R4/R6).
+ *
+ * The refresh is the whole difficulty. It rewrites `meta.json` atomically, so
+ * the file's mtime becomes now while the database's stays old — which is the
+ * write order a paired write produces, and precisely what
+ * `unstampedMetaPairsByWriteOrder` accepts. Three rules follow, and each of them
+ * is load-bearing:
+ *
+ *  1. Ask `bridgeMetaMatchesFile` FIRST, on the file as it stands. After the
+ *     write the question is unanswerable, because the write is what destroys
+ *     the evidence.
+ *  2. Re-stamp only when that answer was yes. Re-stamping a pair that already
+ *     failed would MANUFACTURE the provenance the failure just denied — the
+ *     same metadata/database mis-pairing stamping exists to prevent (KTD6).
+ *  3. When it was no, record `provenanceUnknown` explicitly and carry the
+ *     existing stamp fields through verbatim. Writing "no stamp" instead is
+ *     worse, not better: an unstamped file is judged on the two file times,
+ *     and this write has just put them in the accepting order.
+ *
+ * Nothing here opens, reads, or writes the database. The only `stat` of it
+ * happens on the branch where the pair was just verified.
+ *
+ * NOT SPLIT into locked/unlocked halves the way {@link writeBridge} is, and
+ * deliberately. Its one caller is `syncGroup`'s preserve branch, which is
+ * already inside `withGroupSyncLock` — so this write is ALREADY serialized
+ * against every other sync of the group, and taking the lock here would be the
+ * second acquisition of a non-reentrant primitive that the split exists to
+ * avoid. An acquiring wrapper would therefore have zero production callers,
+ * and no test calls this function at all: it would be dead code standing in for
+ * a guarantee the caller already provides. If a caller outside the critical
+ * section ever appears, it needs the same treatment `writeBridge` got — a
+ * wrapper, not a lock moved down here.
+ */
+export async function refreshPreservedBridgeMeta(
+  groupDir: string,
+  // Deliberately NOT `suppressedMatchStages`. This path preserves an EARLIER
+  // sync's database, so stamping it with this run's request would claim the
+  // untouched bridge was built with a flag it never saw. The registry's own
+  // preserve write (`{ ...prior, missingRepos, unreadableRepos }`) omits it for
+  // exactly this reason, and the two artifacts have to agree about which run
+  // they describe.
+  diagnostics: { missingRepos: string[]; unreadableRepos: string[] },
+): Promise<PreservedBridgeMetaOutcome> {
+  const dbPath = path.join(groupDir, 'bridge.lbug');
+  const [metaOnDisk, dbOnDisk] = await Promise.all([
+    fileExists(path.join(groupDir, 'meta.json')),
+    fileExists(dbPath),
+  ]);
+  // Nothing on either side of the pair. `readBridgeMeta` already answers
+  // `version: 0` — provenance unknown — for an absent file, so a file written
+  // here would say what the absence already says while inventing state for a
+  // bridge that has never existed.
+  if (!metaOnDisk && !dbOnDisk) return 'no-bridge';
+
+  const existing = await readBridgeMeta(groupDir);
+  const paired = await bridgeMetaMatchesFile(groupDir, existing);
+
+  const refreshed: BridgeMeta = { ...existing, ...diagnostics };
+  // NEVER PERSISTED (see `BridgeMeta`): both are things a READER computes ABOUT
+  // a file, and this is the first code in the repo that reads metadata and
+  // writes it back. The strip itself now lives in `writeBridgeMeta`, so every
+  // writer inherits it rather than each remembering.
+
+  if (paired) {
+    const stat = await fsp.stat(dbPath).catch(() => null);
+    if (stat) {
+      refreshed.bridgeSize = stat.size;
+      refreshed.bridgeMtimeMs = stat.mtimeMs;
+      await writeBridgeMeta(groupDir, refreshed);
+      return 'restamped';
+    }
+    // The database disappeared between the pairing check and this stat. There
+    // is nothing left to stamp, so fall through and say so rather than write a
+    // stamp describing a file that is gone.
+  }
+
+  refreshed.provenanceUnknown = true;
+  await writeBridgeMeta(groupDir, refreshed);
+  return 'provenance-unknown';
+}
+
+/**
+ * Withdraw the bridge's claim to be complete, without touching the database.
+ *
+ * The one path this exists for: `contracts.json` committed, then the bridge
+ * replacement failed. The old database is still physically usable and still
+ * answers queries, but it now describes an EARLIER sync than the canonical
+ * registry beside it — so `group_contracts` can report a narrowed or advanced
+ * contract set while `group_impact` traverses the old graph and calls its
+ * answer complete. Two public surfaces, contradictory epistemic claims, from
+ * one sync.
+ *
+ * Setting `provenanceUnknown` is the smallest thing that makes that safe:
+ * `bridgeMetaMatchesFile` gives it highest precedence and refuses to vouch for
+ * the pair, so every cross-repo answer downgrades to a floor until a sync
+ * succeeds. Deliberately NOT a re-stamp — the metadata still describes the
+ * database it was written for, and claiming otherwise is the mis-pairing the
+ * preserve path is careful to avoid. Deliberately not a delete either: the
+ * previous graph is better than nothing as long as nobody calls it complete.
+ *
+ * Best-effort by construction. It runs inside a failure handler, so a throw
+ * here would replace a reported bridge failure with an unrelated one.
+ */
+export async function markBridgeProvenanceUnknown(groupDir: string): Promise<boolean> {
+  try {
+    const existing = await readBridgeMeta(groupDir);
+    if (existing.version === 0) return false;
+    await writeBridgeMeta(groupDir, { ...existing, provenanceUnknown: true });
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -322,6 +1025,29 @@ export interface WriteBridgeInput {
   crossLinks: CrossLink[];
   repoSnapshots: Record<string, RepoSnapshot>;
   missingRepos: string[];
+  /**
+   * Repos this sync could not extract from — see
+   * `ContractRegistry.unreadableRepos` for the full definition, which this
+   * field carries unchanged.
+   *
+   * Deliberately not restated here. The narrower wording this once had ("whose
+   * index could not be opened") described one of the two causes and silently
+   * excluded the other, an extractor that threw partway through — so the same
+   * field meant one thing on the registry, another on the bridge input, and a
+   * third on the result. One definition, referenced twice, cannot drift.
+   *
+   * Recorded in meta.json so cross-repo impact can tell "nothing depends on
+   * this" from "we could not look": the bridge built here is missing every
+   * contract those repos own.
+   */
+  unreadableRepos?: string[];
+  /**
+   * Matching stages the sync was asked to skip. Recorded here for the same
+   * reason `unreadableRepos` is: a later cross-repo query reads this bridge
+   * with no access to the run that built it, and a graph narrowed by request
+   * looks exactly like a complete one.
+   */
+  suppressedMatchStages?: MatchType[];
 }
 
 /**
@@ -356,11 +1082,44 @@ function errMessage(err: unknown): string {
   }
 }
 
-export async function writeBridge(
+/**
+ * Rebuild `bridge.lbug` and its `meta.json`, ASSUMING THE CALLER ALREADY HOLDS
+ * THE GROUP SYNC LOCK for `groupDir` (R9).
+ *
+ * PRECONDITION — the group lock is held. There is exactly one production call
+ * site, `syncGroup` in sync.ts, and it is already inside
+ * `withGroupSyncLock(groupDir, …)` when it gets here. Enforced by this comment
+ * rather than by a type, matching `registerRepoUnlocked` / `withRegistryLock`
+ * in repo-manager.ts, which splits the same shape for the same reason.
+ *
+ * WHY THE SPLIT EXISTS AT ALL. The swap this function performs — old database
+ * aside, temp database into place, then `meta.json` written as a SECOND
+ * operation — is the write two concurrent syncs can interleave into a pairing
+ * that never existed: one sync's metadata beside the other's database. That
+ * needs mutual exclusion. But taking the lock HERE would be a second
+ * acquisition of a non-reentrant primitive inside a region that already holds
+ * it, and it would hang every single sync on the happy path, not some rare
+ * interleave. So the exclusion is the caller's, and this function only states
+ * the precondition. {@link writeBridge} is the acquiring wrapper for callers
+ * who are not already inside that region.
+ *
+ * SCOPE — writer-writer only. The reader-side promotion of a leftover
+ * `bridge.lbug.bak` runs on ordinary reads, outside anybody's critical section;
+ * `bridgeMetaMatchesFile` remains the reader's defense there and is not
+ * replaced by this lock.
+ */
+export async function writeBridgeUnlocked(
   groupDir: string,
   input: WriteBridgeInput,
 ): Promise<WriteBridgeReport> {
   await fsp.mkdir(groupDir, { recursive: true });
+
+  // Invalidate the RO cache before writing. On Windows the cached handle
+  // would block the atomic rename (tmp → bridge.lbug) because the OS keeps
+  // a shared-mode lock on the open file. Closing it first guarantees the
+  // rename succeeds without EBUSY.
+  await invalidateBridgeCache(groupDir);
+
   const contracts = dedupeContracts(input.contracts);
   const crossLinks = dedupeCrossLinks(input.crossLinks);
 
@@ -609,11 +1368,42 @@ export async function writeBridge(
     }
     await removeLbugFile(bakPath);
 
-    // 4. Write meta.json
+    // 4. Write the new meta.json, STAMPED WITH THE FILE IT DESCRIBES.
+    //
+    // meta.json carries the bridge's completeness, and since #3011 that is
+    // load-bearing: `runGroupImpact` folds `unreadableRepos ∪ missingRepos`
+    // into its truncation fields. The swap above and this write are two
+    // operations, so a sync that stops between them leaves the previous sync's
+    // meta beside a new database — and reading that as fact is a confidently
+    // wrong answer about the one thing this channel exists to make legible.
+    //
+    // Deleting the old meta before the swap would decide which way that window
+    // fails, but at an unacceptable price: the rename of the old database is
+    // wrapped in a catch that also swallows a FAILED rename (a held read-only
+    // handle does this on Windows), so `writeBridge` can throw with the old,
+    // perfectly good database still in place — and its metadata already gone,
+    // unrecoverably, for as long as the swap keeps failing.
+    //
+    // So destroy nothing and pair the two instead: record the size and mtime of
+    // the database this metadata describes, and let readers check that the pair
+    // still belongs together (`bridgeMetaMatchesFile`). A stale meta cannot match
+    // a freshly renamed database, and a sync that fails before the swap leaves a
+    // matching pair untouched.
+    const finalStat = await fsp.stat(finalPath);
     await writeBridgeMeta(groupDir, {
       version: BRIDGE_SCHEMA_VERSION,
       generatedAt: new Date().toISOString(),
+      bridgeSize: finalStat.size,
+      bridgeMtimeMs: finalStat.mtimeMs,
       missingRepos: input.missingRepos,
+      // Persisted whenever the caller supplied it, `[]` included: an empty list
+      // is the measurement "this sync accounted for every repo", and it is a
+      // different claim from a bridge that never recorded the field. Omitted
+      // only when the caller passed nothing to record.
+      ...(input.unreadableRepos ? { unreadableRepos: input.unreadableRepos } : {}),
+      ...(input.suppressedMatchStages
+        ? { suppressedMatchStages: input.suppressedMatchStages }
+        : {}),
     });
 
     return report;
@@ -629,6 +1419,33 @@ export async function writeBridge(
   }
 }
 
+/**
+ * Rebuild `bridge.lbug` and its `meta.json` as the only writer of `groupDir`.
+ *
+ * The acquiring half of the split described on {@link writeBridgeUnlocked}: for
+ * callers that are NOT already inside the group's critical section, this takes
+ * the group sync lock around the whole swap and releases it afterwards. Two
+ * concurrent calls therefore run one after the other, so the `meta.json` left
+ * on disk is stamped for the `bridge.lbug` left on disk instead of for the
+ * loser's, which is the pairing the swap-plus-metadata sequence would otherwise
+ * let them interleave into.
+ *
+ * NOT used by `syncGroup`, and it must not be: that path already holds this
+ * lock, and `acquireIndexLock` is not reentrant, so routing it here would make
+ * every ordinary sync wait out the full `GROUP_SYNC_LOCK_TIMEOUT_MS` ceiling
+ * against itself. It calls {@link writeBridgeUnlocked} directly.
+ *
+ * Fails closed exactly as `withGroupSyncLock` does: if the lock cannot be
+ * acquired, a `GroupSyncLockError` is thrown and NOTHING is written —
+ * `bridge.lbug` and `meta.json` are left as they were.
+ */
+export async function writeBridge(
+  groupDir: string,
+  input: WriteBridgeInput,
+): Promise<WriteBridgeReport> {
+  return withGroupSyncLock(groupDir, () => writeBridgeUnlocked(groupDir, input));
+}
+
 /* ------------------------------------------------------------------ */
 /*  openBridgeDbReadOnly                                               */
 /* ------------------------------------------------------------------ */
@@ -642,6 +1459,11 @@ export async function writeBridge(
  * 33 ("The process cannot access the file because another process has
  * locked a portion of the file"). Retrying with a small back-off lets the
  * background thread settle and the OS release the handle.
+ *
+ * As of v0.18.0 the "Could not set lock" file-lock error text gained an
+ * appended detail suffix upstream (see `lbug-config.ts`'s
+ * `OPEN_LOCK_RETRY_ATTEMPTS` comment), but the substrings matched here are
+ * unaffected by that change.
  */
 const LBUG_OPEN_RETRY_PATTERNS = [
   'process cannot access the file',
@@ -650,6 +1472,8 @@ const LBUG_OPEN_RETRY_PATTERNS = [
   'lock held by another process',
 ];
 
+// Cross-repo bridge RO open retry. Catalogued as entry 5 of the lbug-config
+// retry-budget registry; caps back-off so total wait ~3s.
 const LBUG_OPEN_RETRY_ATTEMPTS = 10;
 const LBUG_OPEN_RETRY_BASE_MS = 100;
 /** Cap individual back-off delays so the total wait is bounded (~3s). */
@@ -713,7 +1537,12 @@ export async function openBridgeDbReadOnly(groupDir: string): Promise<BridgeHand
       // (where we can retry) instead of on the first user query.
       await handle.db.init();
       await handle.conn.init();
-      return { _db: handle.db, _conn: handle.conn, groupDir } as BridgeHandle;
+      return {
+        _db: handle.db,
+        _conn: handle.conn,
+        groupDir,
+        _readOnly: true,
+      } as BridgeHandle;
     } catch (err) {
       lastErr = err;
       if (handle) await closeLbugConnection(handle);
@@ -730,7 +1559,11 @@ export async function openBridgeDbReadOnly(groupDir: string): Promise<BridgeHand
   const safeErrMsg =
     lastErr instanceof Error ? String(lastErr.message).replace(/[\r\n]/g, ' ') : undefined;
   bridgeLogger.debug(
-    { groupDir: safeGroupDir, errMsg: safeErrMsg, attempts: LBUG_OPEN_RETRY_ATTEMPTS },
+    {
+      groupDir: safeGroupDir,
+      errMsg: safeErrMsg,
+      attempts: LBUG_OPEN_RETRY_ATTEMPTS,
+    },
     'openBridgeDbReadOnly gave up',
   );
   return null;

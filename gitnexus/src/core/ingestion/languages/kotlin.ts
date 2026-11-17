@@ -8,27 +8,52 @@
  */
 
 import { SupportedLanguages } from 'gitnexus-shared';
+import { kotlinRenameProvider } from './kotlin/rename.js';
 import { createClassExtractor } from '../class-extractors/generic.js';
 import { kotlinClassConfig } from '../class-extractors/configs/jvm.js';
 import { defineLanguage } from '../language-provider.js';
+import { createLeadingDocDescriptionExtractor } from '../utils/ast-helpers.js';
+import { assertCloneable } from '../workers/clone-safety.js';
 import { kotlinTypeConfig } from '../type-extractors/jvm.js';
 import { kotlinExportChecker } from '../export-detection.js';
-import { createImportResolver } from '../import-resolvers/resolver-factory.js';
-import { kotlinImportConfig } from '../import-resolvers/configs/jvm.js';
-import { extractKotlinNamedBindings } from '../named-bindings/kotlin.js';
-import { appendKotlinWildcard } from '../import-resolvers/jvm.js';
+import { appendKotlinWildcard } from './kotlin/import-wildcard.js';
 import { KOTLIN_QUERIES } from '../tree-sitter-queries.js';
 import type { AstFrameworkPatternConfig } from '../language-provider.js';
 import type { SyntaxNode } from '../utils/ast-helpers.js';
 import { createCallExtractor } from '../call-extractors/generic.js';
 import { kotlinCallConfig } from '../call-extractors/configs/jvm.js';
+import { createKotlinCfgVisitor } from '../cfg/visitors/kotlin.js';
+import {
+  getKotlinSpringMessageProducerFacts,
+  getKotlinSpringNonHttpHandlerFacts,
+} from './kotlin/capture-side-channel.js';
 import { createFieldExtractor } from '../field-extractors/generic.js';
 import { kotlinConfig } from '../field-extractors/configs/jvm.js';
 import { createMethodExtractor } from '../method-extractors/generic.js';
 import { kotlinMethodConfig } from '../method-extractors/configs/jvm.js';
 import { createVariableExtractor } from '../variable-extractors/generic.js';
 import { kotlinVariableConfig } from '../variable-extractors/configs/jvm.js';
-import { createHeritageExtractor } from '../heritage-extractors/generic.js';
+import {
+  collectKotlinCaptureSideChannel,
+  emitKotlinScopeCaptures,
+  interpretKotlinImport,
+  interpretKotlinTypeBinding,
+  kotlinArityCompatibility,
+  kotlinBindingScopeFor,
+  kotlinImportOwningScope,
+  kotlinMergeBindings,
+  kotlinReceiverBinding,
+} from './kotlin/index.js';
+import { synthesizeLombokAccessors } from './kotlin/lombok-synthesizer.js';
+import {
+  extractKotlinRuntimeSymbolProperties,
+  kotlinRuntimeSymbolStrategy,
+} from './kotlin/spring-actuator.js';
+import { extractKotlinSpringRoutes } from '../route-extractors/kotlin-spring.js';
+import {
+  extractKotlinModuleConstants,
+  foldKotlinOperands,
+} from '../route-extractors/kotlin-const-resolver.js';
 
 /** Check if a Kotlin function_declaration capture is inside a class_body (i.e., a method).
  *  Kotlin grammar uses function_declaration for both top-level functions and class methods.
@@ -103,7 +128,24 @@ const BUILT_INS: ReadonlySet<string> = new Set([
   'step',
 ]);
 
+/**
+ * Program-boundary names for `LanguageProvider.externalReceiverNames`.
+ *
+ * `System` is `java.lang.System`, which Kotlin/JVM imports by default, so
+ * `System.out.println(...)` reaches the JDK. `java` and `kotlin` are package
+ * roots no program can declare into — the JVM refuses `java.*`, and the
+ * compiler reserves `kotlin.*` for the standard library — so a fully qualified
+ * `java.util.UUID.randomUUID()` is rooted outside too. A name counts only where
+ * the program binds nothing by it, so an `object System` still wins.
+ */
+const EXTERNAL_RECEIVER_NAMES: ReadonlySet<string> = new Set(['System', 'java', 'kotlin']);
+
+/** Imports from those same reserved roots can never resolve in-workspace. */
+const isKotlinPlatformModule = (specifier: string): boolean =>
+  /^(?:java|kotlin)(?:\.|$)/.test(specifier);
+
 export const kotlinProvider = defineLanguage({
+  rename: kotlinRenameProvider,
   id: SupportedLanguages.Kotlin,
   extensions: ['.kt', '.kts'],
   entryPointPatterns: [
@@ -150,8 +192,6 @@ export const kotlinProvider = defineLanguage({
   treeSitterQueries: KOTLIN_QUERIES,
   typeConfig: kotlinTypeConfig,
   exportChecker: kotlinExportChecker,
-  importResolver: createImportResolver(kotlinImportConfig),
-  namedBindingExtractor: extractKotlinNamedBindings,
   importPathPreprocessor: appendKotlinWildcard,
   mroStrategy: 'implements-split',
   callExtractor: createCallExtractor(kotlinCallConfig),
@@ -159,11 +199,59 @@ export const kotlinProvider = defineLanguage({
   methodExtractor: createMethodExtractor(kotlinMethodConfig),
   variableExtractor: createVariableExtractor(kotlinVariableConfig),
   classExtractor: createClassExtractor(kotlinClassConfig),
-  heritageExtractor: createHeritageExtractor(SupportedLanguages.Kotlin),
   builtInNames: BUILT_INS,
+  externalReceiverNames: EXTERNAL_RECEIVER_NAMES,
+  isExternalModuleSpecifier: isKotlinPlatformModule,
+
+  // ── KDoc → description (issue #2270) ──
+  descriptionExtractor: createLeadingDocDescriptionExtractor(),
+  definitionPropertiesExtractor: extractKotlinRuntimeSymbolProperties,
+  runtimeSymbolStrategy: kotlinRuntimeSymbolStrategy,
+
   labelOverride: (functionNode, defaultLabel) => {
     if (defaultLabel !== 'Function') return defaultLabel;
     if (isKotlinClassMethod(functionNode)) return 'Method';
     return defaultLabel;
   },
+
+  // ── RFC #909 Ring 3: scope-based resolution hooks ──
+  emitScopeCaptures: emitKotlinScopeCaptures,
+  // ── #2195 PDG layer: Kotlin CFG visitor (vendored grammar) ──
+  cfgVisitor: createKotlinCfgVisitor(),
+  // Worker-side: snapshot companion-scope marks, package visibility, class
+  // annotations, and Spring DI facts `emitKotlinScopeCaptures` just populated
+  // into plain data on `ParsedFile.captureSideChannel`, so the main thread can
+  // restore them via `applyCaptureSideChannel` WITHOUT a re-parse (#1983). See
+  // `kotlin/capture-side-channel.ts`.
+  // `assertCloneable` is a runtime identity; it makes a future non-serializable
+  // value in the side-channel payload a compile error here, at the source, rather
+  // than a DataCloneError at the worker boundary (#2143).
+  collectCaptureSideChannel: (filePath) =>
+    assertCloneable(collectKotlinCaptureSideChannel(filePath)),
+  interpretImport: interpretKotlinImport,
+  interpretTypeBinding: interpretKotlinTypeBinding,
+  bindingScopeFor: kotlinBindingScopeFor,
+  importOwningScope: kotlinImportOwningScope,
+  mergeBindings: (_scope, bindings) => kotlinMergeBindings(bindings),
+  receiverBinding: kotlinReceiverBinding,
+  arityCompatibility: kotlinArityCompatibility,
+  synthesizeStructureMembers: synthesizeLombokAccessors,
+
+  // ── Spring decorator routes + composed path constants (#3130) ──
+  extractDecoratorRoutes: extractKotlinSpringRoutes,
+  extractModuleConstants: extractKotlinModuleConstants,
+  foldRoutePathOperands: foldKotlinOperands,
+
+  // Async messaging facts for the `springDestinations` phase. Both stores are
+  // repopulated on the main thread by `applyKotlinCaptureSideChannel`, so this
+  // answers for cache hits and misses alike.
+  getSpringMessagingFacts: (filePath) => ({
+    handlers: getKotlinSpringNonHttpHandlerFacts(filePath),
+    producers: getKotlinSpringMessageProducerFacts(filePath),
+  }),
+  // Kotlin string literals interpolate: `"orders-$env"` and `"orders-${env}"`
+  // are string templates, and a Spring property placeholder has to escape the
+  // dollar (`"\${app.topic}"`). Destination resolution needs this to keep a
+  // runtime template out of the address namespace.
+  interpolatesStringLiterals: true,
 });

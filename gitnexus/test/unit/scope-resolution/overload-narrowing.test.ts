@@ -27,6 +27,37 @@ describe('narrowOverloadCandidates — empty input', () => {
   });
 });
 
+describe('narrowOverloadCandidates — definitive block declaration conversions', () => {
+  const prototype = mkDef({
+    nodeId: 'record:int',
+    type: 'Function',
+    parameterCount: 1,
+    requiredParameterCount: 1,
+    parameterTypes: ['int'],
+  });
+  const conversionRankFn = (argument: string, parameter: string) =>
+    argument === parameter ? 0 : Number.POSITIVE_INFINITY;
+
+  it('rejects a known incompatible local prototype only when requested', () => {
+    expect(narrowOverloadCandidates([prototype], 1, ['Event'], { conversionRankFn })).toEqual([
+      prototype,
+    ]);
+    expect(
+      narrowOverloadCandidates([prototype], 1, ['Event'], {
+        conversionRankFn,
+        incompatibleConversionsAreFinal: true,
+      }),
+    ).toEqual([]);
+  });
+
+  it('preserves candidates when argument or parameter metadata is unknown', () => {
+    const unknown = { ...prototype, parameterTypes: undefined };
+    const hooks = { conversionRankFn, incompatibleConversionsAreFinal: true };
+    expect(narrowOverloadCandidates([prototype], 1, [''], hooks)).toEqual([prototype]);
+    expect(narrowOverloadCandidates([unknown], 1, ['Event'], hooks)).toEqual([unknown]);
+  });
+});
+
 describe('narrowOverloadCandidates — arity filtering', () => {
   const add1 = mkDef({ nodeId: 'add:1', parameterCount: 1, requiredParameterCount: 1 });
   const add2 = mkDef({ nodeId: 'add:2', parameterCount: 2, requiredParameterCount: 2 });
@@ -69,11 +100,26 @@ describe('narrowOverloadCandidates — arity filtering', () => {
     expect(result.map((d) => d.nodeId)).toEqual(['v:1']);
   });
 
-  it('falls back to the full overload list when arity filter empties it', () => {
+  it('returns empty when arity filter empties the set AND every candidate had definite bounds', () => {
     // argCount=5 doesn't match any overload (none variadic, all have max < 5).
+    // Post-commit af9af4a9 (PR #1497 / U1): the empty result is now authoritative
+    // because every rejected candidate had defined `parameterCount` /
+    // `requiredParameterCount`. The old "always fall back to full list" rescue
+    // was deliberately removed so resolvers actually drop calls that are
+    // definitively arity-incompatible (e.g., PHP `f(int $req, ...$rest)`
+    // called with zero args).
     const result = narrowOverloadCandidates([add1, add2, add3], 5, undefined);
-    expect(result.map((d) => d.nodeId)).toEqual(['add:1', 'add:2', 'add:3']);
+    expect(result.map((d) => d.nodeId)).toEqual([]);
   });
+
+  // Note: the `anyUnknownBounds ? overloads : []` branch in
+  // narrowOverloadCandidates is structurally unreachable in this caller's
+  // shape — a candidate with both `parameterCount` and `requiredParameterCount`
+  // undefined always passes the arity filter (neither `argCount > max` nor
+  // `argCount < min` can fire), so `arityMatches.length` is always > 0
+  // whenever `anyUnknownBounds` is true. The branch is preserved in the
+  // source as a defensive guard for future refactors that might add
+  // additional rejection criteria in the filter.
 });
 
 describe('narrowOverloadCandidates — type narrowing', () => {
@@ -101,6 +147,56 @@ describe('narrowOverloadCandidates — type narrowing', () => {
     expect(result.map((d) => d.nodeId).sort()).toEqual(['m:int', 'm:string']);
   });
 
+  it('retains an unknown parameter slot alongside an exact typed match', () => {
+    const unknown = { ...byInt, nodeId: 'm:unknown', parameterTypes: [''] };
+    const result = narrowOverloadCandidates([byInt, unknown, byString], 1, ['int']);
+    expect(result.map((d) => d.nodeId)).toEqual(['m:int', 'm:unknown']);
+  });
+
+  it('does not let an unknown parameter slot hide a viable conversion overload', () => {
+    const unknown = { ...byInt, nodeId: 'm:unknown', parameterTypes: [''] };
+    const byLong = { ...byInt, nodeId: 'm:long', parameterTypes: ['long'] };
+    const result = narrowOverloadCandidates([unknown, byLong], 1, ['int'], {
+      conversionRankFn: (argument, parameter) =>
+        argument === parameter ? 0 : argument === 'int' && parameter === 'long' ? 1 : Infinity,
+    });
+    expect(result.map((d) => d.nodeId)).toEqual(['m:unknown', 'm:long']);
+  });
+
+  it('keeps exact known-slot requirements when an exact overload exists', () => {
+    const exact = mkDef({
+      nodeId: 'm:exact',
+      parameterCount: 2,
+      requiredParameterCount: 2,
+      parameterTypes: ['int', 'long'],
+    });
+    const partial = { ...exact, nodeId: 'm:partial', parameterTypes: ['', 'double'] };
+    const result = narrowOverloadCandidates([exact, partial], 2, ['int', 'long'], {
+      conversionRankFn: (argument, parameter) =>
+        argument === parameter ? 0 : argument === 'long' && parameter === 'double' ? 1 : Infinity,
+    });
+    expect(result.map((d) => d.nodeId)).toEqual(['m:exact']);
+  });
+
+  it.each([
+    { parameterTypes: ['', 'bool'], expected: ['m:exact', 'm:partial'] },
+    { parameterTypes: ['', 'string'], expected: ['m:exact'] },
+    { parameterTypes: ['string', ''], expected: ['m:exact'] },
+  ])(
+    'keeps positional unknown slots without ignoring known mismatches: $parameterTypes',
+    ({ parameterTypes, expected }) => {
+      const exact = mkDef({
+        nodeId: 'm:exact',
+        parameterCount: 2,
+        requiredParameterCount: 2,
+        parameterTypes: ['int', 'bool'],
+      });
+      const partial = { ...exact, nodeId: 'm:partial', parameterTypes };
+      const result = narrowOverloadCandidates([exact, partial], 2, ['int', 'bool']);
+      expect(result.map((d) => d.nodeId)).toEqual(expected);
+    },
+  );
+
   it('falls through to arity-filtered candidates when type filter matches nothing', () => {
     const result = narrowOverloadCandidates([byInt, byString], 1, ['bool']);
     // Type mismatch against both — falls back to arity candidates.
@@ -125,5 +221,62 @@ describe('narrowOverloadCandidates — type narrowing', () => {
     });
     const result = narrowOverloadCandidates([byInt, noTypes], 1, ['int']);
     expect(result.map((d) => d.nodeId)).toEqual(['m:int']);
+  });
+});
+
+describe('narrowOverloadCandidates — constraint filter monotonicity (issue #1579)', () => {
+  // Language-agnostic contract: when `constraintCompatibility` returns
+  // 'unknown' for every candidate, the filter must keep every candidate.
+  // Adding a predicate to the registry can only narrow correctly, never
+  // produce a wrong edge — this guarantees the worst-case behavior is
+  // today's "degrade not lie" suppression, not a regression.
+  const a = mkDef({
+    nodeId: 'a',
+    parameterCount: 1,
+    requiredParameterCount: 1,
+    parameterTypes: ['T'],
+    templateConstraints: { dummy: true },
+  });
+  const b = mkDef({
+    nodeId: 'b',
+    parameterCount: 1,
+    requiredParameterCount: 1,
+    parameterTypes: ['T'],
+    templateConstraints: { dummy: true },
+  });
+
+  it('keeps every candidate when constraintCompatibility returns unknown for all', () => {
+    const result = narrowOverloadCandidates([a, b], 1, ['int'], {
+      constraintCompatibility: () => 'unknown',
+    });
+    expect(result.map((d) => d.nodeId).sort()).toEqual(['a', 'b']);
+  });
+
+  it('drops only candidates the hook explicitly marks incompatible', () => {
+    const result = narrowOverloadCandidates([a, b], 1, ['int'], {
+      constraintCompatibility: (_callsite, def) =>
+        def.nodeId === 'a' ? 'incompatible' : 'compatible',
+    });
+    expect(result.map((d) => d.nodeId)).toEqual(['b']);
+  });
+
+  it('skips the constraint filter when hookCtx is omitted (pre-#1579 behavior preserved)', () => {
+    const result = narrowOverloadCandidates([a, b], 1, ['int']);
+    expect(result.map((d) => d.nodeId).sort()).toEqual(['a', 'b']);
+  });
+
+  it('skips the constraint filter for candidates without templateConstraints', () => {
+    const plain = mkDef({
+      nodeId: 'plain',
+      parameterCount: 1,
+      requiredParameterCount: 1,
+      parameterTypes: ['T'],
+    });
+    // Even though the hook would return 'incompatible' for everything, the
+    // candidate has no templateConstraints so the filter doesn't consult it.
+    const result = narrowOverloadCandidates([plain], 1, ['int'], {
+      constraintCompatibility: () => 'incompatible',
+    });
+    expect(result.map((d) => d.nodeId)).toEqual(['plain']);
   });
 });

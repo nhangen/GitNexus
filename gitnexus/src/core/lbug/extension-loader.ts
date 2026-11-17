@@ -1,7 +1,29 @@
 import { spawn } from 'child_process';
 import { fileURLToPath } from 'node:url';
 import { LBUG_MAX_DB_SIZE } from './lbug-config.js';
+import { escapeCypherString } from './cypher-escape.js';
+import {
+  diagnoseExtensionLoad,
+  extractExtensionPath,
+  type ExtensionLoadDiagnosis,
+} from './extension-load-error.js';
+import {
+  defaultVendorRoot,
+  isUnsupportedFtsTuple,
+  nodePlatformTuple,
+  resolveFtsVersionPair,
+  resolveVendoredFtsPath,
+  resolveVendoredVectorPath,
+} from './vendored-extension-path.js';
 import { logger } from '../logger.js';
+
+export type ExtensionAttemptSource = 'vendored' | 'named' | 'install';
+
+/** Structured load attempt — source and tuple labels only, never a path. */
+export interface ExtensionLoadAttempt {
+  source: ExtensionAttemptSource;
+  tuple?: string;
+}
 
 const DEFAULT_EXTENSION_INSTALL_TIMEOUT_MS = 15_000;
 const EXTENSION_NAME_PATTERN = /^[A-Za-z][A-Za-z0-9_]*$/;
@@ -30,18 +52,46 @@ export interface ExtensionCapability {
   loaded: boolean;
   /** Human-readable reason when `loaded` is false. */
   reason?: string;
+  /**
+   * Classified diagnosis of `reason`, computed ONCE at mark-unavailable time so
+   * per-request surfaces (ftsDegradedWarning on /api/search + MCP query) read the
+   * cached remedy instead of re-inspecting the extension file on every call (#2383 F3).
+   */
+  diagnosis?: ExtensionLoadDiagnosis;
+  /** What this ensure() tried, labels only (KTD7). */
+  attempts?: ExtensionLoadAttempt[];
 }
 
 /** Per-call overrides applied on top of `ExtensionManager` defaults. */
 export interface ExtensionEnsureOptions {
   policy?: ExtensionInstallPolicy;
   installTimeoutMs?: number;
+  /**
+   * Speculative probe: log an unavailable outcome at debug level instead of
+   * warn, and do not consume the once-per-(extension, reason) warn budget.
+   *
+   * Set only by callers that do NOT own the extension's lifecycle and know a
+   * later owner will retry with an install-capable policy — currently the
+   * writable `initLbug` pre-load, whose miss on a cold cache is expected and
+   * is fixed moments later by analyze Phase 3. Never set it on a path where
+   * the failure is the final answer (serve/MCP read paths), or a real
+   * degradation goes unreported.
+   */
+  quiet?: boolean;
+  /** Injected vendor tree for tests / e2e. Never an attacker-controlled env. */
+  vendorRoot?: string;
+  /** Injected Node platform tuple (`linux-x64`). Defaults to this process. */
+  platformTuple?: string;
 }
 
 export interface ExtensionManagerOptions {
   policy?: ExtensionInstallPolicy;
   installTimeoutMs?: number;
-  installExtension?: (extensionName: string, timeoutMs: number) => Promise<ExtensionInstallResult>;
+  installExtension?: (
+    extensionName: string,
+    timeoutMs: number,
+    loadError?: string,
+  ) => Promise<ExtensionInstallResult>;
   warn?: (message: string) => void;
 }
 
@@ -50,7 +100,32 @@ const alreadyAvailable = (message: string): boolean =>
   message.includes('already installed') ||
   message.includes('already exists');
 
+/** LadybugDB errors are multi-line; collapse for single-line warn/reason strings. */
+const oneLine = (value: string): string => value.replace(/\s+/g, ' ').trim();
+
 const resolvePolicyFromEnv = (): ExtensionInstallPolicy => {
+  const raw = process.env.GITNEXUS_LBUG_EXTENSION_INSTALL;
+  if (raw === 'load-only' || raw === 'never' || raw === 'auto') return raw;
+  return 'load-only';
+};
+
+export const getExtensionInstallPolicy = (): ExtensionInstallPolicy => resolvePolicyFromEnv();
+
+/**
+ * Install policy for the **analyze (write) path**.
+ *
+ * The global default (`resolvePolicyFromEnv`) is `load-only` so serve/query
+ * read paths never require outbound network access (PR #1161, offline-first).
+ * The analyze path is different: it owns building the search indexes, so it
+ * defaults to `auto` — LOAD the extension if present, otherwise attempt one
+ * bounded out-of-process INSTALL. This keeps FTS symmetric with the
+ * VECTOR/embeddings path (which already defaults to `auto`) and matches the
+ * #726 contract. An explicit `GITNEXUS_LBUG_EXTENSION_INSTALL` value still
+ * wins, so operators can force `load-only`/`never` for fully offline analyze;
+ * `auto` LOADs-first, so offline machines still degrade gracefully when the
+ * INSTALL cannot reach the network.
+ */
+export const resolveAnalyzeInstallPolicy = (): ExtensionInstallPolicy => {
   const raw = process.env.GITNEXUS_LBUG_EXTENSION_INSTALL;
   if (raw === 'load-only' || raw === 'never' || raw === 'auto') return raw;
   return 'auto';
@@ -81,6 +156,7 @@ export const getExtensionInstallChildProcessArgs = (
 export const installDuckDbExtensionOutOfProcess = async (
   extensionName: string,
   timeoutMs: number = getExtensionInstallTimeoutMs(),
+  loadError?: string,
 ): Promise<ExtensionInstallResult> => {
   if (!EXTENSION_NAME_PATTERN.test(extensionName)) {
     throw new Error(`Invalid DuckDB extension name: ${extensionName}`);
@@ -91,6 +167,9 @@ export const installDuckDbExtensionOutOfProcess = async (
       env: {
         ...process.env,
         GITNEXUS_LBUG_EXTENSION_NAME: extensionName,
+        // The child picks INSTALL vs FORCE INSTALL from this LOAD error so it
+        // only re-downloads when the on-disk extension file is actually broken.
+        ...(loadError ? { GITNEXUS_LBUG_EXTENSION_LOAD_ERROR: loadError } : {}),
       },
       stdio: ['ignore', 'ignore', 'pipe'],
       windowsHide: true,
@@ -110,7 +189,7 @@ export const installDuckDbExtensionOutOfProcess = async (
       resolve({
         success: false,
         timedOut: true,
-        message: `INSTALL ${extensionName} timed out after ${timeoutMs}ms`,
+        message: `extension install for ${extensionName} timed out after ${timeoutMs}ms`,
       });
     }, timeoutMs);
 
@@ -130,8 +209,8 @@ export const installDuckDbExtensionOutOfProcess = async (
         timedOut: false,
         message:
           code === 0
-            ? `INSTALL ${extensionName} completed`
-            : `INSTALL ${extensionName} failed with ${signal ?? `exit code ${code}`}${stderr ? `: ${stderr.trim()}` : ''}`,
+            ? `extension install for ${extensionName} completed`
+            : `extension install for ${extensionName} failed with ${signal ?? `exit code ${code}`}${stderr ? `: ${stderr.trim()}` : ''}`,
       });
     });
   });
@@ -140,15 +219,16 @@ export const installDuckDbExtensionOutOfProcess = async (
 /**
  * Centralized lifecycle manager for optional LadybugDB extensions.
  *
- * Always tries `LOAD EXTENSION <name>` first — it is per-connection,
- * idempotent, and never touches the network. If `LOAD` fails and the active
- * policy permits, the manager runs a single bounded out-of-process `INSTALL`
- * attempt per process and retries `LOAD`. Capability outcomes are cached so
- * unavailable extensions degrade search features without ever blocking
- * subsequent analyze or query calls.
+ * Tries `LOAD` first — it is per-connection, idempotent, and never
+ * touches the network. For FTS and VECTOR, a packaged vendored path is
+ * path-LOADed before the named `LOAD EXTENSION`. If `LOAD` fails and the active
+ * policy permits, the manager runs a single bounded out-of-process
+ * `INSTALL` attempt per process and retries `LOAD`. Capability outcomes
+ * are cached so unavailable extensions degrade search features without
+ * ever blocking subsequent analyze or query calls.
  *
  * Policy precedence (most specific wins):
- *   per-call `opts.policy` → constructor `options.policy` → env → `auto`
+ *   per-call `opts.policy` → constructor `options.policy` → env → `load-only`
  */
 export class ExtensionManager {
   private readonly capabilities = new Map<string, ExtensionCapability>();
@@ -190,55 +270,176 @@ export class ExtensionManager {
     const timeoutMs =
       opts.installTimeoutMs ?? this.options.installTimeoutMs ?? getExtensionInstallTimeoutMs();
     const warn = this.options.warn ?? ((msg: string) => logger.warn(msg));
+    const quiet = opts.quiet === true;
+
+    const attempts: ExtensionLoadAttempt[] = [];
+    let lastInspectPath: string | null = null;
+    const versionsFor = (inspectPath: string | null) =>
+      name === 'fts' ? resolveFtsVersionPair(inspectPath, opts.vendorRoot) : undefined;
 
     if (policy === 'never') {
-      this.markUnavailable(name, label, 'extension install policy is "never"', warn);
+      this.markUnavailable(
+        name,
+        label,
+        'extension install policy is "never"',
+        warn,
+        quiet,
+        attempts,
+        null,
+      );
       return false;
     }
 
-    if (await this.tryLoad(query, name)) {
-      this.markLoaded(name);
+    const isVector = name.toLowerCase() === 'vector';
+    if (name === 'fts' || isVector) {
+      const tuple = opts.platformTuple ?? nodePlatformTuple();
+      const vendorRoot = opts.vendorRoot ?? defaultVendorRoot();
+      const vendored = isVector
+        ? resolveVendoredVectorPath({ vendorRoot, tuple })
+        : resolveVendoredFtsPath({ vendorRoot, tuple });
+      if (vendored) {
+        attempts.push({ source: 'vendored', tuple });
+        const vendoredError = await this.tryLoadPath(query, vendored);
+        if (vendoredError === null) {
+          this.markLoaded(name, attempts);
+          return true;
+        }
+        lastInspectPath = vendored;
+      } else if (name === 'fts' && isUnsupportedFtsTuple(tuple, vendorRoot)) {
+        attempts.push({ source: 'vendored', tuple });
+        this.markUnavailable(
+          name,
+          label,
+          this.composeReason(`no packaged FTS artifact for ${tuple}`, attempts),
+          warn,
+          quiet,
+          attempts,
+          null,
+        );
+        return false;
+      }
+    }
+
+    attempts.push({ source: 'named' });
+    const loadError = await this.tryLoad(query, name);
+    if (loadError === null) {
+      this.markLoaded(name, attempts);
       return true;
     }
+    const namedPath = extractExtensionPath(loadError);
+    if (namedPath) lastInspectPath = namedPath;
 
     if (policy === 'load-only') {
-      this.markUnavailable(name, label, 'load-only policy: extension not pre-installed', warn);
+      this.markUnavailable(
+        name,
+        label,
+        this.composeReason(
+          `load-only policy (no install attempted); LOAD ${name} failed: ${loadError}`,
+          attempts,
+        ),
+        warn,
+        quiet,
+        attempts,
+        lastInspectPath,
+        versionsFor(lastInspectPath),
+      );
       return false;
     }
 
+    attempts.push({ source: 'install' });
     let install = this.installAttempted.get(name);
     if (!install) {
       const installFn = this.options.installExtension ?? installDuckDbExtensionOutOfProcess;
-      install = await installFn(name, timeoutMs);
+      // Hand the child the LOAD error so it re-downloads (FORCE) only when the
+      // present extension file is provably broken, not on every LOAD failure.
+      install = await installFn(name, timeoutMs, loadError);
       this.installAttempted.set(name, install);
     }
 
     if (!install.success) {
-      this.markUnavailable(name, label, install.message, warn);
+      this.markUnavailable(
+        name,
+        label,
+        this.composeReason(`${install.message}; LOAD ${name} had failed: ${loadError}`, attempts),
+        warn,
+        quiet,
+        attempts,
+        lastInspectPath,
+        versionsFor(lastInspectPath),
+      );
       return false;
     }
 
-    if (await this.tryLoad(query, name)) {
-      this.markLoaded(name);
+    const retryError = await this.tryLoad(query, name);
+    if (retryError === null) {
+      this.markLoaded(name, attempts);
       return true;
     }
 
-    this.markUnavailable(name, label, `LOAD ${name} failed after successful INSTALL`, warn);
+    this.markUnavailable(
+      name,
+      label,
+      this.composeReason(`LOAD ${name} failed after successful INSTALL: ${retryError}`, attempts),
+      warn,
+      quiet,
+      attempts,
+      extractExtensionPath(retryError),
+      versionsFor(extractExtensionPath(retryError)),
+    );
     return false;
   }
 
-  private async tryLoad(query: (sql: string) => Promise<unknown>, name: string): Promise<boolean> {
+  /**
+   * Attempt `LOAD EXTENSION <name>`; returns `null` on success and the
+   * collapsed error message on failure. The message is the load-side ground
+   * truth — LadybugDB distinguishes a missing extension file from a present
+   * but unloadable one (wrong platform, truncated download, version mismatch),
+   * and discarding it left users staring at "not pre-installed" when the file
+   * existed all along (#2374).
+   */
+  private async tryLoad(
+    query: (sql: string) => Promise<unknown>,
+    name: string,
+  ): Promise<string | null> {
     try {
       await query(`LOAD EXTENSION ${name}`);
-      return true;
+      return null;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      return alreadyAvailable(msg);
+      return alreadyAvailable(msg) ? null : oneLine(msg);
     }
   }
 
-  private markLoaded(name: string): void {
-    this.capabilities.set(name, { name, loaded: true });
+  private async tryLoadPath(
+    query: (sql: string) => Promise<unknown>,
+    absPath: string,
+  ): Promise<string | null> {
+    try {
+      await query(`LOAD EXTENSION '${escapeCypherString(absPath)}'`);
+      return null;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return alreadyAvailable(msg) ? null : oneLine(msg);
+    }
+  }
+
+  private composeReason(base: string, attempts: ExtensionLoadAttempt[]): string {
+    if (!attempts.some((attempt) => attempt.source === 'vendored')) return base;
+    const trail = attempts
+      .map((attempt) =>
+        attempt.source === 'vendored' ? `vendored ${attempt.tuple}` : attempt.source,
+      )
+      .join(', ');
+    return `${base} (attempts: ${trail})`;
+  }
+
+  private markLoaded(name: string, attempts: ExtensionLoadAttempt[] = []): void {
+    const record = attempts.some((attempt) => attempt.source === 'vendored') ? attempts : undefined;
+    this.capabilities.set(name, {
+      name,
+      loaded: true,
+      ...(record ? { attempts: record } : {}),
+    });
   }
 
   private markUnavailable(
@@ -246,14 +447,32 @@ export class ExtensionManager {
     label: string,
     reason: string,
     warn: (message: string) => void,
+    quiet = false,
+    attempts: ExtensionLoadAttempt[] = [],
+    inspectPath: string | null = null,
+    versions?: { expected?: string; found?: string },
   ): void {
-    this.capabilities.set(name, { name, loaded: false, reason });
+    // Classify once here (the single load-failure sink, run per Database not per
+    // request) so the hot per-request warning path does no file I/O (#2383 F3).
+    // Diagnose the LAST attempt's file, never a path scraped from concatenated text.
+    this.capabilities.set(name, {
+      name,
+      loaded: false,
+      reason,
+      attempts,
+      diagnosis: diagnoseExtensionLoad(reason, label, inspectPath, versions),
+    });
+    const message = `GitNexus: ${label} extension unavailable; continuing without ${label} features. ${reason}`;
+    // A quiet probe must not register the dedup key: the owning caller may hit
+    // the identical reason later, and that one is the real degradation report.
+    if (quiet) {
+      logger.debug(message);
+      return;
+    }
     const key = `${name}:${reason}`;
     if (this.warnedKeys.has(key)) return;
     this.warnedKeys.add(key);
-    warn(
-      `GitNexus: ${label} extension unavailable; continuing without ${label} features. ${reason}`,
-    );
+    warn(message);
   }
 }
 
@@ -263,6 +482,27 @@ export const extensionManager = new ExtensionManager();
 /** Snapshot of which optional DuckDB extensions are loaded in this process. */
 export const getExtensionCapabilities = (): ExtensionCapability[] =>
   extensionManager.getCapabilities();
+
+/**
+ * One optional extension's capability record, or `undefined` when nothing in
+ * this process has resolved it yet.
+ *
+ * `getExtensionCapabilities().find((c) => c.name === …)` was spelled out at five
+ * call sites across four modules (#2841 review), each re-deriving the same
+ * lookup — and each free to drift on the extension NAME, which is the one string
+ * the lookup is keyed on. Keep the name in one place.
+ */
+export const getExtensionCapability = (name: string): ExtensionCapability | undefined =>
+  getExtensionCapabilities().find((c) => c.name === name);
+
+/**
+ * {@link getExtensionCapability} for the FTS extension — the only extension
+ * whose capability record is read outside this module (degrade warnings, the
+ * `--repair-fts` reporting path, and `dropFTSIndex`'s remedy lookup), so the
+ * `'fts'` spelling itself lives here rather than at each of them.
+ */
+export const getFtsCapability = (): ExtensionCapability | undefined =>
+  getExtensionCapability('fts');
 
 /** Test-only: clear the singleton's cached capability and install state. */
 export const resetExtensionState = (): void => extensionManager.reset();

@@ -1,0 +1,155 @@
+# Scenario suite for the gitnexus workflow benchmark — the ground-base matrix.
+#
+# Task fields:
+#   id:      short slug used in reports
+#   class:   task class for cost/quality routing analysis. The suite spans:
+#            trivial → investigation-feature → cross-module
+#   repo:    path to a git repo that is GitNexus-indexed
+#   ref:     git ref benchmarked (fresh detached worktree per arm per run)
+#   setup:   optional shell command run in the fresh worktree first
+#            (task-specific preparation; dependencies are immutable mounts)
+#   prompt:  the engineering task, phrased once, given verbatim to every arm.
+#            Prescribe the test file path — that keeps `verify` deterministic.
+#   verify:  model-visible authored-test command (recorded as a separate signal)
+#   oracle:  harness-owned hidden files + command; oracle success is also
+#            required for resolved and files are staged only after the session
+#   expensive: optional boolean; true scenarios require --include-expensive
+#   sandbox_dependencies: repository-local dependencies mounted read-only
+#
+# Arms (runner --arms): workflow (plan→work), workflow_direct (work skill,
+# no plan), baseline (no skills, MCP allowed), baseline_nomcp (no skills, no
+# graph tools). candidate_workflow and candidate_workflow_direct apply a
+# skill-only --candidate-overlay and must be paired with their incumbent arm.
+# Comparing workflow vs workflow_direct vs baseline locates the task-complexity
+# boundary where each mode pays for itself — that boundary is the routing rule
+# lfg's gate and work's direct-mode triage encode.
+#
+# GitNexus scenarios build one graph from a history-pruned, parentless clone and
+# cache only that sanitized graph for every arm. The target repository's
+# prebuilt .gitnexus directory is never copied. Three declared dependency trees
+# are mounted read-only; missing assets fail before model execution.
+# Every task starts at the exact v1.6.12 commit, where all four tasks remain
+# unsolved. The C provenance feature replaces the invalid historical system-include task.
+
+tasks:
+  # Overhead floor — measured 2026-07-11 (see README calibration): the
+  # workflow is EXPECTED to lose here. Kept in the suite so regressions in
+  # the overhead floor stay visible.
+  - id: trivial-status-json-alias
+    class: trivial
+    repo: ~/GitNexus
+    ref: c4ecf398de637cf779ab2238e69958cfd5d601ce
+    sandbox_dependencies: &gitnexus_sandbox_dependencies
+      - source: node_modules
+        target: node_modules
+      - source: gitnexus/node_modules
+        target: gitnexus/node_modules
+      - source: gitnexus-shared/node_modules
+        target: gitnexus-shared/node_modules
+      # Host-built types/JS. The clone has no dist/, and node_modules/gitnexus-shared
+      # is a relative symlink into that unbuilt tree — without this mount, in-sandbox
+      # `tsc --noEmit` / vitest fail with TS2307 / TS6379 (run 33962002890).
+      - source: gitnexus-shared/dist
+        target: gitnexus-shared/dist
+    prompt: >
+      Add -j as a short alias for --json on the gitnexus status command
+      (gitnexus/src/cli/index.ts), and cover the alias with a unit test in
+      gitnexus/test/unit/status-json-alias.test.ts.
+    verify: cd gitnexus && npx tsc --noEmit && npx vitest run test/unit/status-json-alias.test.ts
+    oracle:
+      command: >-
+        cd gitnexus && ./node_modules/.bin/vitest run
+        --config "$GITNEXUS_BENCH_ORACLE_ROOT/vitest.config.mts"
+        "$GITNEXUS_BENCH_ORACLE_ROOT/trivial-status-json-alias.oracle.test.ts"
+      files:
+        - source: vitest.config.mts
+          target: vitest.config.mts
+        - source: trivial-status-json-alias.oracle.test.ts
+          target: trivial-status-json-alias.oracle.test.ts
+
+  # Investigation-heavy feature: retain literal include provenance through
+  # parsing and resolution without binding system headers to repository decoys.
+  - id: inv-feature-c-include-provenance
+    class: investigation-feature
+    repo: ~/GitNexus
+    ref: c4ecf398de637cf779ab2238e69958cfd5d601ce
+    sandbox_dependencies: *gitnexus_sandbox_dependencies
+    prompt: >
+      Retain literal C #include records after parsing and interpretation, including
+      system includes such as <stdio.h>. Preserve each header's identity and enough
+      provenance to distinguish system from quoted includes. With no configured
+      system include roots, system includes must never resolve to unrelated
+      same-named repository headers; quoted sibling and relative includes must
+      still resolve. Computed macro includes remain unsupported and produce no
+      parsed import. Cover the real parser, include decomposition, interpretation
+      and resolver in test/unit/scope-resolution/c/c-include-provenance.test.ts.
+      Correct the C conformance fixture to distinguish system and quoted forms of
+      the same header, and remove C from KNOWN_GAPS. Choose the representation;
+      shared dependency declarations are immutable.
+    verify: >-
+      cd gitnexus && npx tsc --noEmit && npx vitest run
+      test/unit/scope-resolution/c/c-include-provenance.test.ts
+      test/unit/scope-resolution/external-import-conformance.test.ts
+    oracle:
+      command: >-
+        cd gitnexus && ./node_modules/.bin/vitest run
+        --config "$GITNEXUS_BENCH_ORACLE_ROOT/vitest.config.mts"
+        "$GITNEXUS_BENCH_ORACLE_ROOT/inv-feature-c-include-provenance.oracle.test.ts"
+      files:
+        - source: vitest.config.mts
+          target: vitest.config.mts
+        - source: inv-feature-c-include-provenance.oracle.test.ts
+          target: inv-feature-c-include-provenance.oracle.test.ts
+
+  # Investigation-heavy feature: touches tool schema, backend filtering, and
+  # pagination totals — three seams that must stay consistent.
+  - id: inv-feature-list-repos-filter
+    class: investigation-feature
+    repo: ~/GitNexus
+    ref: c4ecf398de637cf779ab2238e69958cfd5d601ce
+    sandbox_dependencies: *gitnexus_sandbox_dependencies
+    prompt: >
+      Add an optional "name_contains" filter parameter to the list_repos MCP
+      tool: case-insensitive substring match on the repo name, with the
+      pagination object (total/hasMore/nextOffset) reflecting the FILTERED
+      set. Cover with unit tests in
+      gitnexus/test/unit/list-repos-name-filter.test.ts.
+    verify: cd gitnexus && npx tsc --noEmit && npx vitest run test/unit/list-repos-name-filter.test.ts
+    oracle:
+      command: >-
+        cd gitnexus && ./node_modules/.bin/vitest run
+        --config "$GITNEXUS_BENCH_ORACLE_ROOT/vitest.config.mts"
+        "$GITNEXUS_BENCH_ORACLE_ROOT/inv-feature-list-repos-filter.oracle.test.ts"
+      files:
+        - source: vitest.config.mts
+          target: vitest.config.mts
+        - source: inv-feature-list-repos-filter.oracle.test.ts
+          target: inv-feature-list-repos-filter.oracle.test.ts
+
+  # Cross-module: worker-pool + pipeline seams, concurrency-sensitive.
+  # The most expensive scenario — run deliberately, not by default.
+  - id: cross-module-parse-retry
+    class: cross-module
+    expensive: true
+    repo: ~/GitNexus
+    ref: c4ecf398de637cf779ab2238e69958cfd5d601ce
+    sandbox_dependencies: *gitnexus_sandbox_dependencies
+    prompt: >
+      Add bounded retry with backoff to the ingestion pipeline so a transient
+      parse-worker failure on a file is retried up to 2 times before the file
+      is marked failed, without retrying deterministic parse errors. Treat
+      EAGAIN worker error messages/events and worker exit code 75 as transient;
+      SyntaxError messages/events and exit code 65 are deterministic. Cover
+      the retry/no-retry decision with unit tests in
+      gitnexus/test/unit/parse-retry.test.ts.
+    verify: cd gitnexus && npx tsc --noEmit && npx vitest run test/unit/parse-retry.test.ts
+    oracle:
+      command: >-
+        cd gitnexus && ./node_modules/.bin/vitest run
+        --config "$GITNEXUS_BENCH_ORACLE_ROOT/vitest.config.mts"
+        "$GITNEXUS_BENCH_ORACLE_ROOT/cross-module-parse-retry.oracle.test.ts"
+      files:
+        - source: vitest.config.mts
+          target: vitest.config.mts
+        - source: cross-module-parse-retry.oracle.test.ts
+          target: cross-module-parse-retry.oracle.test.ts

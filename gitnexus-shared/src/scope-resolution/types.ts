@@ -24,6 +24,9 @@
 
 import type { NodeLabel } from '../graph/types.js';
 import type { SymbolDefinition } from './symbol-definition.js';
+// Type-only, so the `reference-site.ts` → `types.ts` import cycle is erased
+// at compile time.
+import type { CallForm } from './reference-site.js';
 
 // ─── §2.1 Type aliases ──────────────────────────────────────────────────────
 
@@ -33,14 +36,27 @@ export type ScopeId = string;
 /** Stable symbol-definition identifier (graph nodeId). */
 export type DefId = string;
 
-/** Kinds of lexical scope a `Scope` node can represent. */
+/**
+ * Kinds of lexical scope a `Scope` node can represent.
+ *
+ * `Object` is a hoist boundary ONLY: an object/record literal body
+ * (TS/JS `{...}`, Kotlin anonymous `object {...}`). Members are
+ * reachable via property access, never as bare identifiers, so
+ * scope-chain walkers (`scope/walkers.ts`) must skip an `Object`
+ * scope's own bindings while still traversing past it to the parent
+ * (#2545/#2551) -- unlike `Block`, where a nested closure legitimately
+ * DOES see a sibling `let`/`const` from an enclosing `if`/`for`/`while`,
+ * a nested closure inside an object literal must NOT see a sibling
+ * property's name as a free identifier.
+ */
 export type ScopeKind =
   | 'Module' // file root
   | 'Namespace' // C++ namespace, C# namespace, Kotlin package-object, Rust mod
   | 'Class' // class/struct/trait/interface body
   | 'Function' // function/method/closure/lambda body
   | 'Block' // { ... }, if-body, for-body, with-body, match arms
-  | 'Expression'; // comprehensions, for-init, pattern bindings, lambda param lists
+  | 'Expression' // comprehensions, for-init, pattern bindings, lambda param lists
+  | 'Object'; // object/record literal body -- see doc comment above
 
 // ─── Range + Capture (parser-agnostic) ──────────────────────────────────────
 
@@ -91,7 +107,24 @@ export type CaptureMatch = Readonly<Record<string, Capture>>;
  * produced when `expandsWildcardTo` materializes a wildcard against target
  * exports — a provider must never emit it at parse time.
  */
-export type ParsedImport =
+export type ParsedImport = ParsedImportSyntax & {
+  /** Lexical location retained by extraction, independently of execution timing.
+   * Absent for legacy or synthesized imports. Binding semantics remain opt-in
+   * through FinalizeHooks.importsBindAtLexicalScope. */
+  readonly declaredAtScope?: ScopeId;
+  readonly atRange?: Range;
+  /** Per-import lexical binding override; useful when a provider also has file-wide dependencies. */
+  readonly bindsAtLexicalScope?: boolean;
+  /** An export dependency publishes names without importing them locally. */
+  readonly exportsOnly?: boolean;
+  /** Ordered namespace filters retained from the source declaration. */
+  readonly nameFilters?: readonly {
+    readonly kind: 'show' | 'hide';
+    readonly names: readonly string[];
+  }[];
+};
+
+type ParsedImportSyntax =
   /**
    * Per-name import without rename.
    *
@@ -105,6 +138,139 @@ export type ParsedImport =
       readonly localName: string;
       readonly importedName: string;
       readonly targetRaw: string;
+      /** Provider-specific imported symbol category when module and symbol
+       * namespaces have distinct resolution rules (for example PHP).
+       *
+       * **Not** the same fact as {@link ParsedImport.typeOnly} — see the note
+       * on `typeOnly` below, which is documented on this variant. */
+      readonly importedSymbolKind?: 'type' | 'function' | 'const';
+      /**
+       * Is this import ERASED before the module ever runs?
+       *
+       * TypeScript `import type { X } from './m'` and `import { type X }` are
+       * deleted by `tsc`: no `require`/`import` for `./m` survives in the
+       * emitted JavaScript, so the pair cannot force a module-INITIALIZATION
+       * order and cannot participate in an init cycle. That is the one thing
+       * `check --cycles` exists to find, so the fact has to survive from the
+       * syntax down to the emitted `IMPORTS` edge — see `ImportEdge.typeOnly`
+       * and `graph-bridge/imports-to-edges.ts`.
+       *
+       * **Distinct from `importedSymbolKind: 'type'`, which is NOT a substitute.**
+       * That field is a resolution-NAMESPACE category (PHP's `use function` /
+       * `use const` split), it exists only on this variant, and it says "the
+       * thing imported is a type". A symbol being a type says nothing about
+       * whether the import STATEMENT is erased, and PHP erases nothing at all.
+       * This field is about the statement's runtime existence, not the symbol's
+       * category.
+       *
+       * Set only by providers whose syntax marks it. Absent everywhere else,
+       * which reads as "not erased" — the fail-safe direction, since it only
+       * makes `check --cycles` over-report.
+       *
+       * That fail-safe matters more than it first looks, because an explicit
+       * `type` is a SUFFICIENT signal of erasure and not a necessary one. With
+       * neither `verbatimModuleSyntax` nor `importsNotUsedAsValues: preserve`
+       * set — this repo sets neither — `tsc` also elides a plain
+       * `import { SomeInterface }` whose bindings are every one of them used in
+       * type position. Those statements are erased at run time and carry no
+       * marker, so they stay tagged as initializing and `check --cycles` can
+       * still report a cycle that cannot exist. Closing that gap needs
+       * whole-program binding USE information, not import syntax, which is why
+       * this field stops at what the syntax states.
+       */
+      readonly typeOnly?: boolean;
+      /**
+       * Was this import written inside a function body — so that it runs only
+       * when something CALLS that function, never while the module itself is
+       * initializing?
+       *
+       * Python's `def f(): from x import Y` and a CommonJS
+       * `function f() { const { Y } = require('./x'); }` are the spellings.
+       * Both are syntactically ordinary imports — no `kind` tells them apart
+       * from a top-level one, and nothing about the target does either. Only
+       * their POSITION defers them.
+       *
+       * Not every language's imports are like that, and the rule is wrong for
+       * the ones that are not: Rust's `use` and C/C++'s `#include` are legal
+       * in a function body and are deferred by NOTHING, because neither is an
+       * executed statement. Those providers opt out — see
+       * `LanguageProvider.importsExecuteWhereWritten`, below.
+       *
+       * **Why this cannot be re-derived downstream — the whole reason the
+       * field exists.** The natural place to decide it looks like the graph
+       * bridge, by walking the scope the finalized edges hang off; that is
+       * exactly what `graph-bridge/imports-to-edges.ts` once attempted, and it
+       * is dead code by construction. Default finalize still publishes each
+       * file's edges under `file.moduleScope`, so a bridge walk that starts
+       * there answers `false` for every import. Resolvers that opt into
+       * `importsBindAtLexicalScope` instead key the edge by
+       * `parsed.declaredAtScope` when extraction placed the statement (Rust
+       * `use` in a function body is the example). Even then the *execution*
+       * question — does this import run at module init? — is not the same as
+       * the lexical key, and `FinalizeFile.parsedImports` is still a flat
+       * per-file list. The extractor is the last stage that still knows
+       * where the statement sat (`scope-extractor.ts`, Pass 3), so it marks the
+       * fact here and it rides the edge from there — see
+       * {@link ImportEdge.runsOnlyWhenCalled}.
+       *
+       * Consumed by `check --cycles`, which asks "can these modules be
+       * initialized in any order?". A deferred import carries no
+       * initialization order, and deferring one is the standard way to BREAK
+       * an init cycle, so counting it reports the fix as the bug.
+       *
+       * Set by the central extractor for every language, not by providers —
+       * except that a provider may declare that its imports do not execute
+       * where they are written (`LanguageProvider.importsExecuteWhereWritten:
+       * false`) and be skipped entirely. C, C++, Rust and COBOL do. A `#include`
+       * or a `use` inside a function body is not deferred: the header is
+       * spliced and the path alias is resolved before anything runs, so the
+       * pair really is a dependency and the cycle it can form is real.
+       *
+       * Absent reads as "runs at initialization" — the fail-safe direction,
+       * since it only makes `check --cycles` over-report.
+       */
+      readonly runsOnlyWhenCalled?: boolean;
+      /**
+       * Set by providers when `targetRaw` already names the imported symbol
+       * rather than only its containing module. Consumers that compose
+       * `<local>.<member>` paths can then use `targetRaw.<member>` instead of
+       * duplicating `importedName`.
+       */
+      readonly targetIncludesImportedName?: boolean;
+      /**
+       * Set by providers whose import syntax *also* republishes the name from
+       * the importing module, so a third file can import it from there.
+       *
+       * Python has no dedicated re-export form: a module-level
+       * `from pkg.impl import X` binds `X` locally **and** publishes it as
+       * `pkg.X`, which is the standard way a package `__init__.py` declares
+       * its public surface. Languages with an explicit form (TS `export … from`,
+       * Rust `pub use`) emit `kind: 'reexport'` instead and leave this unset.
+       *
+       * **The flag must track actual republication, not syntax.** Only a
+       * module-level statement publishes: the same `from m import X` inside a
+       * `def` or `class` body binds locally and puts nothing in the module
+       * namespace, so flagging it fabricates a re-export of a name no importer
+       * can reach. `if` / `try` / `for` / `with` do not suppress it — Python
+       * has no block scope. A provider that cannot tell these apart at
+       * interpret time must carry the fact down from its capture emitter,
+       * where the syntax node is still available.
+       *
+       * **Why not `kind: 'reexport'`.** Not because that form drops the local
+       * binding — `materializeBindings` creates a module-scope `BindingRef`
+       * for every linked edge, re-export included. It is that `reexport`
+       * changes what the binding *is*: `origin` flips to `'reexport'`, which
+       * carries different evidence weight and `ORIGIN_PRIORITY`, and it
+       * misreports the parse-time syntax Python actually wrote. A flag adds
+       * the export-surface fact without restating the import as something the
+       * source does not say.
+       *
+       * Consumed by `buildReexportClosures` (`finalize-algorithm.ts`), which
+       * also documents how ambiguous duplicates of one published name are
+       * handled — the precedence rules that hold for an explicit re-export do
+       * not carry over.
+       */
+      readonly reexportsName?: boolean;
     }
   /**
    * Per-name import with rename.
@@ -119,6 +285,20 @@ export type ParsedImport =
       readonly importedName: string;
       readonly alias: string;
       readonly targetRaw: string;
+      /** See the same field on the `named` variant. */
+      readonly importedSymbolKind?: 'type' | 'function' | 'const';
+      /** See the same field on the `named` variant — including why it is not
+       *  interchangeable with `importedSymbolKind`. Reaches this variant from
+       *  `import type D from './m'` and `import { type X as Y } from './m'`. */
+      readonly typeOnly?: boolean;
+      /** See the same field on the `named` variant. Reaches this variant from
+       *  Python's `def f(): from x import Y as Z` and a CommonJS
+       *  `function f() { const { Y: Z } = require('./x'); }`. */
+      readonly runsOnlyWhenCalled?: boolean;
+      /** See the same field on the `named` variant. */
+      readonly targetIncludesImportedName?: boolean;
+      /** See the same field on the `named` variant. */
+      readonly reexportsName?: boolean;
     }
   /**
    * Qualified module handle, with or without rename. `importedName` is the
@@ -133,11 +313,21 @@ export type ParsedImport =
    */
   | {
       readonly kind: 'namespace';
+      /** The source omitted a local alias; the imported module declares its binding name. */
+      readonly implicitLocalName?: boolean;
+      /** An explicit alias binds the imported module, even when it matches the path's root. */
+      readonly explicitAlias?: boolean;
       /** Scope-visible handle (e.g. `np` in `import numpy as np`; `numpy` when unaliased). */
       readonly localName: string;
       /** Module being aliased (e.g. `numpy` in `import numpy as np`). */
       readonly importedName: string;
       readonly targetRaw: string;
+      /** See the same field on the `named` variant. Reaches this variant from
+       *  TypeScript `import type * as N from './m'`. */
+      readonly typeOnly?: boolean;
+      /** See the same field on the `named` variant. Reaches this variant from
+       *  Python's `def f(): import numpy as np`. */
+      readonly runsOnlyWhenCalled?: boolean;
     }
   /**
    * Syntactically-detectable parse-time re-export. Finalize may still produce
@@ -159,6 +349,19 @@ export type ParsedImport =
       readonly targetRaw: string;
       /** Set when the re-export renames the symbol (e.g. `export { X as Y } from './y'`). */
       readonly alias?: string;
+      /** See the same field on the `named` variant. Reaches this variant from
+       *  TypeScript `export type { X } from './y'` and `export { type X } from './y'`. */
+      readonly typeOnly?: boolean;
+      /** See the same field on the `named` variant. NO spelling reaches this
+       *  variant today: the two providers that emit `reexport` are TypeScript
+       *  / JavaScript, whose `export … from` is a module-top-level-only
+       *  declaration, and Rust, whose `pub use` is a compile-time path alias
+       *  that its provider exempts from the position rule outright
+       *  (`LanguageProvider.importsExecuteWhereWritten`). Kept because the
+       *  extractor sets the field with no `switch` on `kind`, so a re-export
+       *  form that IS an executed statement would be tagged the moment one
+       *  appears — not because anything sets it now. */
+      readonly runsOnlyWhenCalled?: boolean;
     }
   /**
    * Wildcard import — brings every exported name from the target module into
@@ -170,10 +373,35 @@ export type ParsedImport =
    *   - Python `from foo import *`   → `{ kind: 'wildcard', targetRaw: 'foo' }`
    *   - JS `export * from './foo'`   → `{ kind: 'wildcard', targetRaw: './foo' }`
    *   - Rust `pub use foo::*`         → `{ kind: 'wildcard', targetRaw: 'foo' }`
+   *
+   * No `typeOnly` here on purpose. The one syntax that would set it,
+   * TypeScript 5.0's `export type * from './m'`, is not parsed by the
+   * vendored tree-sitter-typescript grammar — it yields an `ERROR` node
+   * holding the bare `type` token, so the fact is not readable at the
+   * statement level (see `typescript/import-decomposer.ts`). Add the field
+   * with the grammar that can express it, not before.
    */
   | {
       readonly kind: 'wildcard';
       readonly targetRaw: string;
+      /** False when this statement imports names without publishing them from
+       * its file. Absent preserves the historical re-exporting wildcard. */
+      readonly reexportsName?: boolean;
+      /** See the same field on the `named` variant. Present here although
+       *  `typeOnly` is not: erasure is a syntactic fact this spelling cannot
+       *  express, but POSITION is not — Ruby's `def f; require './m'; end` is
+       *  a wildcard (everything in the required file becomes visible) and IS
+       *  deferred. Python cannot reach it: `from x import *` inside a `def` is
+       *  a SyntaxError. Rust's fn-local `use foo::*` is legal but not
+       *  deferred — `use` does not execute
+       *  (`LanguageProvider.importsExecuteWhereWritten`). */
+      readonly runsOnlyWhenCalled?: boolean;
+      /**
+       * C/C++ `#include <…>` (true) versus `#include "…"`.
+       * Angle includes resolve only on header search paths. Quoted includes
+       * may still use the including file's directory and the basename index.
+       */
+      readonly isSystem?: boolean;
     }
   /**
    * Runtime-computed target — the import path is not a static literal at
@@ -190,6 +418,9 @@ export type ParsedImport =
       readonly localName: string;
       /** Source text of the unresolved expression when available; `null` otherwise. */
       readonly targetRaw: string | null;
+      /** See the same field on the `named` variant. Set by position like every
+       *  other variant; this kind links no target, so nothing reads it here. */
+      readonly runsOnlyWhenCalled?: boolean;
     }
   /**
    * Lazy / dynamic import whose target IS a static string literal at parse
@@ -211,6 +442,10 @@ export type ParsedImport =
   | {
       readonly kind: 'dynamic-resolved';
       readonly targetRaw: string;
+      /** See the same field on the `named` variant. Redundant on this kind —
+       *  `import()` is already deferred wherever it is written — but set
+       *  uniformly, because position is decided without consulting `kind`. */
+      readonly runsOnlyWhenCalled?: boolean;
     }
   /**
    * Bare-source / side-effect import that introduces no local name binding
@@ -226,6 +461,10 @@ export type ParsedImport =
   | {
       readonly kind: 'side-effect';
       readonly targetRaw: string;
+      /** See the same field on the `named` variant. Reaches this variant from
+       *  a bare CommonJS `function f() { require('./polyfill'); }` — the ESM
+       *  spelling `import './polyfill'` cannot, being top-level only. */
+      readonly runsOnlyWhenCalled?: boolean;
     };
 
 /**
@@ -237,8 +476,24 @@ export type ParsedImport =
 export interface ParsedTypeBinding {
   /** The name being bound (parameter name, `self`, assignment LHS, …). */
   readonly boundName: string;
-  /** The raw type name as written in source (`'User'`, `'models.User'`, …). */
+  /** The type name AFTER this provider's normalization (`'User'`,
+   *  `'models.User'`, …) — see `TypeRef.rawName`. */
   readonly rawTypeName: string;
+  /**
+   * Optional override for `TypeRef.declaredSpelling`, for a grammar that does
+   * not keep the whole written type under `@type-binding.type`.
+   *
+   * The scope extractor derives the spelling from that capture by default,
+   * which is right for every language whose type node spans the annotation.
+   * C++ is the exception: `User* repos` parses with the `*` on the DECLARATOR,
+   * so the type capture is a bare `User` and the container-ness the index step
+   * needs is nowhere in the captures the extractor reads. A provider that can
+   * reconstruct it exactly sets it here.
+   *
+   * Leave undefined otherwise — the extractor's derivation is preferred to a
+   * per-language reimplementation of it.
+   */
+  readonly declaredSpelling?: string;
   readonly source: TypeRef['source'];
 }
 
@@ -267,8 +522,11 @@ export interface ScopeLookup {
 
 /** Call-site description passed to `arityCompatibility`. */
 export interface Callsite {
-  /** Number of arguments at the call site. */
-  readonly arity: number;
+  /** Number of arguments at the call site, if available. */
+  readonly arity?: number;
+  /** Inferred argument types at the call site, one per argument.
+   *  An empty string entry means the type was not inferred. */
+  readonly argumentTypes?: readonly string[];
 }
 
 // ─── §2.4 ImportEdge ────────────────────────────────────────────────────────
@@ -281,8 +539,12 @@ export interface Callsite {
  * bounded-fixpoint linking (RFC §3.2).
  */
 export interface ImportEdge {
+  readonly nameFilters?: ParsedImport['nameFilters'];
+  readonly atRange?: Range;
   /** How this scope sees the imported name (after alias). */
   readonly localName: string;
+  /** Namespace-import alias syntax, retained for providers whose unaliased imports bind a path prefix. */
+  readonly explicitAlias?: boolean;
   /** Exporting file; `null` only when `kind === 'dynamic-unresolved'`. */
   readonly targetFile: string | null;
   /** The name under which the target exports this symbol. */
@@ -302,6 +564,37 @@ export interface ImportEdge {
     | 'side-effect';
   /** Re-export chain, for provenance (e.g., `['./y']` when re-exported via `./y`). */
   readonly transitiveVia?: readonly string[];
+  /**
+   * The import is erased before the module runs — see `ParsedImport`'s
+   * `typeOnly` on the `named` variant for the full note, including why
+   * `importedSymbolKind: 'type'` is a different fact and not a substitute.
+   *
+   * Carried straight from the `ParsedImport` by `makeEdgeDrafts`. The edge is
+   * still emitted: a type-only import is a real source-level dependency that
+   * `impact` and `trace` must see, and editing the target still breaks the
+   * importer's typecheck. What the flag removes is the claim that the pair
+   * forces an INITIALIZATION order.
+   */
+  readonly typeOnly?: boolean;
+  /**
+   * The import was written inside a function body, so it runs only when that
+   * function is called — never during module initialization. See
+   * `ParsedImport`'s `runsOnlyWhenCalled` on the `named` variant for the full
+   * note, including why the consumer cannot re-derive this from the scope tree
+   * and therefore has to be told (`finalize-algorithm.ts:295`).
+   *
+   * Carried straight from the `ParsedImport` by `makeEdgeDrafts`, for the same
+   * reason `typeOnly` is: the edge is where `graph-bridge/imports-to-edges.ts`
+   * can still see it. The edge is still emitted either way — a deferred import
+   * is a real dependency. What the flag removes is the claim that the pair
+   * forces an INITIALIZATION order.
+   *
+   * Distinct from `kind === 'dynamic-resolved'`, which records the OTHER way an
+   * import can be deferred (`import('./m')`). Neither implies the other: a
+   * top-level `import()` is deferred with this flag unset, and a function-local
+   * `from x import Y` is deferred with an ordinary `named` kind.
+   */
+  readonly runsOnlyWhenCalled?: boolean;
   /** Set to `'unresolved'` when the SCC fixpoint could not link this edge. */
   readonly linkStatus?: 'unresolved';
 }
@@ -317,10 +610,18 @@ export interface ImportEdge {
  * stamping first-class instead of reconstructing provenance from a side table.
  */
 export interface BindingRef {
+  readonly availableFrom?: SourcePosition;
+  /** Source declaration range, independent of the target definition's identity. */
+  readonly declarationRange?: Range;
   readonly def: SymbolDefinition;
   readonly origin: 'local' | 'import' | 'namespace' | 'wildcard' | 'reexport';
   /** Non-null for non-local origins; carries the `ImportEdge` that brought the name into this scope. */
   readonly via?: ImportEdge;
+  /**
+   * Optional semantic visibility evidence supplied by a language hook.
+   * Shared resolution consumes this without inspecting language syntax.
+   */
+  readonly visibility?: 'static-member-import';
 }
 
 // ─── §2.5 TypeRef ───────────────────────────────────────────────────────────
@@ -335,8 +636,50 @@ export interface BindingRef {
  * re-exports, and nested modules. Generics deferred to V2 via `typeArgs`.
  */
 export interface TypeRef {
-  /** The name as written in source (e.g., `'User'`, `'models.User'`, `'List'`). */
+  /** Declaration that binds this value, independent of its type's lookup anchor. */
+  readonly bindingRange?: Range;
+  readonly lookupPosition?: SourcePosition;
+  readonly lookupPurpose?: LookupPurpose;
+  /**
+   * The type name AFTER the language's capture-time normalization — NOT
+   * necessarily what the source says. Every provider's `interpretTypeBinding`
+   * reduces the annotation before it gets here: TypeScript runs
+   * `stripGeneric` + `stripArraySuffix` to a FIXED POINT (`User[][]` → `User`),
+   * Go's `normalizeGoTypeName` drops `[]` and `map[K]`, C#/Python/Kotlin/Rust
+   * strip their single-arg collection wrappers. What survives is the name a
+   * class lookup can use (`'User'`, `'models.User'`, `'List'`).
+   *
+   * A consumer that needs the CONTAINER, not the element, must read
+   * `declaredSpelling` — see below.
+   */
   readonly rawName: string;
+  /**
+   * The annotation exactly as written, kept ONLY when `rawName` is not it.
+   *
+   * `rawName` alone cannot distinguish `repos: User[]` (a container the capture
+   * layer already reduced, so the position IS the element) from `grid: Grid`
+   * (an ordinary class the source happened to subscript). Both arrive as a bare
+   * class name that resolves. An index step reading only `rawName` therefore had
+   * no choice but to guess, and guessing "already reduced" typed `grid[0]` as
+   * `Grid` — a confidently WRONG owner for the next member.
+   *
+   * Absent when the provider's normalization was a no-op (nothing was lost, so
+   * `rawName` is already the written spelling), and absent for TypeRefs
+   * synthesized outside the capture path (a `this` receiver binding, a
+   * propagated return type). Consumers must treat absence as "no container
+   * evidence" and decline, never as "not a container".
+   */
+  readonly declaredSpelling?: string;
+  /**
+   * The binding holds the AWAITED result of the callee `rawName` names
+   * (`final x = await fetch()`), not the callee's return value itself. Set by
+   * the scope extractor from a `@type-binding.awaited` capture; read by the
+   * chain follow, which asks the language what the followed return type
+   * yields under `await` (`ScopeResolver.elementTypeOf`, route `await`) and
+   * clears the flag once that first step has been taken. Absent (never
+   * `false`) for every other binding, so an older ParsedFile reads the same.
+   */
+  readonly awaited?: true;
   /** Anchor for resolving `rawName` — the scope where the annotation/inference was written. */
   readonly declaredAtScope: ScopeId;
   readonly source:
@@ -344,6 +687,7 @@ export interface TypeRef {
     | 'parameter-annotation'
     | 'return-annotation'
     | 'self'
+    | 'decorator-unknown'
     | 'assignment-inferred'
     | 'constructor-inferred'
     | 'receiver-propagated';
@@ -353,6 +697,67 @@ export interface TypeRef {
 
 // ─── §2.2 Scope ─────────────────────────────────────────────────────────────
 
+export interface SourcePosition {
+  readonly startLine: number;
+  readonly startCol: number;
+}
+
+export type LookupPurpose = 'value' | 'type';
+
+/** Provider-owned name ownership; a claim does not require an indexed target. */
+export interface NameClaim {
+  readonly name: string;
+  readonly range: Range;
+  readonly kind: 'binding' | 'import' | 'blocked';
+  /** Proven compatible declarations may accumulate their import paths. */
+  readonly merge?: boolean;
+  /** Hoisted declarations rank before active ordered rebinding at this scope. */
+  readonly hoisted?: boolean;
+  readonly purpose?: LookupPurpose | 'both';
+  readonly availableFrom?: SourcePosition;
+  /** Where the declaration is visible when evaluation order differs from
+   * source order: alternating start (inclusive) and end (exclusive) positions
+   * in source order; a last start without an end stays open. Takes the place
+   * of `availableFrom` for lookups that carry a position. */
+  readonly availableSpans?: readonly SourcePosition[];
+  /** Evaluation rank among this scope's claims of the name. Two claims that
+   * both carry a rank are ordered by it; every other pair by `range`. */
+  readonly order?: number;
+  /** The declaration can never be what a call expression of this name
+   * invokes: the language resolves callees in a namespace it is not part of.
+   * A lookup made for a callee (`NameLookupOptions.callee`) does not see it. */
+  readonly neverCallee?: boolean;
+  readonly inactive?: 'blocked' | 'outer' | 'module';
+  readonly redirect?: 'module' | 'enclosing-function';
+}
+
+export interface ScopeLookupPolicy {
+  /** False when bare names cannot refer to members of an implicit receiver. */
+  readonly allowImplicitReceiver?: boolean;
+  /** All lexical declarations have claims; inferred assignments alone do not declare names. */
+  readonly nameClaimsComplete?: boolean;
+  /** Reference scopes already identify the evaluating environment; do not infer
+   * a nested caller from physical source containment. */
+  readonly callerScopeIsAuthoritative?: boolean;
+  /** Exact lexical self names retained when other bindings are skipped by children. */
+  readonly visibleNamesFromChildren?: readonly string[];
+  readonly parentScope?: ScopeId;
+  /** The scope's locals are not an enclosing lexical environment. */
+  readonly skipFromChildren?: boolean;
+  /** Child execution is deferred, so source order in parents cannot imply a TDZ. */
+  readonly deferParentActivation?: boolean;
+}
+
+export interface NameLookupOptions {
+  readonly skipEnclosingClasses?: boolean;
+  readonly position?: SourcePosition;
+  /** Keep source order across deferred scopes when locating the binding before a write. */
+  readonly preservePosition?: boolean;
+  readonly purpose?: LookupPurpose;
+  /** The name is the callee of a call expression written without a receiver. */
+  readonly callee?: boolean;
+}
+
 /**
  * The canonical lexical-scope node. Forms the spine of the SemanticModel.
  *
@@ -360,6 +765,8 @@ export interface TypeRef {
  * — deterministic, stable across reparses of the same source, interned.
  */
 export interface Scope {
+  readonly nameClaims?: readonly NameClaim[];
+  readonly lookupPolicy?: ScopeLookupPolicy;
   readonly id: ScopeId;
   readonly parent: ScopeId | null;
   readonly kind: ScopeKind;
@@ -379,6 +786,25 @@ export interface Scope {
 
   /** Local type facts visible from this scope (parameter annotations, `self` binding, etc.). */
   readonly typeBindings: ReadonlyMap<string, TypeRef>;
+
+  /** Lexically bound names that may have no definition or type fact of their
+   * own (for example, an untyped function parameter). Consumers use this only
+   * as a shadowing barrier; it never resolves a symbol by itself. */
+  readonly lexicalNames?: ReadonlySet<string>;
+
+  /** Receiver names this scope BINDS rather than inherits — `this`, `self`, … (#2701).
+   *
+   *  A receiver walk (`findReceiverTypeBinding`) that reaches such a scope
+   *  without finding the name in `typeBindings` stops here and reports the
+   *  receiver unresolved, instead of continuing up and borrowing an enclosing
+   *  scope's binding. In JavaScript/TypeScript an ordinary `function` binds its
+   *  own `this` (ECMA-262 `[[ThisMode]]`) while an arrow inherits one, so
+   *  `this.m()` inside a nested `function` must NOT reach the enclosing class.
+   *
+   *  Left unset by every language whose closures capture the receiver
+   *  lexically, which is nearly all of them — the walk is unchanged there.
+   *  Populated from `LanguageProvider.scopeOwnsReceivers`. */
+  readonly ownsReceivers?: ReadonlySet<string>;
 }
 
 // ─── §2.6 Resolution + ResolutionEvidence ───────────────────────────────────
@@ -431,12 +857,34 @@ export interface Resolution {
  * during the emit phase.
  */
 export interface Reference {
-  /** Innermost lexical scope containing `atRange`. */
+  /** Scope owning the graph source; may differ from lexical lookup for a synthesized call. */
   readonly fromScope: ScopeId;
   readonly toDef: DefId;
   /** Location of the reference in source. */
   readonly atRange: Range;
-  readonly kind: 'call' | 'read' | 'write' | 'type-reference' | 'inherits' | 'import-use';
+  readonly kind:
+    | 'call'
+    | 'read'
+    | 'write'
+    | 'type-reference'
+    | 'inherits'
+    | 'import-use'
+    | 'value-ref'
+    | 'macro';
+  /**
+   * Call form of the site this reference was resolved from, copied verbatim
+   * from `ReferenceSite.callForm`; set only when `kind === 'call'`. The
+   * emit phase reads it to tell a construction site (`T{…}`, `new T()`,
+   * `T { .. }` — form `'constructor'`) apart from an invocation, which in the
+   * graph are both `CALLS` edges. Optional and additive: a `Reference` built
+   * without it is emitted exactly as before.
+   */
+  readonly callForm?: CallForm;
+  /** Copied from `ReferenceSite.staticGated` for `kind === 'call'`: the site is
+   *  in a branch provably unreachable from the indexed source at compile time.
+   *  The emit phase writes it to `GraphRelationship.staticGated` as metadata;
+   *  see the contract note there. Optional and additive. */
+  readonly staticGated?: boolean;
   readonly confidence: number;
   readonly evidence: readonly ResolutionEvidence[];
 }
@@ -465,6 +913,8 @@ export type RegistryContributor = unknown;
  * RFC §4.4 for per-registry specializations.
  */
 export interface LookupParams {
+  readonly lookupPosition?: SourcePosition;
+  readonly lookupPurpose?: LookupPurpose;
   readonly acceptedKinds: readonly NodeLabel[];
   /** Class lookups: false. Method/Field lookups: true. */
   readonly useReceiverTypeBinding: boolean;

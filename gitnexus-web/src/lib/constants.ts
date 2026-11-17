@@ -8,6 +8,8 @@ export const NODE_COLORS: Record<NodeLabel, string> = {
   Folder: '#6366f1', // Indigo
   File: '#3b82f6', // Blue
   Class: '#f59e0b', // Amber - stands out
+  Protocol: '#ec4899', // Pink - like Interface
+  Category: '#14b8a6', // Teal - like Method
   Function: '#10b981', // Emerald
   Method: '#14b8a6', // Teal
   Variable: '#64748b', // Slate - muted (less important)
@@ -37,7 +39,9 @@ export const NODE_COLORS: Record<NodeLabel, string> = {
   Constructor: '#10b981', // Emerald - like Function
   Template: '#a78bfa', // Violet light - like Type
   Route: '#f43f5e', // Rose - like Process
+  Destination: '#fb7185', // Rose light - like Route, the broker-side counterpart
   Tool: '#a855f7', // Purple - like Project
+  BasicBlock: '#475569', // Slate darker - control-flow node (muted, taint/PDG substrate)
 };
 
 // Node sizes by type - clear visual hierarchy with dramatic size differences
@@ -49,6 +53,8 @@ export const NODE_SIZES: Record<NodeLabel, number> = {
   Folder: 10, // Structural - clearly bigger than files
   File: 6, // Common element - smaller than folders
   Class: 8, // Important code structure
+  Protocol: 7, // Like Interface
+  Category: 3, // Like Method
   Function: 4, // Common code element - small
   Method: 3, // Smaller than function
   Variable: 2, // Tiny - leaf node
@@ -78,7 +84,9 @@ export const NODE_SIZES: Record<NodeLabel, number> = {
   Constructor: 4, // Like Function
   Template: 3, // Like Type
   Route: 5, // Like Enum
+  Destination: 5, // Like Route - the broker-side counterpart
   Tool: 5, // Like Enum
+  BasicBlock: 2, // Tiny - control-flow node (taint/PDG substrate)
 };
 
 // Community color palette for cluster-based coloring
@@ -97,11 +105,25 @@ export const COMMUNITY_COLORS = [
   '#84cc16', // lime
 ];
 
-export const getCommunityColor = (communityIndex: number): string => {
+export const getCommunityColor = (communityIndex: string | number): string => {
+  if (typeof communityIndex === 'string') {
+    // Keep colors for older indexes while treating new IDs as opaque strings.
+    const legacy = /^comm_(\d+)$/.exec(communityIndex);
+    if (legacy && Number.isSafeInteger(Number(legacy[1]))) {
+      return COMMUNITY_COLORS[Number(legacy[1]) % COMMUNITY_COLORS.length];
+    }
+    let hash = 0;
+    for (let i = 0; i < communityIndex.length; i++) {
+      hash = (Math.imul(hash, 31) + communityIndex.charCodeAt(i)) >>> 0;
+    }
+    return COMMUNITY_COLORS[hash % COMMUNITY_COLORS.length];
+  }
   return COMMUNITY_COLORS[communityIndex % COMMUNITY_COLORS.length];
 };
 
-// Labels to show by default (hide imports and variables by default as they clutter)
+// Labels to show by default (hide imports by default as they clutter).
+// Property/Const are the Kotlin/Java equivalents of Variable — include them so
+// Kotlin repos don't appear to have no leaf nodes.
 export const DEFAULT_VISIBLE_LABELS: NodeLabel[] = [
   'Project',
   'Package',
@@ -109,8 +131,12 @@ export const DEFAULT_VISIBLE_LABELS: NodeLabel[] = [
   'Folder',
   'File',
   'Class',
+  'Protocol',
+  'Category',
   'Function',
   'Method',
+  'Property', // Kotlin/Java fields (HAS_PROPERTY + DEFINES File→Property)
+  'Const', // Top-level constants
   'Interface',
   'Enum',
   'Type',
@@ -121,12 +147,16 @@ export const FILTERABLE_LABELS: NodeLabel[] = [
   'Folder',
   'File',
   'Class',
+  'Protocol',
+  'Category',
   'Interface',
   'Enum',
   'Type',
   'Function',
   'Method',
   'Variable',
+  'Property', // Kotlin/Java field nodes
+  'Const',
   'Decorator',
   'Import',
 ];

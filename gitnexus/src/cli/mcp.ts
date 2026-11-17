@@ -29,7 +29,77 @@
 
 import { installGlobalStdoutSentinel } from '../mcp/stdio-context.js';
 
-export const mcpCommand = async () => {
+import type { UpdateState } from '../core/update-check.js';
+
+interface McpUpdateLogger {
+  info(bindings: Record<string, unknown>, message: string): unknown;
+}
+
+interface McpUpdateChecker {
+  evaluate(): Promise<UpdateState | null>;
+  armUpdateRefreshScheduler(onState: (state: UpdateState | null) => void): () => void;
+}
+
+type LoadMcpUpdateChecker = () => Promise<McpUpdateChecker>;
+
+const announcedUpdateVersions = new Set<string>();
+
+/**
+ * Start the process-scoped MCP update adapter after its transport startup
+ * boundary. All failures stay inside this best-effort side channel.
+ */
+export async function startMcpUpdateNotifier(
+  logger: McpUpdateLogger,
+  loadChecker: LoadMcpUpdateChecker = () => import('../core/update-check.js'),
+): Promise<void> {
+  let checker: McpUpdateChecker;
+  try {
+    checker = await loadChecker();
+  } catch {
+    return;
+  }
+
+  const announce = (state: UpdateState | null): void => {
+    try {
+      if (
+        !state?.updateAvailable ||
+        !state.latestVersion ||
+        announcedUpdateVersions.has(state.latestVersion)
+      ) {
+        return;
+      }
+      announcedUpdateVersions.add(state.latestVersion);
+      logger.info(
+        { event: 'gitnexus.update_available', latestVersion: state.latestVersion },
+        'GitNexus update available',
+      );
+    } catch {
+      // Logging must never escape into MCP startup or scheduler promises.
+    }
+  };
+
+  try {
+    announce(await checker.evaluate());
+  } catch {
+    // Cache evaluation and any detached refresh are best-effort.
+  }
+
+  let stop: (() => void) | undefined;
+  try {
+    stop = checker.armUpdateRefreshScheduler(announce);
+  } catch {
+    return;
+  }
+
+  process.once('exit', () => stop?.());
+}
+
+export const mcpCommand = async (options?: {
+  http?: boolean;
+  port?: string;
+  host?: string;
+  authToken?: string;
+}) => {
   // Install the global stdout sentinel as the very first thing — before
   // ANY other module loads. The static-import closure above is leaf-only
   // (stdio-context → stdio-capture, zero non-`node:` deps), so this is
@@ -48,11 +118,23 @@ export const mcpCommand = async () => {
   // stdout at module init, but transitive deps (pino, pino-pretty, the
   // worker-thread transport) could in theory, and the import-closure
   // regression test enforces the leaf invariant.
-  const [{ startMCPServer }, { LocalBackend }, { logger }] = await Promise.all([
+  const [
+    { startMCPServer },
+    { LocalBackend },
+    { logger },
+    { createMcpRepositoryPolicy },
+    { resolveMcpRefreshLimits, resolveMcpRefreshMode },
+  ] = await Promise.all([
     import('../mcp/server.js'),
     import('../mcp/local/local-backend.js'),
     import('../core/logger.js'),
+    import('../mcp/repository-policy.js'),
+    import('../mcp/refresh-policy.js'),
   ]);
+  // Local servers only: `gitnexus serve` never reads these (#3524). A malformed
+  // value fails startup here, before any repository is opened.
+  const refreshIndex = resolveMcpRefreshMode();
+  if (refreshIndex) resolveMcpRefreshLimits();
 
   // Missing-optional-grammar warnings are intentionally NOT emitted here.
   // `gitnexus analyze` already warns at index time, filtered by the repo's
@@ -66,7 +148,8 @@ export const mcpCommand = async () => {
   const backend = new LocalBackend();
   await backend.init();
 
-  const repos = await backend.listRepos();
+  const repositoryPolicy = await createMcpRepositoryPolicy(backend);
+  const repos = await repositoryPolicy.scopeBackend(backend).listRepos();
   if (repos.length === 0) {
     // Operator-actionable but the server still starts and serves; warn-level,
     // not error. Tools will discover newly-analyzed repos via lazy refresh.
@@ -80,6 +163,41 @@ export const mcpCommand = async () => {
     );
   }
 
+  // Start HTTP server or fall back to stdio (default).
+  if (options?.http) {
+    // Dynamically import the HTTP transport module AFTER the sentinel installs.
+    // http-transport.ts pulls in express/cors/MCP SDK HTTP transport; these must
+    // not load before installGlobalStdoutSentinel() runs (see module doc above).
+    const port = Number(options.port ?? 3000);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      logger.error(
+        { port: options.port },
+        `Invalid --port value: "${options.port ?? ''}". Must be an integer between 1 and 65535.`,
+      );
+      process.exit(1);
+    }
+    // Dynamic import keeps express/cors out of mcp.ts's static graph (stdio sentinel).
+    const { startMcpHttpServer, resolveAuthToken } = await import('../mcp/http-transport.js');
+    try {
+      await startMcpHttpServer(backend, {
+        port,
+        host: options.host ?? '127.0.0.1',
+        authToken: resolveAuthToken(options.authToken, process.env),
+        repositoryPolicy,
+        refreshIndex,
+      });
+    } catch (err) {
+      logger.error(
+        { err: err instanceof Error ? err.message : err },
+        'Failed to start the MCP HTTP server',
+      );
+      process.exit(1);
+    }
+    void startMcpUpdateNotifier(logger).catch(() => {});
+    return;
+  }
+
   // Start MCP server (serves all repos, discovers new ones lazily)
-  await startMCPServer(backend);
+  await startMCPServer(backend, repositoryPolicy, { refreshIndex });
+  void startMcpUpdateNotifier(logger).catch(() => {});
 };

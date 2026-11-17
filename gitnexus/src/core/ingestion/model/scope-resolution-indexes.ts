@@ -26,8 +26,8 @@
  *   - `scopeTree` / `moduleScopes` / `defs` / `qualifiedNames` — the
  *     four Ring 2 SHARED indexes built over per-file artifacts.
  *   - `methodDispatch` — MRO + implements materialized view (#914).
- *   - `imports` — finalized `ImportEdge[]` per module scope (`parsedImports`
- *     resolved through cross-file link + wildcard expansion).
+ *   - `imports` — what each scope imports, behind `ImportVisibility`
+ *     (`parsedImports` resolved through cross-file link + wildcard expansion).
  *   - `bindings` — merged bindings per module scope (local + import +
  *     wildcard + re-export), with the provider's precedence applied.
  *   - `referenceSites` — union of every file's pre-resolution usage
@@ -45,23 +45,30 @@ import type {
   DefIndex,
   FinalizedScc,
   FinalizeStats,
-  ImportEdge,
+  ImportVisibility,
   MethodDispatchIndex,
   ModuleScopeIndex,
   QualifiedNameIndex,
   ReferenceSite,
   ScopeId,
   ScopeTree,
+  SymbolDefinition,
+  TypeRef,
 } from 'gitnexus-shared';
 
 export interface ScopeResolutionIndexes {
+  /** Optional authoritative namespace exports, installed when the bundle is
+   *  built, before return propagation. */
+  readonly namespaceExportsByFile?: ReadonlyMap<string, ReadonlyMap<string, SymbolDefinition>>;
   readonly scopeTree: ScopeTree;
   readonly defs: DefIndex;
   readonly qualifiedNames: QualifiedNameIndex;
   readonly moduleScopes: ModuleScopeIndex;
   readonly methodDispatch: MethodDispatchIndex;
-  /** Finalized `ImportEdge[]` per module scope. */
-  readonly imports: ReadonlyMap<ScopeId, readonly ImportEdge[]>;
+  /** What each scope imports, as finalize resolved it. The only access path:
+   *  ask `reaches` / `membership` / `forEachTarget` for everything a scope can
+   *  reach, and `edgesAt` for the edges bound by name or kind. */
+  readonly imports: ImportVisibility;
   /** Finalize-output bindings (local + imports + wildcards) per module scope.
    *  Inner `BindingRef[]` arrays are frozen by `materializeBindings`;
    *  this channel is permanently immutable post-finalize. Consumers
@@ -77,6 +84,64 @@ export interface ScopeResolutionIndexes {
    *  are returned first and win duplicate `def.nodeId` metadata, with
    *  unique augmentations appended after. See I8. */
   readonly bindingAugmentations: ReadonlyMap<ScopeId, ReadonlyMap<string, readonly BindingRef[]>>;
+  /** Workspace-level binding lookup, shared instead of per-scope
+   *  duplication. Consulted by `lookupBindingsAt` as a third source after
+   *  finalized and per-scope augmented bindings. Language-specific
+   *  namespace-sibling hooks populate it with keys that mean the same thing
+   *  from every scope — e.g. backslash-separated FQNs (`App\Models\User`) for
+   *  backslash-namespace languages. The shared map gives those workspace-wide
+   *  names one entry each instead of O(scopes × defs) per-scope augmentation.
+   *  It answers at EVERY scope, ahead of anything an enclosing scope binds, so
+   *  a bare simple name belongs here only if no nearer declaration can hide
+   *  it. A default namespace whose simple names rank below the file's own
+   *  namespaces goes through `namespaceFqnBindings` under its own key instead. */
+  readonly workspaceFqnBindings: ReadonlyMap<string, readonly BindingRef[]>;
+  /** Workspace-level *type* binding lookup — the typeBindings analogue of
+   *  `workspaceFqnBindings`. Holds names that are type-visible from every file
+   *  (e.g. C# global/default-namespace method return-type bindings, keyed by
+   *  the bound name). The C# language spec makes the unnamed global namespace a
+   *  single declaration space whose members are available from inside named
+   *  namespaces too — so this channel is consulted scope-independently by the
+   *  typeBindings chain-walkers (`findReceiverTypeBinding`,
+   *  `followChainPostFinalize`) as a final fallback after the per-scope chain.
+   *  Routing global types here gives them one shared entry instead of the
+   *  O(scopes × defs) per-file `Scope.typeBindings` copy that OOM'd large
+   *  no-namespace solutions (#1871) — mirroring how Roslyn resolves against a
+   *  single `Compilation.GlobalNamespace` symbol rather than per-file copies.
+   *  Populated post-finalize by `populateCsharpNamespaceSiblings`; most
+   *  languages leave it empty. */
+  readonly workspaceTypeBindings: ReadonlyMap<string, TypeRef>;
+  /** Per-namespace class/def binding lookup — the namespace-scoped analogue of
+   *  `workspaceFqnBindings`. Outer key is the namespace name (e.g. `App.Models`),
+   *  inner key is the simple name. Unlike the flat workspace channels (which are
+   *  visible from *every* file — correct only for the global/default namespace),
+   *  named-namespace types are visible only within that namespace and to files
+   *  that import it, so this channel is consulted through an accessibility gate
+   *  (`accessibleNamespacesByScope`) rather than unconditionally. Routing named
+   *  siblings here gives them one entry per def instead of the O(files × defs)
+   *  per-scope augmentation that OOM'd large single-namespace solutions (#1871).
+   *  Populated post-finalize by language namespace-sibling hooks; most languages
+   *  leave it empty. */
+  readonly namespaceFqnBindings: ReadonlyMap<string, ReadonlyMap<string, readonly BindingRef[]>>;
+  /** Per-namespace *type* binding lookup — the namespace-scoped analogue of
+   *  `workspaceTypeBindings`. Outer key is the namespace name, inner key is the
+   *  bound name (e.g. a method name mapping to its return TypeRef). Consulted by
+   *  the typeBindings chain-walkers (`findReceiverTypeBinding`,
+   *  `followChainPostFinalize`) through the `accessibleNamespacesByScope` gate
+   *  after the per-scope chain and the flat `workspaceTypeBindings` miss.
+   *  Populated post-finalize; most languages leave it empty. */
+  readonly namespaceTypeBindings: ReadonlyMap<string, ReadonlyMap<string, TypeRef>>;
+  /** Accessibility gate for the per-namespace channels. A declaration or module
+   *  scope maps to the namespace names visible there, including enclosing and
+   *  global namespaces where the provider permits them. Provider ordering
+   *  preserves lookup precedence without copying definitions into every scope.
+   *  Empty for bundles that do not populate the namespace channels. */
+  readonly accessibleNamespacesByScope: ReadonlyMap<ScopeId, readonly string[]>;
+  /** Optional precedence groups for namespace lookup. Candidates in one group
+   *  compete together; the first group containing a name hides later groups.
+   *  Keys may be declaration scopes as well as module scopes. Bundles that
+   *  omit this channel retain their existing flat accessibility semantics. */
+  readonly namespaceLookupTiersByScope?: ReadonlyMap<ScopeId, readonly (readonly string[])[]>;
   /** Pre-resolution usage facts; consumed by the resolution phase. */
   readonly referenceSites: readonly ReferenceSite[];
   /** SCC condensation of the file-level import graph — callers that want

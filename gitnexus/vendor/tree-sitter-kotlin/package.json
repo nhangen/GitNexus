@@ -1,0 +1,19 @@
+{
+  "name": "tree-sitter-kotlin",
+  "version": "0.4.0-gd6af96d",
+  "description": "Kotlin grammar for tree-sitter",
+  "repository": "https://github.com/fwcd/tree-sitter-kotlin",
+  "license": "MIT",
+  "main": "bindings/node/index.js",
+  "types": "bindings/node/index.d.ts",
+  "_vendoredBy": "gitnexus - re-vendored from fwcd/tree-sitter-kotlin@d6af96d2e23ef0a8ff5ab512864378cf08fba311 by grammar-update-monitor on ABI 14. Source-build inputs (parser.c/scanner.c/src/) refreshed; the GitNexus-hardened binding.gyp + synchronous loader + vendor README + prebuilds are preserved (prebuilds are rebuilt by build-tree-sitter-prebuilds.yml on this version change). No scripts/dependencies here (#836/#1728).",
+  "peerDependencies": {
+    "tree-sitter": "0.25.1"
+  },
+  "peerDependenciesMeta": {
+    "tree-sitter": {
+      "optional": true
+    }
+  },
+  "_upstreamCommit": "d6af96d2e23ef0a8ff5ab512864378cf08fba311"
+}

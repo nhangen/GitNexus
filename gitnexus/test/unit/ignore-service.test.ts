@@ -1,7 +1,8 @@
-import { describe, it, expect, beforeAll, beforeEach, afterAll, afterEach } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, afterAll, afterEach, vi } from 'vitest';
 import fs from 'fs/promises';
 import path from 'path';
 import os from 'os';
+import { execFileSync } from 'child_process';
 import {
   shouldIgnorePath,
   isHardcodedIgnoredDirectory,
@@ -9,6 +10,30 @@ import {
   createIgnoreFilter,
 } from '../../src/config/ignore-service.js';
 import { _captureLogger } from '../../src/core/logger.js';
+import * as git from '../../src/storage/git.js';
+
+// Only the two functions loadIgnoreRules calls are mocked (#2606) — real git
+// repos/config are exercised separately in git.test.ts; here the goal is
+// hermetic coverage of loadIgnoreRules' precedence wiring.
+vi.mock('../../src/storage/git.js', () => ({
+  getCoreExcludesFilePath: vi.fn(),
+  getGitInfoExcludePath: vi.fn(),
+}));
+
+// Every other describe block in this file calls loadIgnoreRules/
+// createIgnoreFilter without expecting a global-ignore layer — default both
+// mocks to "nothing there" (a path that can't exist, and null respectively)
+// so pre-existing scenarios stay unaffected. The #2606 block below overrides
+// per test.
+const NONEXISTENT_CORE_EXCLUDES_PATH = path.join(
+  os.tmpdir(),
+  'gn-ignore-service-test-nonexistent-core-excludes-file',
+);
+
+beforeEach(() => {
+  vi.mocked(git.getCoreExcludesFilePath).mockReturnValue(NONEXISTENT_CORE_EXCLUDES_PATH);
+  vi.mocked(git.getGitInfoExcludePath).mockReturnValue(null);
+});
 
 describe('shouldIgnorePath', () => {
   describe('version control directories', () => {
@@ -175,8 +200,19 @@ describe('shouldIgnorePath', () => {
       expect(shouldIgnorePath('src/api.generated.ts')).toBe(true);
     });
 
-    it('ignores TypeScript declaration files', () => {
-      expect(shouldIgnorePath('types/index.d.ts')).toBe(true);
+    it('ignores generated Monaco editor worker bundles', () => {
+      expect(shouldIgnorePath('public/monaco-workers/json.worker.js')).toBe(true);
+      expect(shouldIgnorePath('keep-ui/public/monaco-workers/125.js')).toBe(true);
+    });
+
+    it('keeps tracked TypeScript declaration files discoverable', () => {
+      expect(shouldIgnorePath('types/index.d.ts')).toBe(false);
+    });
+
+    it('ignores Laravel compiled Blade view cache files', () => {
+      expect(shouldIgnorePath('storage/framework/views/1a2b3c.php')).toBe(true);
+      expect(shouldIgnorePath('project/storage/framework/views/1a2b3c.php')).toBe(true);
+      expect(shouldIgnorePath('project\\storage\\framework\\views\\1a2b3c.php')).toBe(true);
     });
   });
 
@@ -191,6 +227,12 @@ describe('shouldIgnorePath', () => {
     it.each([
       'src/index.ts',
       'src/components/Button.tsx',
+      'apps/client/src/shared/env/getAppEnv.ts',
+      'packages/ai/src/generated/bundle.ts',
+      'apps/client/src/vite-env.d.ts',
+      'Generated/client.cs',
+      'Env/settings.ts',
+      'ENV/config.ts',
       'lib/utils.py',
       'cmd/server/main.go',
       'src/main.rs',
@@ -203,6 +245,13 @@ describe('shouldIgnorePath', () => {
     ])('does not ignore source file %s', (filePath) => {
       expect(shouldIgnorePath(filePath)).toBe(false);
     });
+
+    it.each(['env/pyvenv.cfg', 'env/settings.py', 'generated/client.ts'])(
+      'prunes ambiguous artifact directories only at the repository root: %s',
+      (filePath) => {
+        expect(shouldIgnorePath(filePath)).toBe(true);
+      },
+    );
   });
 });
 
@@ -211,7 +260,9 @@ describe('isHardcodedIgnoredDirectory', () => {
     expect(isHardcodedIgnoredDirectory('node_modules')).toBe(true);
     expect(isHardcodedIgnoredDirectory('.git')).toBe(true);
     expect(isHardcodedIgnoredDirectory('dist')).toBe(true);
+    expect(isHardcodedIgnoredDirectory('monaco-workers')).toBe(true);
     expect(isHardcodedIgnoredDirectory('__pycache__')).toBe(true);
+    expect(isHardcodedIgnoredDirectory('dist-packages')).toBe(true);
   });
 
   it('returns false for source directories', () => {
@@ -219,6 +270,8 @@ describe('isHardcodedIgnoredDirectory', () => {
     expect(isHardcodedIgnoredDirectory('lib')).toBe(false);
     expect(isHardcodedIgnoredDirectory('app')).toBe(false);
     expect(isHardcodedIgnoredDirectory('local')).toBe(false);
+    expect(isHardcodedIgnoredDirectory('env')).toBe(false);
+    expect(isHardcodedIgnoredDirectory('generated')).toBe(false);
   });
 });
 
@@ -272,6 +325,65 @@ describe('.gitnexusignore negation overrides hardcoded DEFAULT_IGNORE_LIST (#771
     expect(filter.childrenIgnored(mkPath('__tests__'))).toBe(true);
   });
 
+  it('prunes exact-case root artifacts while allowing nested source directories', async () => {
+    const filter = await createIgnoreFilter(tmpDir);
+
+    expect(filter.childrenIgnored(mkPath('generated'))).toBe(true);
+    expect(filter.childrenIgnored(mkPath('env'))).toBe(true);
+    expect(filter.childrenIgnored(mkPath('packages/api/generated'))).toBe(false);
+    expect(filter.childrenIgnored(mkPath('Generated'))).toBe(false);
+    expect(filter.childrenIgnored(mkPath('Env'))).toBe(false);
+  });
+
+  // `_next` has to prune the DIRECTORY, not merely reject each file underneath.
+  // Every measured benefit of ignoring it comes from never enumerating the
+  // bundle tree, and no file list can show the difference — anything under
+  // `_next` is rejected either way. `childrenIgnored` is the only observation
+  // that distinguishes them, so a refactor that moved `_next` to a
+  // `shouldIgnorePath`-only rule would keep the build-output suite green while
+  // silently restoring the full walk.
+  it('prunes emitted _next output as a directory, at any depth', async () => {
+    const filter = await createIgnoreFilter(tmpDir);
+
+    expect(filter.childrenIgnored(mkPath('_next'))).toBe(true);
+    expect(filter.childrenIgnored(mkPath('android/app/src/main/assets/public/_next'))).toBe(true);
+  });
+
+  it('matches _next as a whole segment, so _nextgen source is still walked', async () => {
+    const filter = await createIgnoreFilter(tmpDir);
+
+    expect(filter.childrenIgnored(mkPath('src/_nextgen'))).toBe(false);
+    expect(filter.childrenIgnored(mkPath('packages/my_next'))).toBe(false);
+  });
+
+  it('`!_next/` negation unlocks the emitted output directory at any depth', async () => {
+    // The bare form is the one that works. `!_next/**` alone is a silent no-op:
+    // `childrenIgnored` prunes the directory before any descendant pattern is
+    // ever tested, so no file underneath reaches `ignored`.
+    await fs.writeFile(path.join(tmpDir, '.gitnexusignore'), '!_next/\n');
+    const filter = await createIgnoreFilter(tmpDir);
+
+    expect(filter.childrenIgnored(mkPath('_next'))).toBe(false);
+    expect(filter.childrenIgnored(mkPath('android/app/src/main/assets/public/_next'))).toBe(false);
+  });
+
+  it('prunes a nested env directory only when pyvenv.cfg identifies a virtual environment', async () => {
+    await fs.mkdir(path.join(tmpDir, 'backend', 'env'), { recursive: true });
+    await fs.writeFile(path.join(tmpDir, 'backend', 'env', 'pyvenv.cfg'), 'home = python\n');
+    const filter = await createIgnoreFilter(tmpDir);
+
+    expect(filter.childrenIgnored(mkPath('backend/env'))).toBe(true);
+    expect(filter.childrenIgnored(mkPath('services/api/env'))).toBe(false);
+  });
+
+  it('`!env/` negation unlocks the root artifact directory', async () => {
+    await fs.writeFile(path.join(tmpDir, '.gitnexusignore'), '!env/\n');
+    const filter = await createIgnoreFilter(tmpDir);
+
+    expect(filter.childrenIgnored(mkPath('env'))).toBe(false);
+    expect(filter.ignored(mkPath('env/settings.py'))).toBe(false);
+  });
+
   it('`!__tests__/` negation unlocks the directory and its descendants', async () => {
     await fs.writeFile(path.join(tmpDir, '.gitnexusignore'), '!__tests__/\n');
     const filter = await createIgnoreFilter(tmpDir);
@@ -299,6 +411,22 @@ describe('.gitnexusignore negation overrides hardcoded DEFAULT_IGNORE_LIST (#771
     expect(filter.ignored(mkPath('node_modules/express/index.js'))).toBe(false);
   });
 
+  it('`!parts/` unlocks Java modules and nested parts directories (#2673)', async () => {
+    await fs.writeFile(path.join(tmpDir, '.gitnexusignore'), '!parts/\n');
+    const filter = await createIgnoreFilter(tmpDir);
+
+    expect(filter.childrenIgnored(mkPath('parts'))).toBe(false);
+    expect(filter.ignored(mkPath('parts/src/main/java/com/example/Part.java'))).toBe(false);
+    expect(filter.childrenIgnored(mkPath('admin/src/main/java/com/example/controller/parts'))).toBe(
+      false,
+    );
+    expect(
+      filter.ignored(
+        mkPath('admin/src/main/java/com/example/controller/parts/PartsController.java'),
+      ),
+    ).toBe(false);
+  });
+
   it('negation of one hardcoded entry does not leak to others', async () => {
     await fs.writeFile(path.join(tmpDir, '.gitnexusignore'), '!__tests__/\n');
     const filter = await createIgnoreFilter(tmpDir);
@@ -310,6 +438,13 @@ describe('.gitnexusignore negation overrides hardcoded DEFAULT_IGNORE_LIST (#771
     expect(filter.ignored(mkPath('dist/bundle.js'))).toBe(true);
     expect(filter.childrenIgnored(mkPath('node_modules'))).toBe(true);
     expect(filter.childrenIgnored(mkPath('.git'))).toBe(true);
+  });
+
+  it('explicit negation can still opt into generated Monaco worker bundles', async () => {
+    await fs.writeFile(path.join(tmpDir, '.gitnexusignore'), '!public/monaco-workers/\n');
+    const filter = await createIgnoreFilter(tmpDir);
+    expect(filter.childrenIgnored(mkPath('public/monaco-workers'))).toBe(false);
+    expect(filter.ignored(mkPath('public/monaco-workers/json.worker.js'))).toBe(false);
   });
 
   it('standard `.gitignore` rules (no negation) still layer on top of hardcoded', async () => {
@@ -553,6 +688,319 @@ describe('createIgnoreFilter', () => {
   });
 });
 
+describe('createIgnoreFilter with nested .gitignore files (#2675)', () => {
+  let tmpDir: string;
+  let originalNoGitignore: string | undefined;
+
+  const asPath = (rel: string) => ({ name: path.basename(rel), relative: () => rel }) as any;
+
+  beforeEach(async () => {
+    originalNoGitignore = process.env.GITNEXUS_NO_GITIGNORE;
+    // These tests expect nested rules to apply, so a value inherited from the
+    // invoking shell must not switch them off. afterEach restores it.
+    delete process.env.GITNEXUS_NO_GITIGNORE;
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'gn-nested-ignore-test-'));
+  });
+
+  afterEach(async () => {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+    if (originalNoGitignore === undefined) {
+      delete process.env.GITNEXUS_NO_GITIGNORE;
+    } else {
+      process.env.GITNEXUS_NO_GITIGNORE = originalNoGitignore;
+    }
+  });
+
+  it('applies a nested .gitignore relative to its own directory', async () => {
+    await fs.mkdir(path.join(tmpDir, 'app', 'public', 'generated'), { recursive: true });
+    await fs.writeFile(path.join(tmpDir, 'app', '.gitignore'), 'public/generated/\n*.log\n');
+    const filter = await createIgnoreFilter(tmpDir);
+
+    expect(filter.childrenIgnored(asPath('app/public/generated'))).toBe(true);
+    expect(filter.ignored(asPath('app/public/generated/bundle.js'))).toBe(true);
+    expect(filter.ignored(asPath('app/debug.log'))).toBe(true);
+    expect(filter.ignored(asPath('app/src/deep/debug.log'))).toBe(true);
+
+    // Rules stay scoped to the directory that declares them.
+    expect(filter.childrenIgnored(asPath('public/generated'))).toBe(false);
+    expect(filter.ignored(asPath('debug.log'))).toBe(false);
+    expect(filter.ignored(asPath('other/debug.log'))).toBe(false);
+    expect(filter.ignored(asPath('app/src/index.ts'))).toBe(false);
+  });
+
+  it('preserves independent root exclusions beneath a GitNexus directory negation', async () => {
+    await fs.mkdir(path.join(tmpDir, 'pkg', 'generated'), { recursive: true });
+    await fs.writeFile(path.join(tmpDir, '.gitignore'), '*.log\n**/pkg/generated/\n');
+    await fs.writeFile(path.join(tmpDir, '.gitnexusignore'), '!pkg/\n');
+    const filter = await createIgnoreFilter(tmpDir);
+
+    expect(filter.childrenIgnored(asPath('pkg'))).toBe(false);
+    expect(filter.ignored(asPath('pkg/debug.log'))).toBe(true);
+    expect(filter.childrenIgnored(asPath('pkg/generated'))).toBe(true);
+    expect(filter.ignored(asPath('pkg/generated/index.ts'))).toBe(true);
+    expect(filter.ignored(asPath('pkg/index.ts'))).toBe(false);
+  });
+
+  it('preserves root inclusions after an unrelated nested directory negation', async () => {
+    await fs.mkdir(path.join(tmpDir, 'pkg', 'reports', '__tests__'), { recursive: true });
+    await fs.writeFile(path.join(tmpDir, '.gitignore'), '!__tests__/\n');
+    await fs.writeFile(path.join(tmpDir, 'pkg', '.gitignore'), '!reports/\n');
+    await fs.writeFile(path.join(tmpDir, 'pkg', 'reports', '__tests__', 'test.ts'), 'export {};\n');
+    const filter = await createIgnoreFilter(tmpDir);
+
+    expect(filter.childrenIgnored(asPath('pkg/reports/__tests__'))).toBe(false);
+    expect(filter.ignored(asPath('pkg/reports/__tests__/test.ts'))).toBe(false);
+    const { walkRepositoryPaths } = await import('../../src/core/ingestion/filesystem-walker.js');
+    expect((await walkRepositoryPaths(tmpDir)).map((f) => f.path)).toContain(
+      'pkg/reports/__tests__/test.ts',
+    );
+  });
+
+  it('lets a deeper nested negation re-include what an outer nested file ignored', async () => {
+    await fs.mkdir(path.join(tmpDir, 'app', 'lib'), { recursive: true });
+    await fs.writeFile(path.join(tmpDir, 'app', '.gitignore'), '*.gen.ts\n');
+    await fs.writeFile(path.join(tmpDir, 'app', 'lib', '.gitignore'), '!keep.gen.ts\n');
+    const filter = await createIgnoreFilter(tmpDir);
+
+    expect(filter.ignored(asPath('app/lib/keep.gen.ts'))).toBe(false);
+    expect(filter.ignored(asPath('app/lib/other.gen.ts'))).toBe(true);
+  });
+
+  it('lets a nested negation re-include what the root .gitignore ignored', async () => {
+    await fs.mkdir(path.join(tmpDir, 'pkg', 'reports'), { recursive: true });
+    await fs.writeFile(path.join(tmpDir, '.gitignore'), '*.log\nreports/\n');
+    await fs.writeFile(path.join(tmpDir, 'pkg', '.gitignore'), '!keep.log\n!reports/\n');
+    const filter = await createIgnoreFilter(tmpDir);
+
+    expect(filter.ignored(asPath('pkg/keep.log'))).toBe(false);
+    expect(filter.ignored(asPath('pkg/other.log'))).toBe(true);
+    expect(filter.childrenIgnored(asPath('pkg/reports'))).toBe(false);
+    expect(filter.childrenIgnored(asPath('reports'))).toBe(true);
+  });
+
+  it('re-includes the files inside a directory a nested negation un-ignores', async () => {
+    await fs.mkdir(path.join(tmpDir, 'pkg', 'reports', 'daily'), { recursive: true });
+    await fs.writeFile(path.join(tmpDir, '.gitignore'), 'reports/\n');
+    await fs.writeFile(path.join(tmpDir, 'pkg', '.gitignore'), '!reports/\n');
+    await fs.writeFile(path.join(tmpDir, 'pkg', 'reports', 'summary.ts'), 'export {};\n');
+    await fs.writeFile(path.join(tmpDir, 'pkg', 'reports', 'daily', 'run.ts'), 'export {};\n');
+    await fs.mkdir(path.join(tmpDir, 'reports'), { recursive: true });
+    await fs.writeFile(path.join(tmpDir, 'reports', 'top.ts'), 'export {};\n');
+    const filter = await createIgnoreFilter(tmpDir);
+
+    expect(filter.ignored(asPath('pkg/reports/summary.ts'))).toBe(false);
+    expect(filter.childrenIgnored(asPath('pkg/reports/daily'))).toBe(false);
+    expect(filter.ignored(asPath('pkg/reports/daily/run.ts'))).toBe(false);
+    expect(filter.ignored(asPath('reports/top.ts'))).toBe(true);
+
+    const { walkRepositoryPaths } = await import('../../src/core/ingestion/filesystem-walker.js');
+    const scanned = (await walkRepositoryPaths(tmpDir)).map((f) => f.path);
+
+    expect(scanned).toContain('pkg/reports/summary.ts');
+    expect(scanned).toContain('pkg/reports/daily/run.ts');
+    expect(scanned).not.toContain('reports/top.ts');
+  });
+
+  it('keeps independent root exclusions inside a directory re-included by nested rules', async () => {
+    await fs.mkdir(path.join(tmpDir, 'pkg', 'reports', 'private'), { recursive: true });
+    await fs.writeFile(path.join(tmpDir, '.gitignore'), '*.ts\nreports/\n**/reports/private/\n');
+    await fs.writeFile(path.join(tmpDir, 'pkg', '.gitignore'), '!reports/\n');
+    await fs.writeFile(path.join(tmpDir, 'pkg', 'reports', 'file.ts'), 'export {};\n');
+    await fs.writeFile(path.join(tmpDir, 'pkg', 'reports', 'keep.js'), 'export {};\n');
+    await fs.writeFile(path.join(tmpDir, 'pkg', 'reports', 'private', 'secret.js'), 'export {};\n');
+
+    const { walkRepositoryPaths } = await import('../../src/core/ingestion/filesystem-walker.js');
+    const scanned = (await walkRepositoryPaths(tmpDir)).map((f) => f.path);
+
+    expect(scanned).toContain('pkg/reports/keep.js');
+    expect(scanned).not.toContain('pkg/reports/file.ts');
+    expect(scanned).not.toContain('pkg/reports/private/secret.js');
+  });
+
+  it('re-includes descendants when a deeper directory negation overrides an outer nested file', async () => {
+    await fs.mkdir(path.join(tmpDir, 'app', 'pkg', 'reports', 'daily'), { recursive: true });
+    await fs.writeFile(path.join(tmpDir, 'app', '.gitignore'), 'reports/\n*.gen.ts\n');
+    await fs.writeFile(path.join(tmpDir, 'app', 'pkg', '.gitignore'), '!reports/\n');
+    await fs.writeFile(path.join(tmpDir, 'app', 'pkg', 'reports', 'keep.ts'), 'export {};\n');
+    await fs.writeFile(path.join(tmpDir, 'app', 'pkg', 'reports', 'drop.gen.ts'), 'export {};\n');
+    await fs.writeFile(
+      path.join(tmpDir, 'app', 'pkg', 'reports', 'daily', 'run.ts'),
+      'export {};\n',
+    );
+
+    const { walkRepositoryPaths } = await import('../../src/core/ingestion/filesystem-walker.js');
+    const scanned = (await walkRepositoryPaths(tmpDir)).map((f) => f.path);
+
+    expect(scanned).toContain('app/pkg/reports/keep.ts');
+    expect(scanned).toContain('app/pkg/reports/daily/run.ts');
+    expect(scanned).not.toContain('app/pkg/reports/drop.gen.ts');
+  });
+
+  it.each(['reports [daily]', ...(process.platform === 'win32' ? [] : ['reports\ndaily'])])(
+    'keeps re-included directory names literal: %j',
+    async (directory) => {
+      await fs.mkdir(path.join(tmpDir, 'pkg', directory), { recursive: true });
+      await fs.mkdir(path.join(tmpDir, 'other', directory), { recursive: true });
+      await fs.writeFile(path.join(tmpDir, '.gitignore'), 'reports*/\n*.ts\n');
+      await fs.writeFile(path.join(tmpDir, 'pkg', '.gitignore'), '!reports*/\n');
+      await fs.writeFile(path.join(tmpDir, 'pkg', directory, 'keep.js'), 'export {};\n');
+      await fs.writeFile(path.join(tmpDir, 'pkg', directory, 'drop.ts'), 'export {};\n');
+      await fs.writeFile(path.join(tmpDir, 'other', directory, 'drop.js'), 'export {};\n');
+
+      const { walkRepositoryPaths } = await import('../../src/core/ingestion/filesystem-walker.js');
+      const scanned = (await walkRepositoryPaths(tmpDir)).map((f) => f.path);
+
+      expect(scanned).toContain(`pkg/${directory}/keep.js`);
+      expect(scanned).not.toContain(`pkg/${directory}/drop.ts`);
+      expect(scanned).not.toContain(`other/${directory}/drop.js`);
+    },
+  );
+
+  it('keeps .gitnexusignore above a nested negation', async () => {
+    await fs.mkdir(path.join(tmpDir, 'pkg'), { recursive: true });
+    await fs.writeFile(path.join(tmpDir, 'pkg', '.gitignore'), '!keep.log\n');
+    await fs.writeFile(path.join(tmpDir, '.gitnexusignore'), 'pkg/keep.log\n');
+    const filter = await createIgnoreFilter(tmpDir);
+
+    expect(filter.ignored(asPath('pkg/keep.log'))).toBe(true);
+  });
+
+  it('keeps an explicit root .gitnexusignore negation in charge', async () => {
+    await fs.mkdir(path.join(tmpDir, 'app'), { recursive: true });
+    await fs.writeFile(path.join(tmpDir, 'app', '.gitignore'), 'generated/\n');
+    await fs.writeFile(path.join(tmpDir, '.gitnexusignore'), '!app/generated/\n');
+    const filter = await createIgnoreFilter(tmpDir);
+
+    expect(filter.childrenIgnored(asPath('app/generated'))).toBe(false);
+    expect(filter.ignored(asPath('app/generated/schema.ts'))).toBe(false);
+  });
+
+  it('lets a nested ignore beat a root .gitignore file negation', async () => {
+    await fs.mkdir(path.join(tmpDir, 'pkg'), { recursive: true });
+    await fs.writeFile(path.join(tmpDir, '.gitignore'), '*.log\n!pkg/keep.log\n');
+    await fs.writeFile(path.join(tmpDir, 'pkg', '.gitignore'), 'keep.log\n');
+    const filter = await createIgnoreFilter(tmpDir);
+
+    expect(filter.ignored(asPath('pkg/keep.log'))).toBe(true);
+  });
+
+  it('lets a nested ignore beat a root .gitignore directory negation', async () => {
+    await fs.mkdir(path.join(tmpDir, 'app', 'generated'), { recursive: true });
+    await fs.writeFile(path.join(tmpDir, '.gitignore'), '!app/generated/\n');
+    await fs.writeFile(path.join(tmpDir, 'app', '.gitignore'), 'generated/\n');
+    const filter = await createIgnoreFilter(tmpDir);
+
+    expect(filter.childrenIgnored(asPath('app/generated'))).toBe(true);
+    expect(filter.ignored(asPath('app/generated/schema.ts'))).toBe(true);
+  });
+
+  it('does not let a nested negation rescue hardcoded defaults', async () => {
+    await fs.mkdir(path.join(tmpDir, 'pkg', 'node_modules'), { recursive: true });
+    await fs.writeFile(
+      path.join(tmpDir, 'pkg', '.gitignore'),
+      '!node_modules/\n!package-lock.json\n',
+    );
+    const filter = await createIgnoreFilter(tmpDir);
+
+    expect(filter.childrenIgnored(asPath('pkg/node_modules'))).toBe(true);
+    expect(filter.ignored(asPath('pkg/package-lock.json'))).toBe(true);
+  });
+
+  it.skipIf(process.platform === 'win32')('ignores a symlinked nested .gitignore', async () => {
+    await fs.mkdir(path.join(tmpDir, 'app'), { recursive: true });
+    await fs.writeFile(path.join(tmpDir, 'rules.txt'), '*.log\n');
+    await fs.symlink(path.join(tmpDir, 'rules.txt'), path.join(tmpDir, 'app', '.gitignore'));
+    const filter = await createIgnoreFilter(tmpDir);
+
+    expect(filter.ignored(asPath('app/debug.log'))).toBe(false);
+  });
+
+  it('skips nested .gitignore files when GITNEXUS_NO_GITIGNORE is set', async () => {
+    await fs.mkdir(path.join(tmpDir, 'app'), { recursive: true });
+    await fs.writeFile(path.join(tmpDir, 'app', '.gitignore'), 'generated/\n');
+    process.env.GITNEXUS_NO_GITIGNORE = '1';
+    const filter = await createIgnoreFilter(tmpDir);
+
+    expect(filter.childrenIgnored(asPath('app/generated'))).toBe(false);
+  });
+
+  it('prunes nested-ignored files from a real repository walk', async () => {
+    await fs.mkdir(path.join(tmpDir, 'app', 'src'), { recursive: true });
+    await fs.mkdir(path.join(tmpDir, 'app', 'public', 'generated'), { recursive: true });
+    await fs.writeFile(path.join(tmpDir, 'app', '.gitignore'), 'public/generated/\n');
+    await fs.writeFile(path.join(tmpDir, 'app', 'src', 'index.ts'), 'export {};\n');
+    await fs.writeFile(path.join(tmpDir, 'app', 'public', 'generated', 'bundle.js'), 'x;\n');
+
+    const { walkRepositoryPaths } = await import('../../src/core/ingestion/filesystem-walker.js');
+    const scanned = (await walkRepositoryPaths(tmpDir)).map((f) => f.path);
+
+    expect(scanned).toContain('app/src/index.ts');
+    expect(scanned).not.toContain('app/public/generated/bundle.js');
+  });
+
+  it('follows git when a nested file negates a path inside an ignored directory', async () => {
+    // git cannot re-include a file whose parent directory is excluded, so
+    // `gen/` + `!gen/keep.ts` leaves keep.ts out, while `gen/*` excludes only
+    // the contents and lets the negation bring keep.ts back. Root rules behave
+    // the same way. (`gen`, not `build`: `build` is a hardcoded default.)
+    const { walkRepositoryPaths } = await import('../../src/core/ingestion/filesystem-walker.js');
+    for (const [pkg, rules] of [
+      ['dir', 'gen/\n!gen/keep.ts\n'],
+      ['star', 'gen/*\n!gen/keep.ts\n'],
+    ]) {
+      await fs.mkdir(path.join(tmpDir, pkg, 'gen'), { recursive: true });
+      await fs.writeFile(path.join(tmpDir, pkg, '.gitignore'), rules);
+      await fs.writeFile(path.join(tmpDir, pkg, 'gen', 'keep.ts'), 'export {};\n');
+      await fs.writeFile(path.join(tmpDir, pkg, 'gen', 'drop.ts'), 'export {};\n');
+    }
+
+    const scanned = (await walkRepositoryPaths(tmpDir)).map((f) => f.path);
+
+    expect(scanned).not.toContain('dir/gen/keep.ts');
+    expect(scanned).not.toContain('dir/gen/drop.ts');
+    expect(scanned).toContain('star/gen/keep.ts');
+    expect(scanned).not.toContain('star/gen/drop.ts');
+  });
+
+  it.skipIf(process.platform === 'win32')(
+    'does not hang on a nested .gitignore that is a FIFO',
+    async () => {
+      // Opening a FIFO for reading blocks until a writer appears. Without
+      // O_NONBLOCK the walk would stop in open(2), before the regular-file
+      // check, and never return.
+      await fs.mkdir(path.join(tmpDir, 'pkg', 'src'), { recursive: true });
+      await fs.writeFile(path.join(tmpDir, 'pkg', 'src', 'index.ts'), 'export {};\n');
+      execFileSync('mkfifo', [path.join(tmpDir, 'pkg', '.gitignore')]);
+
+      // A timer in this worker cannot interrupt a blocked synchronous open.
+      // Enforce the deadline outside the process that performs the walk.
+      const walkerUrl = new URL('../../src/core/ingestion/filesystem-walker.ts', import.meta.url)
+        .href;
+      const output = execFileSync(
+        process.execPath,
+        [
+          '--import',
+          import.meta.resolve('tsx'),
+          '--input-type=module',
+          '--eval',
+          `import { walkRepositoryPaths } from ${JSON.stringify(walkerUrl)};
+         const files = await walkRepositoryPaths(${JSON.stringify(tmpDir)});
+         console.log(JSON.stringify(files.map((file) => file.path)));`,
+        ],
+        {
+          encoding: 'utf8',
+          timeout: 5_000,
+          killSignal: 'SIGKILL',
+          env: { ...process.env, GITNEXUS_NO_GLOBAL_IGNORE: '1' },
+        },
+      );
+
+      expect(JSON.parse(output)).toContain('pkg/src/index.ts');
+    },
+    10_000,
+  );
+});
+
 describe('loadIgnoreRules — error handling', () => {
   let tmpDir: string;
 
@@ -638,4 +1086,152 @@ describe('loadIgnoreRules — GITNEXUS_NO_GITIGNORE env var', () => {
       await fs.unlink(path.join(tmpDir, '.gitnexusignore'));
     }
   });
+});
+
+// ─── Git-native global ignore sources (#2606) ─────────────────────────
+//
+// IgnoreService previously read only per-repo .gitignore/.gitnexusignore.
+// #2606 asked for something that applies across every indexed repo without
+// repeating it per repo. Rather than inventing a new file location,
+// loadIgnoreRules now reads the same two sources real `git` itself
+// consults for exactly this purpose: `core.excludesFile` (git's own
+// all-repos global file) and `$GIT_COMMON_DIR/info/exclude` (per-repo,
+// untracked — no push/commit access to the repo needed).
+//
+// Precedence mirrors gitignore(5) exactly: core.excludesFile (lowest) is
+// added first, then info/exclude, then .gitignore/.gitnexusignore below —
+// each later ig.add() can negate an earlier one, matching git's own
+// last-match-wins semantics and the #771 tests above one layer up.
+//
+// getCoreExcludesFilePath/getGitInfoExcludePath are mocked here (see the
+// vi.mock + file-wide beforeEach above) — their own real-git behavior is
+// covered in git.test.ts. This block only proves loadIgnoreRules wires
+// them into the ignore instance with the right precedence and bypasses.
+describe('loadIgnoreRules — git-native global ignore sources (#2606)', () => {
+  let repoDir: string;
+  let coreExcludesPath: string;
+  let infoExcludePath: string;
+  let originalNoGlobalIgnore: string | undefined;
+
+  beforeEach(async () => {
+    repoDir = await fs.mkdtemp(path.join(os.tmpdir(), 'gn-global-ignore-repo-'));
+    coreExcludesPath = path.join(
+      await fs.mkdtemp(path.join(os.tmpdir(), 'gn-core-excludes-')),
+      'ignore',
+    );
+    infoExcludePath = path.join(
+      await fs.mkdtemp(path.join(os.tmpdir(), 'gn-info-exclude-')),
+      'exclude',
+    );
+    vi.mocked(git.getCoreExcludesFilePath).mockReturnValue(coreExcludesPath);
+    vi.mocked(git.getGitInfoExcludePath).mockReturnValue(infoExcludePath);
+    originalNoGlobalIgnore = process.env.GITNEXUS_NO_GLOBAL_IGNORE;
+  });
+
+  afterEach(async () => {
+    if (originalNoGlobalIgnore === undefined) {
+      delete process.env.GITNEXUS_NO_GLOBAL_IGNORE;
+    } else {
+      process.env.GITNEXUS_NO_GLOBAL_IGNORE = originalNoGlobalIgnore;
+    }
+    await fs.rm(repoDir, { recursive: true, force: true });
+    await fs.rm(path.dirname(coreExcludesPath), { recursive: true, force: true });
+    await fs.rm(path.dirname(infoExcludePath), { recursive: true, force: true });
+  });
+
+  it('honours rules from core.excludesFile when no per-repo files exist', async () => {
+    await fs.writeFile(coreExcludesPath, 'docs/\n');
+    const ig = await loadIgnoreRules(repoDir);
+    expect(ig).not.toBeNull();
+    expect(ig!.ignores('docs/guide.md')).toBe(true);
+    expect(ig!.ignores('src/index.ts')).toBe(false);
+  });
+
+  it('honours rules from $GIT_COMMON_DIR/info/exclude when no per-repo files exist', async () => {
+    await fs.writeFile(infoExcludePath, 'build/\n');
+    const ig = await loadIgnoreRules(repoDir);
+    expect(ig).not.toBeNull();
+    expect(ig!.ignores('build/out.js')).toBe(true);
+    expect(ig!.ignores('src/index.ts')).toBe(false);
+  });
+
+  it('info/exclude can negate a core.excludesFile rule (matches git precedence)', async () => {
+    await fs.writeFile(coreExcludesPath, 'docs/\n');
+    await fs.writeFile(infoExcludePath, '!docs/\n');
+    const ig = await loadIgnoreRules(repoDir);
+    expect(ig).not.toBeNull();
+    expect(ig!.ignores('docs/guide.md')).toBe(false);
+  });
+
+  it('per-repo .gitnexusignore can negate rules from both global sources', async () => {
+    await fs.writeFile(coreExcludesPath, 'docs/\n');
+    await fs.writeFile(infoExcludePath, 'build/\n');
+    await fs.writeFile(path.join(repoDir, '.gitnexusignore'), '!docs/\n!build/\n');
+    const ig = await loadIgnoreRules(repoDir);
+    expect(ig).not.toBeNull();
+    expect(ig!.ignores('docs/guide.md')).toBe(false);
+    expect(ig!.ignores('build/out.js')).toBe(false);
+  });
+
+  it('gracefully skips info/exclude when getGitInfoExcludePath returns null (not a git repo)', async () => {
+    vi.mocked(git.getGitInfoExcludePath).mockReturnValue(null);
+    await fs.writeFile(coreExcludesPath, 'docs/\n');
+    const ig = await loadIgnoreRules(repoDir);
+    expect(ig).not.toBeNull();
+    expect(ig!.ignores('docs/guide.md')).toBe(true);
+  });
+
+  it('GITNEXUS_NO_GLOBAL_IGNORE skips both global sources entirely', async () => {
+    await fs.writeFile(coreExcludesPath, 'docs/\n');
+    await fs.writeFile(infoExcludePath, 'build/\n');
+    process.env.GITNEXUS_NO_GLOBAL_IGNORE = '1';
+    const ig = await loadIgnoreRules(repoDir);
+    expect(ig).toBeNull();
+  });
+
+  it('noGlobalIgnore option skips both global sources entirely', async () => {
+    await fs.writeFile(coreExcludesPath, 'docs/\n');
+    await fs.writeFile(infoExcludePath, 'build/\n');
+    const ig = await loadIgnoreRules(repoDir, { noGlobalIgnore: true });
+    expect(ig).toBeNull();
+  });
+
+  it('missing files at both global source paths is a no-op (byte-identical to pre-#2606 behaviour)', async () => {
+    // coreExcludesPath/infoExcludePath point at real (empty) temp dirs, but
+    // neither file has been written, and no per-repo files exist either.
+    const ig = await loadIgnoreRules(repoDir);
+    expect(ig).toBeNull();
+  });
+
+  it('combines core.excludesFile, info/exclude, .gitignore, and .gitnexusignore together', async () => {
+    await fs.writeFile(coreExcludesPath, 'docs/\n');
+    await fs.writeFile(infoExcludePath, 'build/\n');
+    await fs.writeFile(path.join(repoDir, '.gitignore'), 'data/\n');
+    await fs.writeFile(path.join(repoDir, '.gitnexusignore'), 'vendor/\n');
+    const ig = await loadIgnoreRules(repoDir);
+    expect(ig).not.toBeNull();
+    expect(ig!.ignores('docs/guide.md')).toBe(true);
+    expect(ig!.ignores('build/out.js')).toBe(true);
+    expect(ig!.ignores('data/file.txt')).toBe(true);
+    expect(ig!.ignores('vendor/lib.js')).toBe(true);
+    expect(ig!.ignores('src/index.ts')).toBe(false);
+  });
+
+  // Root bypasses POSIX read-permission checks (see the analogous EACCES
+  // test above for .gitignore), so this can't reproduce under uid=0.
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+    'warns on an unreadable global source file but does not throw',
+    async () => {
+      await fs.writeFile(coreExcludesPath, 'docs/\n');
+      await fs.chmod(coreExcludesPath, 0o000);
+
+      const cap = _captureLogger();
+      const ig = await loadIgnoreRules(repoDir);
+      expect(ig).toBeNull();
+      expect(cap.records().some((r) => String(r.msg ?? '').includes(coreExcludesPath))).toBe(true);
+
+      cap.restore();
+      await fs.chmod(coreExcludesPath, 0o644);
+    },
+  );
 });

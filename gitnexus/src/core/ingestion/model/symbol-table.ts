@@ -27,14 +27,14 @@
  *          ↑
  *     model/semantic-model.ts           — orchestrator, wraps add()
  *          ↑
- *     model/resolve.ts, call-processor.ts, resolution-context.ts, ...
+ *     model/resolve.ts, call-processor.ts, ...
  *
  * No arrow ever points downward from this file. If you are tempted to
  * import from `./model/` here, you are going the wrong way — move the
  * logic up the dependency chain instead.
  */
 
-import type { NodeLabel, SymbolDefinition } from 'gitnexus-shared';
+import type { NodeLabel, ParameterTypeClass, SymbolDefinition } from 'gitnexus-shared';
 
 /**
  * Class-like NodeLabels — used for qualifiedName fallback inside
@@ -56,6 +56,8 @@ import type { NodeLabel, SymbolDefinition } from 'gitnexus-shared';
  */
 export const CLASS_TYPES_TUPLE = [
   'Class',
+  'Protocol',
+  'Category',
   'Struct',
   'Interface',
   'Enum',
@@ -69,9 +71,8 @@ export const CLASS_TYPES: ReadonlySet<NodeLabel> = new Set(CLASS_TYPES_TUPLE);
 
 /** Free-callable labels — single source of truth for "callables that have
  *  NO owner scope". Methods and constructors are owner-scoped and live in
- *  `MethodRegistry` — Tier 3 reaches them via
- *  `model.methods.lookupMethodByName`. See `resolution-context.ts` Tier 3
- *  for how both indexes are consulted together.
+ *  `MethodRegistry`, reached via `model.methods.lookupMethodByName`. Global
+ *  by-name resolution consults both indexes (see `model/index.ts`).
  *
  *  Exported as a `readonly` tuple so that `typeof FREE_CALLABLE_TUPLE[number]`
  *  yields a precise literal union (`FreeCallableLabel`). `registration-table.ts`
@@ -115,7 +116,7 @@ export const CALL_TARGET_TYPES: ReadonlySet<NodeLabel> = new Set<NodeLabel>([
 
 // `SymbolDefinition` moved to `gitnexus-shared` as part of RFC #909 Ring 1
 // (see #910). It is imported at the top of this file from `gitnexus-shared`
-// and re-used unchanged throughout. Consumers should import
+// and reused as the canonical symbol contract. Consumers should import
 // `SymbolDefinition` directly from `gitnexus-shared`, not via this file.
 
 /**
@@ -126,10 +127,13 @@ export interface AddMetadata {
   parameterCount?: number;
   requiredParameterCount?: number;
   parameterTypes?: string[];
+  parameterTypeClasses?: ParameterTypeClass[];
   returnType?: string;
   declaredType?: string;
+  templateArguments?: string[];
   ownerId?: string;
   qualifiedName?: string;
+  isDeleted?: boolean;
 }
 
 /**
@@ -275,9 +279,16 @@ export const createSymbolTable = (): InternalSymbolTable => {
       ...(metadata?.parameterTypes !== undefined
         ? { parameterTypes: metadata.parameterTypes }
         : {}),
+      ...(metadata?.parameterTypeClasses !== undefined
+        ? { parameterTypeClasses: metadata.parameterTypeClasses }
+        : {}),
       ...(metadata?.returnType !== undefined ? { returnType: metadata.returnType } : {}),
       ...(metadata?.declaredType !== undefined ? { declaredType: metadata.declaredType } : {}),
+      ...(metadata?.templateArguments !== undefined
+        ? { templateArguments: metadata.templateArguments }
+        : {}),
       ...(metadata?.ownerId !== undefined ? { ownerId: metadata.ownerId } : {}),
+      ...(metadata?.isDeleted === true ? { isDeleted: true } : {}),
     };
 
     // A. File Index — unconditional.

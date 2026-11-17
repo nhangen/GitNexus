@@ -1,8 +1,11 @@
 /**
  * JavaScript: self/this resolution, parent resolution, super resolution
  */
-import { describe, it, expect, beforeAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import path from 'path';
+import fs from 'node:fs';
+import os from 'node:os';
+import { summarizeUnresolvedReceivers } from '../../../src/core/ingestion/scope-resolution/unresolved-receivers.js';
 import {
   FIXTURES,
   CROSS_FILE_FIXTURES,
@@ -11,8 +14,36 @@ import {
   getNodesByLabelFull,
   edgeSet,
   runPipelineFromRepo,
+  suppressionReasonsAt,
+  useFixture,
+  writeFixtureRepo,
+  type OutcomeSite,
   type PipelineResult,
 } from './helpers.js';
+
+// ---------------------------------------------------------------------------
+// Qualified (namespaced) base (#1951): `extends ns.Base` parses as a
+// class_heritage holding a member_expression (object: `ns`, property: `Base`).
+// An earlier synth (synthesizeJsInheritanceReferences) dropped member_expression
+// bases, emitting only for a direct identifier base, so production silently
+// omitted this EXTENDS edge. It is now resolved by the base's trailing
+// property_identifier (`Base`), matching the documented per-shape reduction.
+// `Plain extends Base` is the bare control (its simple-base handling is
+// unchanged). Scope-resolution owns these edges since #942.
+// ---------------------------------------------------------------------------
+
+describe('JavaScript qualified-base heritage resolution (#1951)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'javascript-qualified-base'), () => {});
+  }, 60000);
+
+  it('emits EXTENDS for the qualified base (ns.Base) and the bare control (Base)', () => {
+    const extends_ = getRelationships(result, 'EXTENDS');
+    expect(edgeSet(extends_)).toEqual(['Plain → Base', 'Service → Base']);
+  });
+});
 
 // ---------------------------------------------------------------------------
 // skipGraphPhases: verify pipeline works correctly when graph phases are skipped
@@ -297,6 +328,23 @@ describe('Field type resolution (JavaScript)', () => {
     expect(def!.properties.isStatic).toBe(true);
     expect(def!.properties.visibility).toBe('public');
   });
+
+  // `static DEFAULT = new Config()` declares no type, and a static field's
+  // initializer binding is kept out of the class scope on purpose (it would
+  // retype an instance field of the same name). So `Config.DEFAULT` had no
+  // type anywhere and the call was dropped. The Property node now records the
+  // type its initializer constructs, and the class-level receiver route reads it.
+  it('records the type a static field initializer constructs on its Property node', () => {
+    const def = getNodesByLabelFull(result, 'Property').find((p) => p.name === 'DEFAULT');
+    expect(def?.properties.initializerType).toBe('Config');
+  });
+
+  it('resolves Config.DEFAULT.validate() through the static field initializer type', () => {
+    const targets = getRelationships(result, 'CALLS')
+      .filter((c) => c.source === 'validateConfig')
+      .map((c) => c.rel.targetId);
+    expect(targets).toEqual(['Method:models.js:Config.validate#0']);
+  });
 });
 
 // ACCESSES write edges from assignment expressions
@@ -508,7 +556,7 @@ describe('JavaScript method enrichment', () => {
 });
 
 // ---------------------------------------------------------------------------
-// SM-9: lookupMethodByOwnerWithMRO — child.parentMethod() via first-wins walk
+// SM-9: inherited method resolution — child.parentMethod() via first-wins walk
 // ---------------------------------------------------------------------------
 
 describe('JavaScript Child extends Parent — inherited method resolution (SM-9)', () => {
@@ -539,5 +587,421 @@ describe('JavaScript Child extends Parent — inherited method resolution (SM-9)
     );
     expect(parentMethodCall).toBeDefined();
     expect(parentMethodCall!.source).toBe('run');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #1358: class-instance singleton (`export const x = new C()`)
+// PR #1718 closed the object-literal-shorthand sub-case; this fixture covers
+// the class-instance sub-case for JavaScript. Same resolution chain as TS but
+// the receiver type comes from the `new ClassName()` initializer (no JSDoc
+// annotation needed — the @type-binding.constructor capture handles it).
+// ---------------------------------------------------------------------------
+
+describe('JavaScript class-instance singleton resolution (issue #1358 sub-case)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'javascript-class-instance-singleton'),
+      () => {},
+      { skipGraphPhases: true },
+    );
+  }, 60000);
+
+  it('detects FooService class, getUser method, caller function, fooService Const', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('FooService');
+    expect(getNodesByLabel(result, 'Method')).toContain('getUser');
+    expect(getNodesByLabel(result, 'Function')).toContain('caller');
+    expect(getNodesByLabel(result, 'Const')).toContain('fooService');
+  });
+
+  it('emits HAS_METHOD edge from FooService to getUser', () => {
+    const hasMethod = getRelationships(result, 'HAS_METHOD');
+    const fromClass = hasMethod.filter((e) => e.source === 'FooService').map((e) => e.target);
+    expect(fromClass).toEqual(['getUser']);
+  });
+
+  it('resolves caller.fooService.getUser() to FooService.getUser via constructor-inferred typeBinding', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const projected = calls
+      .filter((e) => e.source === 'caller' && e.target === 'getUser')
+      .map((e) => ({
+        targetFilePath: e.targetFilePath,
+        reason: e.rel.reason,
+        confidence: e.rel.confidence,
+      }));
+
+    expect(projected).toEqual([
+      {
+        targetFilePath: 'src/service.js',
+        reason: 'import-resolved',
+        confidence: 0.85,
+      },
+    ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #1358: factory-pattern singleton (`export const x = makeC()`)
+// Tests the @type-binding.alias chain-follow for JS — fooService aliases the
+// return of makeFooService(), whose JSDoc @returns {FooService} ties the chain
+// back to the class. Resolution propagates cross-file via
+// propagateImportedReturnTypes followChainPostFinalize.
+// ---------------------------------------------------------------------------
+
+describe('JavaScript factory-pattern singleton resolution (issue #1358 sub-case)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'javascript-factory-singleton'),
+      () => {},
+      { skipGraphPhases: true },
+    );
+  }, 60000);
+
+  it('detects FooService class, makeFooService function, fooService Const, caller function', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('FooService');
+    expect(getNodesByLabel(result, 'Function')).toContain('makeFooService');
+    expect(getNodesByLabel(result, 'Function')).toContain('caller');
+    expect(getNodesByLabel(result, 'Const')).toContain('fooService');
+  });
+
+  it('resolves caller.fooService.getUser() through the factory chain to FooService.getUser', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const projected = calls
+      .filter((e) => e.source === 'caller' && e.target === 'getUser')
+      .map((e) => ({
+        targetFilePath: e.targetFilePath,
+        reason: e.rel.reason,
+        confidence: e.rel.confidence,
+      }));
+
+    expect(projected).toEqual([
+      {
+        targetFilePath: 'src/service.js',
+        reason: 'import-resolved',
+        confidence: 0.85,
+      },
+    ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Inline constructor receiver: new Legacy().doWork() (#2708)
+// The javascript provider is wired `{ keyword: 'new' }` independently of
+// typescript, so it needs its own fixture. Kept under a `javascript-` prefix
+// deliberately: the capture-fingerprint bench globs fixture directories by
+// language prefix, so `.js` sources parked under a `typescript-` directory
+// would be covered by neither language's guard.
+// ---------------------------------------------------------------------------
+
+describe('JavaScript inline constructor receiver resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'javascript-inline-constructor-receiver'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves new Legacy().doWork() to Legacy.doWork', () => {
+    const call = getRelationships(result, 'CALLS').find(
+      (c) => c.source === 'viaInlineNewJs' && c.target === 'doWork',
+    );
+    expect(call).toMatchObject({ target: 'doWork', targetFilePath: 'svc.js' });
+    expect(call!.rel.targetId).toContain('Legacy');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CommonJS export assignments are declarations, not dropped member writes
+// ---------------------------------------------------------------------------
+
+describe('CommonJS export assignment receivers (JavaScript)', () => {
+  let repoDir: string | undefined;
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gn-js-cjs-export-receiver-'));
+    writeFixtureRepo(repoDir, {
+      'lib.js': `exports.memberRequest = function (url) {
+  return url;
+};
+module.exports.arrowRequest = (url) => url;
+function wrap(module) {
+  module.exports.wrapped = 1;
+}
+module.exports.api.nested = 1;
+`,
+      'esm-export.js': 'export {};\nmodule.exports.esmExport = 1;\n',
+      'esm-import.js': 'import "./side-effect.js";\nmodule.exports.esmImport = 1;\n',
+      'side-effect.js': 'const initialized = true;\n',
+      'explicit.mjs': 'module.exports.explicitEsm = 1;\n',
+    });
+    result = await runPipelineFromRepo(repoDir, () => {}, {});
+  }, 60000);
+
+  afterAll(() => {
+    if (repoDir !== undefined) fs.rmSync(repoDir, { recursive: true, force: true });
+  });
+
+  // `module.exports.arrowRequest = …` DECLARES this module's `arrowRequest`
+  // export, exactly as `exports.memberRequest = …` on line 1 does. Its receiver
+  // merely has a dot in it, so the receiver-bound pass tried to fold
+  // `module.exports` as a value, failed, and filed the declaration as a dropped
+  // member write. The bare `exports` spelling never reached that path at all.
+  //
+  // Inside `wrap`, `module` is a PARAMETER: that write goes through a local
+  // value the resolver cannot type, so it is a real drop and must stay one. So
+  // is the last line, which writes INTO a value hanging off the export object
+  // rather than declaring an export.
+  it.each<readonly [OutcomeSite, readonly string[]]>([
+    [['lib.js', 1, 0, 'memberRequest', 'write'], []],
+    [['lib.js', 4, 0, 'arrowRequest', 'write'], []],
+    [['lib.js', 6, 2, 'wrapped', 'write'], ['receiver-unresolved']],
+    [['lib.js', 8, 0, 'nested', 'write'], ['receiver-unresolved']],
+  ])('records %j as %j', (site, reasons) => {
+    expect(suppressionReasonsAt(result, site)).toEqual(reasons);
+  });
+
+  // Instrumentation only: the declaration keeps the write edge it already had,
+  // and gains nothing.
+  it('keeps the module-level write edge to each exported function', () => {
+    const writes = getRelationships(result, 'ACCESSES')
+      .filter((e) => e.sourceLabel === 'File' && e.rel.reason === 'scope-resolution: write')
+      .map((e) => e.target)
+      .sort();
+    expect(writes).toEqual(['arrowRequest', 'memberRequest']);
+  });
+
+  it.each(['esm-export.js', 'esm-import.js', 'explicit.mjs'])(
+    'keeps a receiver drop for an unbound module in %s',
+    (filePath) => {
+      expect(
+        result.resolutionOutcomes?.some(
+          (outcome) =>
+            outcome.kind === 'suppressed' &&
+            outcome.filePath === filePath &&
+            outcome.reason === 'receiver-unresolved' &&
+            outcome.siteKind === 'write',
+        ),
+      ).toBe(true);
+    },
+  );
+});
+
+describe('Literal writes and owned receiver bases preserve bindings', () => {
+  let result: PipelineResult;
+  let fixtureRoot: string | undefined;
+
+  beforeAll(async () => {
+    fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'gitnexus-literal-bindings-'));
+    writeFixtureRepo(fixtureRoot, {
+      'private.js': `const config = { privateFlag: true };
+class PrivateProducer {
+  #make(row) { return { privateFlag: row.value }; }
+}
+`,
+      'owned.dart': `class DartWorker { void go() {} }
+class DartBundle { DartWorker worker = DartWorker(); }
+class DartOwner {
+  DartBundle task = DartBundle();
+  void loop(xs) {
+    for (final task in xs) { task.worker.go(); }
+  }
+}
+`,
+      'input.js': `const config = { secretFlag: true };
+export class SignalService {
+  make(options) {
+    options.secretFlag = false;
+    return { secretFlag: options.secretFlag };
+  }
+}
+new SignalService().make(config);
+`,
+      'foreign-reader.js': `const local = { foreignFlag: 1 };
+export class Service { make(obj) { return obj.foreignFlag; } }
+`,
+      'foreign-producer.js': `export class Service { make() { return { foreignFlag: 0.5 }; } }
+`,
+      'repeated.js': `function build() { return { data: { data: 1 } }; }
+function use() { const res = build(); return res.data.data; }
+`,
+      'static.js': `class StaticService { go() {} }
+class StaticOther { go() {} }
+class StaticBase { static svc = new StaticService(); }
+class NullChild extends StaticBase { static svc = null; }
+class UnknownChild extends StaticBase { static svc = unknownFactory(); }
+class InheritedChild extends StaticBase {}
+class TypedChild extends StaticBase { static svc = new StaticOther(); }
+function nullProbe() { return NullChild.svc.go(); }
+function unknownProbe() { return UnknownChild.svc.go(); }
+function inheritedProbe() { return InheritedChild.svc.go(); }
+function typedProbe() { return TypedChild.svc.go(); }
+`,
+      'constructor.js': `class JsRepo { save() {} }
+class JsActual { save() {} }
+function jsShadow(JsRepo) {
+  class JsHolder { static item = new JsRepo(); }
+  JsHolder.item.save();
+}
+jsShadow(JsActual);
+`,
+      'constructor.ts': `class TsRepo { save() {} }
+class TsActual { save() {} }
+function tsShadow(TsRepo: any) {
+  class TsHolder { static item = new TsRepo(); }
+  TsHolder.item.save();
+}
+function tsAnnotated(TsRepo: any) {
+  class AnnotatedHolder { static item: TsRepo; }
+  AnnotatedHolder.item.save();
+}
+tsShadow(TsActual);
+tsAnnotated(TsActual);
+`,
+    });
+    result = await runPipelineFromRepo(fixtureRoot, () => {}, { skipGraphPhases: true });
+  }, 120000);
+
+  afterAll(() => {
+    if (fixtureRoot !== undefined) fs.rmSync(fixtureRoot, { recursive: true, force: true });
+  });
+
+  it.each(['read', 'write'])('keeps an input property %s on the declared input', (kind) => {
+    const edges = getRelationships(result, 'ACCESSES').filter(
+      (e) =>
+        e.rel.sourceId === 'Method:input.js:SignalService.make#1' &&
+        e.rel.reason?.endsWith(`: ${kind}`),
+    );
+    expect(edges.some((e) => e.rel.targetId === 'Property:input.js:config.secretFlag')).toBe(true);
+    if (kind === 'read') {
+      expect(edges.some((e) => e.rel.targetId.includes('SignalService.make.secretFlag@'))).toBe(
+        false,
+      );
+    }
+  });
+
+  it('keeps the returned literal declaration write on its own key', () => {
+    const writes = getRelationships(result, 'ACCESSES').filter(
+      (e) =>
+        e.rel.sourceId === 'Method:input.js:SignalService.make#1' &&
+        e.rel.targetId === 'Property:input.js:SignalService.make.secretFlag@4:13' &&
+        e.rel.reason?.endsWith(': write'),
+    );
+    expect(writes).toHaveLength(1);
+  });
+
+  it('binds a private method literal write to its own returned key', () => {
+    const writes = getRelationships(result, 'ACCESSES').filter(
+      (e) =>
+        e.sourceFilePath === 'private.js' &&
+        e.sourceLabel !== 'File' &&
+        e.rel.reason?.endsWith(': write'),
+    );
+    expect(writes).toHaveLength(1);
+    expect(writes[0]?.rel.targetId).toContain(
+      'Property:private.js:PrivateProducer.#make.privateFlag@',
+    );
+  });
+
+  it('records a Dart chain on a masked field base as owned but unbound', () => {
+    expect(getRelationships(result, 'CALLS').filter((e) => e.source === 'loop')).toEqual([]);
+    expect(
+      result.resolutionOutcomes?.some(
+        (o) =>
+          o.kind === 'suppressed' &&
+          o.reason === 'receiver-owned-but-unbound' &&
+          o.filePath === 'owned.dart' &&
+          o.name === 'go',
+      ),
+    ).toBe(true);
+    const owned =
+      result.resolutionOutcomes?.filter((outcome) => outcome.filePath === 'owned.dart') ?? [];
+    expect(summarizeUnresolvedReceivers(owned)?.counts.go).toBe(1);
+  });
+
+  it('keeps the unresolved outer read when a repeated-name inner read was answered', () => {
+    const drops = result.resolutionOutcomes?.filter(
+      (outcome) =>
+        outcome.kind === 'suppressed' &&
+        outcome.reason === 'receiver-unresolved' &&
+        outcome.filePath === 'repeated.js' &&
+        outcome.name === 'data',
+    );
+    expect(drops).toHaveLength(1);
+    expect(drops?.[0]).toMatchObject({
+      range: { startLine: 2, startCol: 45, endCol: 58 },
+    });
+    expect(
+      getRelationships(result, 'ACCESSES').some(
+        (edge) =>
+          edge.sourceFilePath === 'repeated.js' &&
+          edge.rel.reason === 'scope-resolution: return-shape member: read',
+      ),
+    ).toBe(true);
+  });
+
+  it('does not borrow a same-named method return shape from another file', () => {
+    const reads = getRelationships(result, 'ACCESSES').filter(
+      (e) => e.rel.sourceId === 'Method:foreign-reader.js:Service.make#1',
+    );
+    expect(reads.map((e) => e.rel.targetId)).toEqual([
+      'Property:foreign-reader.js:local.foreignFlag',
+    ]);
+  });
+
+  it.each(['nullProbe', 'unknownProbe'])('stops at an untyped static override in %s', (source) => {
+    expect(getRelationships(result, 'CALLS').filter((e) => e.source === source)).toEqual([]);
+  });
+
+  it.each([
+    ['inheritedProbe', 'Method:static.js:StaticService.go#0'],
+    ['typedProbe', 'Method:static.js:StaticOther.go#0'],
+    ['tsAnnotated', 'Method:constructor.ts:TsRepo.save#0'],
+  ])('resolves the available field type in %s', (source, target) => {
+    expect(
+      getRelationships(result, 'CALLS')
+        .filter((e) => e.source === source)
+        .map((e) => e.rel.targetId),
+    ).toContain(target);
+  });
+
+  it.each(['jsShadow', 'tsShadow'])('respects the constructor value parameter in %s', (source) => {
+    expect(getRelationships(result, 'CALLS').filter((e) => e.source === source)).toEqual([]);
+  });
+});
+
+describe('JavaScript default imports (#3956)', () => {
+  const result = useFixture('js-default-import', {
+    'legacy.js': 'export default function legacy() { return 1; }\n',
+    'lib.js': "export { default } from './legacy';\n",
+    'Comp.jsx': 'export default function Comp() { return <div />; }\n',
+    'main.js': "import run from './legacy';\nexport function main() { return run(); }\n",
+    'alias.js':
+      "import { default as go } from './legacy';\nexport function viaAlias() { return go(); }\n",
+    'barrel.js': "import run2 from './lib';\nexport function viaBarrel() { return run2(); }\n",
+    'App.jsx': "import Card from './Comp';\nexport function App() { return <Card />; }\n",
+  });
+  const targetsFrom = (source: string, targetFilePath: string) =>
+    getRelationships(result(), 'CALLS')
+      .filter((c) => c.source === source && c.targetFilePath === targetFilePath)
+      .map((c) => c.target);
+
+  it('links a default import and `{ default as X }` to the default-exported function', () => {
+    expect(targetsFrom('main', 'legacy.js')).toContain('legacy');
+    expect(targetsFrom('viaAlias', 'legacy.js')).toContain('legacy');
+  });
+
+  it('carries the default through an `export { default } from` barrel', () => {
+    expect(targetsFrom('viaBarrel', 'legacy.js')).toContain('legacy');
+  });
+
+  it('links a JSX render of a default-imported component', () => {
+    expect(targetsFrom('App', 'Comp.jsx')).toContain('Comp');
   });
 });

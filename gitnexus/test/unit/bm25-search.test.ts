@@ -1,21 +1,27 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { searchFTSFromLbug, type BM25SearchResult } from '../../src/core/search/bm25-index.js';
+import { classifyFtsQueryError } from '../../src/core/lbug/lbug-adapter.js';
+import { extensionManager, resetExtensionState } from '../../src/core/lbug/extension-loader.js';
+import { FTS_INDEXES } from '../../src/core/search/fts-schema.js';
 
 vi.mock('../../src/core/lbug/lbug-adapter.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../src/core/lbug/lbug-adapter.js')>();
   return {
     ...actual,
+    executeQuery: vi.fn().mockResolvedValue([]),
     queryFTS: vi.fn().mockResolvedValue([]),
     createFTSIndex: vi.fn().mockResolvedValue(undefined),
+    dropFTSIndex: vi.fn().mockResolvedValue(undefined),
   };
 });
 
 // Pool adapter is dynamically imported by the MCP-pool path of
 // `searchFTSFromLbug`. We mock it so we can drive the executor without
 // spinning up a real LadybugDB pool.
-const mockExecuteQuery = vi.fn();
+const mockExecuteParameterized = vi.fn();
 vi.mock('../../src/core/lbug/pool-adapter.js', () => ({
-  executeQuery: (repoId: string, cypher: string) => mockExecuteQuery(repoId, cypher),
+  executeParameterized: (repoId: string, cypher: string, params: Record<string, any>) =>
+    mockExecuteParameterized(repoId, cypher, params),
   addPoolCloseListener: vi.fn(),
 }));
 
@@ -25,19 +31,68 @@ describe('BM25 search', () => {
       vi.clearAllMocks();
     });
 
-    it('creates the configured indexes on the writable analysis path', async () => {
+    it('creates every configured index on the writable analysis path', async () => {
       const { createFTSIndex } = await import('../../src/core/lbug/lbug-adapter.js');
       const { createSearchFTSIndexes } = await import('../../src/core/search/fts-indexes.js');
 
       await createSearchFTSIndexes();
 
-      expect(vi.mocked(createFTSIndex).mock.calls).toEqual([
-        ['File', 'file_fts', ['name', 'content']],
-        ['Function', 'function_fts', ['name', 'content']],
-        ['Class', 'class_fts', ['name', 'content']],
-        ['Method', 'method_fts', ['name', 'content']],
-        ['Interface', 'interface_fts', ['name', 'content']],
-      ]);
+      expect(vi.mocked(createFTSIndex).mock.calls).toEqual(
+        FTS_INDEXES.map((i) => [i.table, i.indexName, [...i.properties], 'porter']),
+      );
+    });
+
+    it('returns no missing indexes when every configured index covers its columns', async () => {
+      // One SHOW_INDEXES call returns a catalog row per configured index, each
+      // covering exactly its expected properties.
+      const showIndexesRows = FTS_INDEXES.map((i) => ({
+        table_name: i.table,
+        index_name: i.indexName,
+        index_type: 'FTS',
+        property_names: [...i.properties],
+      }));
+      const executeQuery = vi.fn().mockResolvedValue(showIndexesRows);
+      const { verifySearchFTSIndexes } = await import('../../src/core/search/fts-indexes.js');
+
+      const missing = await verifySearchFTSIndexes(executeQuery);
+
+      expect(missing).toEqual([]);
+      expect(executeQuery).toHaveBeenCalledTimes(1);
+    });
+
+    it('reports an index that exists but does not cover its configured columns', async () => {
+      // Model a pre-#2299 stale Function index: present, but name+content only,
+      // missing `description`. Every other index covers its columns.
+      const staleIndex = 'function_fts';
+      const showIndexesRows = FTS_INDEXES.map((i) => ({
+        table_name: i.table,
+        index_name: i.indexName,
+        index_type: 'FTS',
+        property_names: i.indexName === staleIndex ? ['name', 'content'] : [...i.properties],
+      }));
+      const executeQuery = vi.fn().mockResolvedValue(showIndexesRows);
+      const { verifySearchFTSIndexes } = await import('../../src/core/search/fts-indexes.js');
+
+      const missing = await verifySearchFTSIndexes(executeQuery);
+
+      expect(missing).toEqual(['Function.function_fts']);
+    });
+
+    it('reports an index that is absent from the catalog entirely', async () => {
+      // Every configured index present and covering, except const_fts is missing.
+      const absentIndex = 'const_fts';
+      const showIndexesRows = FTS_INDEXES.filter((i) => i.indexName !== absentIndex).map((i) => ({
+        table_name: i.table,
+        index_name: i.indexName,
+        index_type: 'FTS',
+        property_names: [...i.properties],
+      }));
+      const executeQuery = vi.fn().mockResolvedValue(showIndexesRows);
+      const { verifySearchFTSIndexes } = await import('../../src/core/search/fts-indexes.js');
+
+      const missing = await verifySearchFTSIndexes(executeQuery);
+
+      expect(missing).toEqual(['Const.const_fts']);
     });
   });
 
@@ -138,7 +193,7 @@ describe('BM25 search', () => {
       expect(results[0].nodeIds).toEqual(['func:m1', 'func:m2']);
     });
 
-    it('filters out empty nodeIds', async () => {
+    it('rejects empty native nodeIds instead of hiding them in file-only results', async () => {
       const { queryFTS } = await import('../../src/core/lbug/lbug-adapter.js');
       vi.mocked(queryFTS)
         .mockResolvedValueOnce([]) // File
@@ -151,10 +206,7 @@ describe('BM25 search', () => {
         .mockResolvedValueOnce([]) // Method
         .mockResolvedValueOnce([]); // Interface
 
-      const { results } = await searchFTSFromLbug('util');
-
-      expect(results).toHaveLength(1);
-      expect(results[0].nodeIds).toEqual([]);
+      await expect(searchFTSFromLbug('util')).rejects.toThrow('invalid symbol identity');
     });
 
     it('merges hits across multiple index tables for the same file', async () => {
@@ -209,20 +261,22 @@ describe('BM25 search', () => {
     const REPO = 'test-repo-readonly-fts';
 
     beforeEach(() => {
-      mockExecuteQuery.mockReset();
+      mockExecuteParameterized.mockReset();
     });
 
     it('queries existing FTS indexes without issuing CREATE_FTS_INDEX', async () => {
-      mockExecuteQuery.mockImplementation(async (_repo: string, cypher: string) => {
-        if (cypher.includes('CREATE_FTS_INDEX')) {
-          throw new Error('query path must stay read-only');
-        }
+      mockExecuteParameterized.mockImplementation(
+        async (_repo: string, cypher: string, params: Record<string, any>) => {
+          if (cypher.includes('CREATE_FTS_INDEX')) {
+            throw new Error('query path must stay read-only');
+          }
 
-        if (cypher.includes("QUERY_FTS_INDEX('Function'")) {
-          return [{ node: { filePath: 'src/auth.ts', id: 'func:login' }, score: 8 }];
-        }
-        return [];
-      });
+          if (params.query === 'login' && cypher.includes("QUERY_FTS_INDEX('Function'")) {
+            return [{ node: { filePath: 'src/auth.ts', id: 'func:login' }, score: 8 }];
+          }
+          return [];
+        },
+      );
 
       const { results } = await searchFTSFromLbug('login', 5, REPO);
 
@@ -230,25 +284,534 @@ describe('BM25 search', () => {
         { filePath: 'src/auth.ts', score: 8, rank: 1, nodeIds: ['func:login'] },
       ]);
       expect(
-        mockExecuteQuery.mock.calls.some((c) => String(c[1]).includes('CREATE_FTS_INDEX')),
+        mockExecuteParameterized.mock.calls.some((c) => String(c[1]).includes('CREATE_FTS_INDEX')),
       ).toBe(false);
     });
 
+    it('binds FTS user query text as a parameter in pool mode', async () => {
+      mockExecuteParameterized.mockResolvedValue([]);
+
+      const userQuery = "BrowserWindow create delete set remove 'main' window";
+      await searchFTSFromLbug(userQuery, 5, REPO);
+
+      expect(mockExecuteParameterized).toHaveBeenCalled();
+      const searchCalls = mockExecuteParameterized.mock.calls.filter((call) =>
+        String(call[1]).includes('QUERY_FTS_INDEX'),
+      );
+      expect(searchCalls).toHaveLength(FTS_INDEXES.length);
+      for (const call of searchCalls) {
+        const cypher = String(call[1]);
+        expect(cypher).toContain('$query');
+        expect(cypher).not.toContain(userQuery);
+        expect(cypher.toUpperCase()).not.toMatch(/\bCREATE\b/);
+        expect(cypher.toUpperCase()).not.toMatch(/\bDELETE\b/);
+        expect(cypher.toUpperCase()).not.toMatch(/\bSET\b/);
+        expect(cypher.toUpperCase()).not.toMatch(/\bREMOVE\b/);
+        expect(call[2]).toEqual({ query: userQuery });
+      }
+    });
+
     it('uses the configured FTS query set on every call', async () => {
-      mockExecuteQuery.mockResolvedValue([]);
+      mockExecuteParameterized.mockResolvedValue([]);
 
       await searchFTSFromLbug('anything', 5, REPO);
 
-      const queryCalls = mockExecuteQuery.mock.calls.filter((c) =>
+      const queryCalls = mockExecuteParameterized.mock.calls.filter((c) =>
         String(c[1]).includes('QUERY_FTS_INDEX'),
       );
-      expect(queryCalls.map((c) => String(c[1]).match(/QUERY_FTS_INDEX\('([^']+)'/)?.[1])).toEqual([
-        'File',
-        'Function',
-        'Class',
-        'Method',
-        'Interface',
-      ]);
+      expect(queryCalls.map((c) => String(c[1]).match(/QUERY_FTS_INDEX\('([^']+)'/)?.[1])).toEqual(
+        FTS_INDEXES.map((i) => i.table),
+      );
     });
   });
+
+  describe('classifyFtsQueryError (#2767)', () => {
+    it('classifies the real "doesn\'t have an index" message (confirmed against a live QUERY_FTS_INDEX call) as missing-index', () => {
+      expect(
+        classifyFtsQueryError(
+          "Prepare failed: Binder exception: Table File doesn't have an index with name file_fts.",
+        ),
+      ).toBe('missing-index');
+    });
+
+    it('classifies the real "table does not exist" message (confirmed against a live QUERY_FTS_INDEX call on a nonexistent table) as missing-table, distinct from missing-index (tri-review NEW-6)', () => {
+      // Empirically confirmed: the table-missing message uses "does not
+      // exist", NOT "doesn't have an index with name" — a genuinely different
+      // phrasing from missing-index, not the same condition under two names.
+      // Conflating them was the exact bug: a corrupted/partial DB (table
+      // itself gone) would have been silently treated as the ordinary
+      // "index not built yet" case.
+      expect(
+        classifyFtsQueryError(
+          'Prepare failed: Binder exception: Table TotallyNonexistentTable does not exist.',
+        ),
+      ).toBe('missing-table');
+    });
+
+    it('classifies a Catalog-exception "does not exist" message as missing-table too (both exception classes covered)', () => {
+      expect(classifyFtsQueryError('Catalog exception: Table SomeTable does not exist.')).toBe(
+        'missing-table',
+      );
+    });
+
+    it('classifies the extension-unavailable Catalog exception as other, not benign (mirrors the confirmed DROP_FTS_INDEX shape for QUERY_FTS_INDEX)', () => {
+      // Message shape confirmed for DROP_FTS_INDEX in
+      // drop-fts-index-error-classification.test.ts; QUERY_FTS_INDEX would
+      // fail identically when the extension isn't loaded (same catalog).
+      expect(
+        classifyFtsQueryError(
+          "Catalog exception: function QUERY_FTS_INDEX is not defined. This function exists in the FTS extension. You can install and load the extension by running 'INSTALL FTS; LOAD EXTENSION FTS;'.",
+        ),
+      ).toBe('other');
+    });
+
+    it('does not misclassify a real, differently-classed error that echoes the benign phrase in its body', () => {
+      // Adversarial case: a Runtime exception (not Binder/Catalog) that
+      // happens to echo the user's own search text — which could itself
+      // contain "does not exist" — must not be anchored away as benign.
+      expect(
+        classifyFtsQueryError(
+          'Runtime exception: FTS query syntax error near "the config file does not exist here"',
+        ),
+      ).toBe('other');
+    });
+
+    it('does not misclassify a real Binder-class error unrelated to a missing FTS index', () => {
+      expect(classifyFtsQueryError('Binder exception: column X does not match expected type')).toBe(
+        'other',
+      );
+    });
+
+    it('classifies any other message as other', () => {
+      expect(classifyFtsQueryError('Query execution timed out after 30000ms')).toBe('other');
+      expect(classifyFtsQueryError('Connection pool exhausted')).toBe('other');
+    });
+  });
+
+  describe('MCP pool path — real vs benign FTS query errors (#2767)', () => {
+    const REPO = 'test-repo-error-classification';
+
+    beforeEach(() => {
+      mockExecuteParameterized.mockReset();
+    });
+
+    it('a benign missing-index error on every table leaves nonBenignErrors unset (unchanged behavior)', async () => {
+      mockExecuteParameterized.mockRejectedValue(
+        new Error("Binder exception: Table Function doesn't have an index with name function_fts."),
+      );
+
+      const response = await searchFTSFromLbug('login', 5, REPO);
+
+      expect(response.ftsAvailable).toBe(false);
+      expect(response.nonBenignErrors).toBeUndefined();
+    });
+
+    it('a missing-table error (table itself gone, not just its FTS index) surfaces as non-benign — schema drift is not the ordinary degraded state (tri-review NEW-6)', async () => {
+      mockExecuteParameterized.mockRejectedValue(
+        new Error('Binder exception: Table Function does not exist.'),
+      );
+
+      const response = await searchFTSFromLbug('login', 5, REPO);
+
+      expect(response.ftsAvailable).toBe(false);
+      expect(response.nonBenignErrors!.length).toBeGreaterThan(0);
+    });
+
+    it('a real error on every table surfaces it in nonBenignErrors, redacted', async () => {
+      mockExecuteParameterized.mockRejectedValue(
+        new Error(
+          'Query execution failed: connection reset at /home/alice/.gitnexus/lbug/main.lbug',
+        ),
+      );
+
+      const response = await searchFTSFromLbug('login', 5, REPO);
+
+      expect(response.ftsAvailable).toBe(false);
+      expect(response.nonBenignErrors).toBeDefined();
+      expect(response.nonBenignErrors!.length).toBeGreaterThan(0);
+      expect(response.nonBenignErrors![0]).toContain('connection reset');
+      expect(response.nonBenignErrors![0]).not.toMatch(/\/home\/alice/);
+    });
+
+    it('a real error on one table while another succeeds is still reported (partial-failure gap closed)', async () => {
+      let call = 0;
+      mockExecuteParameterized.mockImplementation(async (_repo: string, cypher: string) => {
+        if (cypher.includes('QUERY_FTS_INDEX')) call++;
+        if (cypher.includes("QUERY_FTS_INDEX('Function'")) {
+          throw new Error('Query execution timed out after 30000ms');
+        }
+        if (cypher.includes("QUERY_FTS_INDEX('File'")) {
+          return [{ node: { filePath: 'src/index.ts', id: 'file:index' }, score: 3 }];
+        }
+        return [];
+      });
+
+      const response = await searchFTSFromLbug('login', 5, REPO);
+
+      // At least one table succeeded, so the client-visible availability
+      // signal and result set are unaffected (regression guard).
+      expect(response.ftsAvailable).toBe(true);
+      expect(response.results.length).toBeGreaterThan(0);
+      // But the real error on the OTHER table is not silently dropped.
+      expect(response.nonBenignErrors).toBeDefined();
+      expect(response.nonBenignErrors![0]).toContain('timed out');
+      expect(call).toBe(FTS_INDEXES.length);
+    });
+  });
+
+  describe('short-circuits when the FTS extension is unavailable (tri-review NEW-4)', () => {
+    const REPO = 'test-repo-extension-unavailable';
+
+    afterEach(() => {
+      resetExtensionState();
+    });
+
+    it('MCP pool path: skips per-table QUERY_FTS_INDEX calls and reports no nonBenignErrors when the extension failed to load', async () => {
+      await extensionManager.ensure(
+        vi.fn().mockRejectedValue(new Error('invalid ELF header.')),
+        'fts',
+        'FTS',
+        { policy: 'load-only' },
+      );
+      mockExecuteParameterized.mockReset();
+
+      const response = await searchFTSFromLbug('login', 5, REPO);
+
+      // The expected degraded-capability state — not per-table query errors.
+      expect(response.ftsAvailable).toBe(false);
+      expect(response.nonBenignErrors).toBeUndefined();
+      // No redundant round-trips to a pool that can't have FTS loaded.
+      expect(mockExecuteParameterized).not.toHaveBeenCalled();
+    });
+
+    it('CLI/pipeline path (no repoId): also skips per-table calls and reports no nonBenignErrors — same expected state, same silence (fixes the pool-only guard a /simplify altitude pass caught)', async () => {
+      const { queryFTS } = await import('../../src/core/lbug/lbug-adapter.js');
+      await extensionManager.ensure(
+        vi.fn().mockRejectedValue(new Error('invalid ELF header.')),
+        'fts',
+        'FTS',
+        { policy: 'load-only' },
+      );
+      vi.mocked(queryFTS).mockClear();
+
+      const response = await searchFTSFromLbug('login', 5); // no repoId → CLI/pipeline branch
+
+      expect(response.ftsAvailable).toBe(false);
+      expect(response.nonBenignErrors).toBeUndefined();
+      expect(vi.mocked(queryFTS)).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('GITNEXUS_FTS_CJK_SEGMENTATION query-side transform (#2331)', () => {
+    const CJK_REPO = 'test-repo-cjk-query';
+
+    beforeEach(() => {
+      vi.clearAllMocks();
+    });
+
+    afterEach(() => {
+      vi.unstubAllEnvs();
+    });
+
+    it('leaves the query unchanged by default (mode: none)', async () => {
+      const { queryFTS } = await import('../../src/core/lbug/lbug-adapter.js');
+      vi.mocked(queryFTS).mockResolvedValue([]);
+
+      await searchFTSFromLbug('审批流程');
+
+      expect(vi.mocked(queryFTS).mock.calls.length).toBeGreaterThan(0);
+      for (const call of vi.mocked(queryFTS).mock.calls) {
+        expect(call[2]).toBe('审批流程');
+      }
+    });
+
+    it('bigram-segments the query before it reaches queryFTS when enabled', async () => {
+      vi.stubEnv('GITNEXUS_FTS_CJK_SEGMENTATION', 'bigram');
+      const { queryFTS } = await import('../../src/core/lbug/lbug-adapter.js');
+      vi.mocked(queryFTS).mockResolvedValue([]);
+
+      await searchFTSFromLbug('审批流程');
+
+      expect(vi.mocked(queryFTS).mock.calls.length).toBeGreaterThan(0);
+      for (const call of vi.mocked(queryFTS).mock.calls) {
+        expect(call[2]).toBe('审批 批流 流程');
+      }
+    });
+
+    it('bigram-segments the query in pool mode too, still bound via $query', async () => {
+      vi.stubEnv('GITNEXUS_FTS_CJK_SEGMENTATION', 'bigram');
+      mockExecuteParameterized.mockResolvedValue([]);
+
+      await searchFTSFromLbug('审批流程', 5, CJK_REPO);
+
+      expect(mockExecuteParameterized).toHaveBeenCalled();
+      const searchCalls = mockExecuteParameterized.mock.calls.filter((call) =>
+        String(call[1]).includes('QUERY_FTS_INDEX'),
+      );
+      expect(searchCalls).toHaveLength(FTS_INDEXES.length);
+      for (const call of searchCalls) {
+        expect(String(call[1])).toContain('$query');
+        expect(String(call[1])).not.toContain('审批流程');
+        expect(call[2]).toEqual({ query: '审批 批流 流程' });
+      }
+    });
+
+    it('skips segmentation for a pathologically long query, searching it unchanged', async () => {
+      vi.stubEnv('GITNEXUS_FTS_CJK_SEGMENTATION', 'bigram');
+      const { queryFTS } = await import('../../src/core/lbug/lbug-adapter.js');
+      vi.mocked(queryFTS).mockResolvedValue([]);
+
+      const longQuery = '审批流程'.repeat(1000); // well past the 2000-char cap
+      await searchFTSFromLbug(longQuery);
+
+      expect(vi.mocked(queryFTS).mock.calls.length).toBeGreaterThan(0);
+      for (const call of vi.mocked(queryFTS).mock.calls) {
+        expect(call[2]).toBe(longQuery);
+      }
+    });
+
+    it('segments a query at exactly the 2000-character cap', async () => {
+      vi.stubEnv('GITNEXUS_FTS_CJK_SEGMENTATION', 'bigram');
+      const { queryFTS } = await import('../../src/core/lbug/lbug-adapter.js');
+      vi.mocked(queryFTS).mockResolvedValue([]);
+
+      const atCapQuery = '审'.repeat(2000);
+      await searchFTSFromLbug(atCapQuery);
+
+      expect(vi.mocked(queryFTS).mock.calls.length).toBeGreaterThan(0);
+      for (const call of vi.mocked(queryFTS).mock.calls) {
+        expect(call[2]).not.toBe(atCapQuery); // segmented, not passed through raw
+        expect(call[2]).toContain(' ');
+      }
+    });
+
+    it('does not segment a query at exactly 2001 characters, one past the cap', async () => {
+      vi.stubEnv('GITNEXUS_FTS_CJK_SEGMENTATION', 'bigram');
+      const { queryFTS } = await import('../../src/core/lbug/lbug-adapter.js');
+      vi.mocked(queryFTS).mockResolvedValue([]);
+
+      const overCapQuery = '审'.repeat(2001);
+      await searchFTSFromLbug(overCapQuery);
+
+      expect(vi.mocked(queryFTS).mock.calls.length).toBeGreaterThan(0);
+      for (const call of vi.mocked(queryFTS).mock.calls) {
+        expect(call[2]).toBe(overCapQuery); // passed through raw, unsegmented
+      }
+    });
+  });
+
+  // #2339: the query path previously never called normalizeFtsText (only
+  // applyCjkSegmentationIfEnabled), unlike the write path which always
+  // composes both — a literal tab/newline in a query wouldn't match
+  // whitespace-normalized indexed text.
+  describe('normalizeFtsText query-side composition (#2339)', () => {
+    beforeEach(() => {
+      vi.clearAllMocks();
+    });
+
+    afterEach(() => {
+      vi.unstubAllEnvs();
+    });
+
+    it('collapses a literal tab in the query to a space (mode: none)', async () => {
+      const { queryFTS } = await import('../../src/core/lbug/lbug-adapter.js');
+      vi.mocked(queryFTS).mockResolvedValue([]);
+
+      await searchFTSFromLbug('审批\t流程');
+
+      expect(vi.mocked(queryFTS).mock.calls.length).toBeGreaterThan(0);
+      for (const call of vi.mocked(queryFTS).mock.calls) {
+        expect(call[2]).toBe('审批 流程');
+      }
+    });
+
+    it('composes segmentation THEN normalization, matching the write path order (mode: bigram)', async () => {
+      vi.stubEnv('GITNEXUS_FTS_CJK_SEGMENTATION', 'bigram');
+      const { queryFTS } = await import('../../src/core/lbug/lbug-adapter.js');
+      vi.mocked(queryFTS).mockResolvedValue([]);
+
+      await searchFTSFromLbug('审批流程\t自动');
+
+      expect(vi.mocked(queryFTS).mock.calls.length).toBeGreaterThan(0);
+      for (const call of vi.mocked(queryFTS).mock.calls) {
+        // "审批流程" bigram-segments to "审批 批流 流程"; the tab (untouched
+        // by segmentCjkSpans, since neither run's boundary needs an extra
+        // space next to an already-whitespace neighbor) is then collapsed
+        // to a space by normalizeFtsText, keeping "自动" a separate token.
+        expect(call[2]).toBe('审批 批流 流程 自动');
+      }
+    });
+
+    it('applies normalization regardless of the 2000-char segmentation cap', async () => {
+      vi.stubEnv('GITNEXUS_FTS_CJK_SEGMENTATION', 'bigram');
+      const { queryFTS } = await import('../../src/core/lbug/lbug-adapter.js');
+      vi.mocked(queryFTS).mockResolvedValue([]);
+
+      const longQueryWithTab = '审'.repeat(2001) + '\t' + '批';
+      await searchFTSFromLbug(longQueryWithTab);
+
+      expect(vi.mocked(queryFTS).mock.calls.length).toBeGreaterThan(0);
+      for (const call of vi.mocked(queryFTS).mock.calls) {
+        // Segmentation is skipped (over the cap), but normalizeFtsText still
+        // runs unconditionally — no per-character cost concern there.
+        expect(call[2]).toBe('审'.repeat(2001) + ' ' + '批');
+      }
+    });
+  });
+});
+
+describe('FTS index completeness', () => {
+  beforeEach(async () => {
+    resetExtensionState();
+    mockExecuteParameterized.mockReset();
+    const { queryFTS, executeQuery } = await import('../../src/core/lbug/lbug-adapter.js');
+    vi.mocked(queryFTS).mockReset();
+    vi.mocked(executeQuery).mockReset().mockResolvedValue([]);
+  });
+
+  const missing = (table: string, indexName: string) =>
+    new Error(`Binder exception: Table ${table} doesn't have an index with name ${indexName}.`);
+
+  for (const pooled of [false, true]) {
+    const mode = pooled ? 'pool' : 'core';
+    const repo = pooled ? 'completeness-test' : undefined;
+
+    async function useOutcome(
+      outcome: (table: string, indexName: string) => Promise<any[]>,
+      counts: Array<{ tableName: string; rowCount: number }> = [],
+    ) {
+      const { queryFTS, executeQuery } = await import('../../src/core/lbug/lbug-adapter.js');
+      vi.mocked(executeQuery).mockResolvedValue(counts);
+      vi.mocked(queryFTS).mockImplementation((table, indexName) => outcome(table, indexName));
+      mockExecuteParameterized.mockImplementation(async (_repo: string, cypher: string) => {
+        const match = cypher.match(/QUERY_FTS_INDEX\('([^']+)', '([^']+)'/);
+        return match ? outcome(match[1], match[2]) : counts;
+      });
+    }
+
+    it(`${mode}: an entirely empty graph has healthy zero matches without index queries`, async () => {
+      const outcome = vi.fn();
+      await useOutcome(
+        outcome,
+        FTS_INDEXES.map(({ table }) => ({ tableName: table, rowCount: 0 })),
+      );
+      expect(await searchFTSFromLbug('auth', 5, repo)).toEqual({ results: [], ftsAvailable: true });
+      expect(outcome).not.toHaveBeenCalled();
+    });
+
+    it(`${mode}: empty tables cannot hide a missing index on the only populated table`, async () => {
+      const outcome = vi.fn(async (table: string, indexName: string) => {
+        throw missing(table, indexName);
+      });
+      await useOutcome(
+        outcome,
+        FTS_INDEXES.map(({ table }) => ({
+          tableName: table,
+          rowCount: table === 'Function' ? 1 : 0,
+        })),
+      );
+      expect(await searchFTSFromLbug('auth', 5, repo)).toEqual({
+        results: [],
+        ftsAvailable: false,
+        missingIndexes: ['Function.function_fts'],
+      });
+      expect(outcome.mock.calls).toEqual([['Function', 'function_fts']]);
+    });
+
+    it(`${mode}: distinguishes healthy zero matches from missing indexes`, async () => {
+      await useOutcome(async () => []);
+      const result = await searchFTSFromLbug('no matches', 5, repo);
+      expect(result).toEqual({ results: [], ftsAvailable: true });
+    });
+
+    it(`${mode}: reports one missing index while retaining successful matches`, async () => {
+      await useOutcome(async (table, indexName) => {
+        if (table === 'Function') throw missing(table, indexName);
+        if (table !== 'File') return [];
+        return pooled
+          ? [{ node: { filePath: 'src/auth.ts', id: 'file:auth' }, score: 3 }]
+          : [{ filePath: 'src/auth.ts', nodeId: 'file:auth', score: 3 }];
+      });
+      const result = await searchFTSFromLbug('auth', 5, repo);
+      expect(result.ftsAvailable).toBe(true);
+      expect(result.results[0]).toMatchObject({ filePath: 'src/auth.ts', score: 3 });
+      expect(result.missingIndexes).toEqual(['Function.function_fts']);
+      expect(result.nonBenignErrors).toBeUndefined();
+    });
+
+    it(`${mode}: reports all missing indexes without claiming FTS is available`, async () => {
+      await useOutcome(async (table, indexName) => {
+        throw missing(table, indexName);
+      });
+      const result = await searchFTSFromLbug('auth', 5, repo);
+      expect(result.ftsAvailable).toBe(false);
+      expect(result.results).toEqual([]);
+      if (!pooled) {
+        const { queryFTS } = await import('../../src/core/lbug/lbug-adapter.js');
+        for (const { table, indexName } of FTS_INDEXES) {
+          expect(queryFTS).toHaveBeenCalledWith(table, indexName, 'auth', 5, false, 'throw');
+        }
+      }
+      expect(result.missingIndexes).toEqual(
+        FTS_INDEXES.map(({ table, indexName }) => `${table}.${indexName}`),
+      );
+      expect(result.nonBenignErrors).toBeUndefined();
+    });
+
+    it(`${mode}: preserves redacted real errors alongside missing-index diagnostics`, async () => {
+      await useOutcome(async (table, indexName) => {
+        if (table === 'Function') throw missing(table, indexName);
+        if (table === 'Class')
+          throw new Error('connection reset at /home/alice/private/index.lbug');
+        return [];
+      });
+      const result = await searchFTSFromLbug('auth', 5, repo);
+      expect(result.ftsAvailable).toBe(true);
+      expect(result.missingIndexes).toEqual(['Function.function_fts']);
+      expect(result.nonBenignErrors).toHaveLength(1);
+      expect(result.nonBenignErrors![0]).toContain('connection reset');
+      expect(JSON.stringify(result)).not.toContain('/home/alice');
+    });
+
+    it(`${mode}: retains both failure causes when no configured index query succeeds`, async () => {
+      await useOutcome(async (table, indexName) => {
+        if (table === 'Function') throw missing(table, indexName);
+        throw new Error('connection reset at /home/alice/private/index.lbug');
+      });
+
+      const result = await searchFTSFromLbug('auth', 5, repo);
+
+      expect(result.ftsAvailable).toBe(false);
+      expect(result.results).toEqual([]);
+      expect(result.missingIndexes).toEqual(['Function.function_fts']);
+      expect(result.nonBenignErrors).toEqual(
+        Array(FTS_INDEXES.length - 1).fill('connection reset at <path>'),
+      );
+    });
+
+    it(`${mode}: clears missing-index diagnostics after a repaired query`, async () => {
+      await useOutcome(async (table, indexName) => {
+        if (table === 'Function') throw missing(table, indexName);
+        return [];
+      });
+      expect((await searchFTSFromLbug('auth', 5, repo)).missingIndexes).toEqual([
+        'Function.function_fts',
+      ]);
+      await useOutcome(async () => []);
+      expect(await searchFTSFromLbug('auth', 5, repo)).toEqual({ results: [], ftsAvailable: true });
+    });
+
+    it(`${mode}: explicit opt-out makes no queries and emits no missing-index diagnosis`, async () => {
+      await useOutcome(async (table, indexName) => {
+        throw missing(table, indexName);
+      });
+      expect(await searchFTSFromLbug('auth', 5, repo, 'disabled-by-flag')).toEqual({
+        results: [],
+        ftsAvailable: false,
+      });
+      const { queryFTS } = await import('../../src/core/lbug/lbug-adapter.js');
+      expect(queryFTS).not.toHaveBeenCalled();
+      expect(mockExecuteParameterized).not.toHaveBeenCalled();
+    });
+  }
 });

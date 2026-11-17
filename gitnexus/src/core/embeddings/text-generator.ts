@@ -1,7 +1,7 @@
 /**
  * Text Generator Module
  *
- * Generates enriched embedding text from code nodes with metadata.
+ * Generates compact, description-forward embedding text from code nodes.
  * Supports chunkable labels (Function/Method with AST chunking),
  * Class-specific structural text, and short-node direct embed.
  *
@@ -48,6 +48,8 @@ const truncateDescription = (text: string, maxLength: number): string => {
  * Clean code content for embedding
  */
 const cleanContent = (content: string): string => {
+  // Keep this hot function small enough for V8 to inline ordinary snippets.
+  if (content.length >= 16 * 1024) return cleanLargeContent(content);
   return content
     .replace(/\r\n/g, '\n')
     .replace(/\n{3,}/g, '\n\n')
@@ -57,39 +59,107 @@ const cleanContent = (content: string): string => {
     .trim();
 };
 
+const cleanLargeContent = (content: string): string => {
+  const normalized = content.replace(/\r\n/g, '\n').replace(/\n{3,}/g, '\n\n');
+  const output = new TextBlocks();
+  for (const line of contentLines(normalized)) output.append(line.trimEnd());
+  return output.finish().trim();
+};
+
+/** Output-sized storage with a bounded number of temporary line strings. */
+class TextBlocks {
+  private pending: string[] = [];
+  private output = '';
+  count = 0;
+  append(line: string): void {
+    if (this.count++) this.pending.push('\n');
+    this.pending.push(line);
+    if (this.pending.length >= 1024) this.flush();
+  }
+  private flush(): void {
+    this.output += this.pending.join('');
+    this.pending = [];
+  }
+  finish(): string {
+    this.flush();
+    return this.output;
+  }
+}
+
+function* contentLines(content: string): Generator<string> {
+  let start = 0;
+  for (;;) {
+    const end = content.indexOf('\n', start);
+    if (end < 0) {
+      yield content.slice(start);
+      return;
+    }
+    yield content.slice(start, end);
+    start = end + 1;
+  }
+}
+
 /**
- * Build metadata header for a node
+ * Compact location signal for the embedding header: the last 1-2 path segments
+ * (immediate parent dir + basename), never the full deep path.
+ *
+ * #2333 / PR #2334 tri-review: U1 dropped the location entirely, which regressed
+ * path/service-qualified semantic search (e.g. `billing/handler` vs
+ * `identity/handler` in a monorepo) — and FTS indexes only name/content/description,
+ * never `filePath`, so there is no keyword backfill. The bounded form restores the
+ * discriminating tokens (service dir + filename-concept) at a fraction of the
+ * dilution the full path caused.
  */
-const buildMetadataHeader = (node: EmbeddableNode, config: Partial<EmbeddingConfig>): string => {
+const boundedLocation = (filePath: string): string => {
+  const segments = filePath.replace(/\\/g, '/').split('/').filter(Boolean);
+  return segments.slice(-2).join('/');
+};
+
+/**
+ * Build a compact, description-forward header for embedding text.
+ *
+ * Issue #2333 (sub-issue of #2326), Option A: lead the embedding text with the
+ * symbol name + doc-comment description and drop the low-signal metadata lines
+ * (`Repo`/`Server`/`Export` and the verbose full `Path`). For short doc comments
+ * those lines used to be ~25-30% of the embedding text, diluting the description's
+ * semantic weight in the vector and weakening description-shaped search — worst
+ * for CJK, where a complete concept is often 4-20 characters.
+ *
+ * A *bounded* location signal (last 1-2 path segments) is kept after the
+ * description — see `boundedLocation` for why the full path drop was reversed.
+ *
+ * Full metadata is unaffected: it lives on the graph node properties, which is
+ * what display/context tools read. Only the embedding text changes here.
+ *
+ * Option B (reorder only, keep metadata) was rejected — mean-pooled embeddings
+ * weight by token proportion, not position, so reordering alone barely moves the
+ * signal. Option C (a separate description-only embedding + hybrid merge) is
+ * deferred to follow-up; build it only if Option A proves insufficient against
+ * real measurement. Any change to this template MUST bump EMBEDDING_TEXT_VERSION.
+ */
+const buildEmbeddingHeader = (node: EmbeddableNode, config: Partial<EmbeddingConfig>): string => {
   const parts: string[] = [];
 
   // Label + name
   parts.push(`${node.label}: ${node.name}`);
 
-  // Repo name
-  if (node.repoName) {
-    parts.push(`Repo: ${node.repoName}`);
-  }
-
-  // Server name (optional)
-  if (node.serverName) {
-    parts.push(`Server: ${node.serverName}`);
-  }
-
-  // Full file path
-  parts.push(`Path: ${node.filePath}`);
-
-  // Export status
-  if (node.isExported !== undefined) {
-    parts.push(`Export: ${node.isExported}`);
-  }
-
-  // Description (truncated)
+  // Description hoisted above everything else so its semantic signal dominates
+  // the embedding vector and is never the part lost to token-limit truncation.
   if (node.description) {
     const maxLen = config.maxDescriptionLength ?? DEFAULT_EMBEDDING_CONFIG.maxDescriptionLength;
     const truncated = truncateDescription(node.description, maxLen);
     if (truncated) {
       parts.push(truncated);
+    }
+  }
+
+  // Bounded location signal — placed after the description so the description
+  // still leads the vector. Restores path/service disambiguation lost when the
+  // full Path line was dropped (FTS does not index filePath to backfill it).
+  if (node.filePath) {
+    const loc = boundedLocation(node.filePath);
+    if (loc) {
+      parts.push(`Loc: ${loc}`);
     }
   }
 
@@ -102,7 +172,7 @@ const generateCodeBodyText = (
   config: Partial<EmbeddingConfig>,
   prevTail?: string,
 ): string => {
-  const header = buildMetadataHeader(node, config);
+  const header = buildEmbeddingHeader(node, config);
   const parts = [header];
   if (prevTail) {
     parts.push(`[preceding context]: ...${cleanContent(prevTail)}`);
@@ -111,13 +181,27 @@ const generateCodeBodyText = (
   return parts.join('\n');
 };
 
+/** Keep preceding context that is not already present in the overlapping chunk. */
+export const withoutOverlappingContext = (
+  previousTail: string,
+  previousEndOffset: number | undefined,
+  currentStartOffset: number | undefined,
+): string => {
+  if (!previousTail || previousEndOffset === undefined || currentStartOffset === undefined)
+    return previousTail;
+  const shared = Math.max(0, previousEndOffset - currentStartOffset);
+  return shared ? previousTail.slice(0, Math.max(0, previousTail.length - shared)) : previousTail;
+};
+
 const getCompactContainerContext = (
   cleanedContent: string,
   declarationOnly: string,
 ): string | undefined => {
-  const source = declarationOnly || cleanedContent;
-  const nlIdx = source.indexOf('\n');
-  const firstLine = (nlIdx === -1 ? source : source.substring(0, nlIdx)).trim();
+  const source = declarationOnly || cleanContent(cleanedContent.slice(0, 200));
+  // The prefix may cut a supplementary character between its two UTF-16 units.
+  const bounded = source.slice(0, 200).replace(/[\uD800-\uDBFF]$/, '');
+  const nlIdx = bounded.indexOf('\n');
+  const firstLine = (nlIdx === -1 ? bounded : bounded.substring(0, nlIdx)).trim();
   return firstLine ? `Container: ${firstLine}` : undefined;
 };
 
@@ -128,12 +212,33 @@ const generateStructuralTypeText = (
   chunkIndex?: number,
   prevTail?: string,
 ): string => {
-  const header = buildMetadataHeader(node, config);
+  const header = buildEmbeddingHeader(node, config);
   const parts: string[] = [header];
   const isFirstChunk = chunkIndex === undefined || chunkIndex === 0;
-  const cleanedContent = cleanContent(node.content);
-  const declarationOnly = extractDeclarationOnly(cleanedContent);
-  const compactContainerContext = getCompactContainerContext(cleanedContent, declarationOnly);
+  if (node.label === 'Class') {
+    // Only chunkNode's projection is trusted as Class code. Raw source and
+    // preceding context may contain method bodies, including on one-line classes.
+    const container = getCompactContainerContext('', node.classDeclaration || `Class ${node.name}`);
+    if (container) parts.push(container);
+    if (isFirstChunk && node.methodNames?.length)
+      parts.push(`Methods: ${node.methodNames.join(', ')}`);
+    if (isFirstChunk && node.fieldNames?.length)
+      parts.push(`Properties: ${node.fieldNames.join(', ')}`);
+    if (node.classDeclaration !== undefined && codeBody) parts.push('', cleanContent(codeBody));
+    return parts.join('\n');
+  }
+  // Only the first chunk needs the whole declaration. Later chunks must not
+  // repeatedly scan and allocate the complete container's source.
+  const cleanedContent = isFirstChunk ? cleanContent(node.content) : undefined;
+  const declarationOnly = extractDeclarationOnly(
+    cleanedContent ?? cleanContent(node.content.slice(0, 200)),
+  );
+  // A long decorator or comment may hide the declaration beyond the bounded
+  // prefix. The graph identity still names the container without rescanning it.
+  const compactContainerContext = getCompactContainerContext(
+    isFirstChunk ? node.content : `${node.label} ${node.name}`,
+    declarationOnly,
+  );
 
   if (compactContainerContext) {
     parts.push(compactContainerContext);
@@ -155,12 +260,31 @@ const generateStructuralTypeText = (
   }
 
   const cleanedChunk = cleanContent(codeBody);
-  if (cleanedChunk && cleanedChunk !== cleanedContent) {
+  if (
+    cleanedChunk &&
+    cleanedChunk !== cleanedContent &&
+    !(isFirstChunk && declarationOnly.includes(cleanedChunk))
+  ) {
     parts.push('', cleanedChunk);
   }
 
   return parts.join('\n');
 };
+
+/** Budget the final text, including headers and generated context. Preserve all
+ * text and Unicode pairs; character limits are not a model-specific tokenizer. */
+export function* splitEmbeddingText(text: string, maxChars: number): Generator<string> {
+  if (!Number.isSafeInteger(maxChars) || maxChars < 2) {
+    throw new Error('Embedding input budget must be a safe integer of at least 2');
+  }
+  for (let start = 0; start < text.length; ) {
+    let end = Math.min(start + maxChars, text.length);
+    const last = text.charCodeAt(end - 1);
+    if (end < text.length && last >= 0xd800 && last <= 0xdbff) end--;
+    yield text.slice(start, end);
+    start = end;
+  }
+}
 
 const DECL_START_RE =
   /^(?:(?:export|pub|data|abstract)\s+)*(?:type\s+\w+\s+struct|(?:class|struct|enum|interface)\s)/;
@@ -172,25 +296,34 @@ const DECL_START_RE =
  * - Non-brace languages (Python/Ruby): returns empty string (patterns handle extraction).
  */
 export const extractDeclarationOnly = (content: string): string => {
-  const lines = content.split('\n');
-  const declLines: string[] = [];
+  const declLines = new TextBlocks();
   let depth = 0;
   let started = false;
   let classDepth = 0;
   let skipDepth = 0;
 
-  for (const [idx, line] of lines.entries()) {
+  let nextLineStart = 0;
+  for (const line of contentLines(content)) {
+    nextLineStart += line.length + 1;
     const trimmed = line.trim();
 
     if (!started) {
       if (DECL_START_RE.test(trimmed)) {
         // Non-brace language check: current line or next 3 lines must have `{`
-        const nextLines = lines.slice(idx + 1, idx + 4);
-        if (!trimmed.includes('{') && !nextLines.some((l) => l.includes('{'))) {
-          return '';
+        if (!trimmed.includes('{')) {
+          let lookaheadEnd = nextLineStart;
+          for (let i = 0; i < 3; i++) {
+            const end = content.indexOf('\n', lookaheadEnd);
+            if (end < 0) {
+              lookaheadEnd = content.length;
+              break;
+            }
+            lookaheadEnd = end + 1;
+          }
+          if (!content.slice(nextLineStart, lookaheadEnd).includes('{')) return '';
         }
         started = true;
-        declLines.push(trimmed);
+        declLines.append(trimmed);
         for (const ch of trimmed) {
           if (ch === '{') depth++;
           else if (ch === '}') depth--;
@@ -201,8 +334,12 @@ export const extractDeclarationOnly = (content: string): string => {
     }
 
     // Always update depth (even when skipping)
-    const opens = (trimmed.match(/{/g) || []).length;
-    const closes = (trimmed.match(/}/g) || []).length;
+    let opens = 0;
+    let closes = 0;
+    for (let i = 0; i < trimmed.length; i++) {
+      if (trimmed.charCodeAt(i) === 123) opens++;
+      else if (trimmed.charCodeAt(i) === 125) closes++;
+    }
     const prevDepth = depth;
     depth += opens - closes;
 
@@ -211,7 +348,7 @@ export const extractDeclarationOnly = (content: string): string => {
         skipDepth = 0;
         // Closing brace of class
         if (depth <= 0) {
-          declLines.push(trimmed);
+          declLines.append(trimmed);
           break;
         }
       }
@@ -224,7 +361,7 @@ export const extractDeclarationOnly = (content: string): string => {
     if (hasParens && hasOpenBrace && prevDepth + opens > classDepth) {
       if (opens === closes && trimmed.endsWith(';')) {
         // Property with function/object initializer like `config = { timeout: 5000 };` — keep
-        declLines.push(trimmed);
+        declLines.append(trimmed);
       }
       // else: single-line or multi-line method — skip entirely
       if (opens !== closes) {
@@ -233,12 +370,12 @@ export const extractDeclarationOnly = (content: string): string => {
       continue;
     }
 
-    declLines.push(trimmed);
+    declLines.append(trimmed);
 
-    if (depth <= 0 && declLines.length > 1) break;
+    if (depth <= 0 && declLines.count > 1) break;
   }
 
-  return declLines.join('\n').trim();
+  return declLines.finish().trim();
 };
 
 /**
@@ -253,7 +390,7 @@ export const generateEmbeddingText = (
   prevTail?: string,
 ): string => {
   if (isShortLabel(node.label)) {
-    const header = buildMetadataHeader(node, config);
+    const header = buildEmbeddingHeader(node, config);
     const cleaned = cleanContent(node.content);
     return `${header}\n\n${cleaned}`;
   }

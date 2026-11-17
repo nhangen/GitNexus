@@ -1,14 +1,16 @@
 ## GitNexus vendor notice
 
-This directory is a GitNexus-managed vendored copy of the official
-`tree-sitter-swift@0.7.1` npm runtime package, including its official native
-prebuilds. GitNexus keeps the top-level `tree-sitter` dependency pinned to
-`^0.21.1` until the broader parser runtime upgrade is handled separately.
+This runtime package uses upstream sources at [`7b7909f2f6b9414be0958275f4c8e5d69c3bca43`](https://github.com/alex-pinkus/tree-sitter-swift/commit/7b7909f2f6b9414be0958275f4c8e5d69c3bca43)
+with Tree-sitter **0.25.1**. The copied C sources, scanner (where present),
+headers, node metadata and native binding source are upstream-identical.
+GitNexus preserves its synchronous CommonJS loader and hardened `binding.gyp`.
+The exact version and source commit are recorded in `package.json`.
 
-When updating this vendor package, replace it from an official
-`tree-sitter-swift` npm release, keep the native `prebuilds/` artifacts, update
-the `_vendoredBy` provenance fields in `package.json`, and verify the packed
-GitNexus tarball can load `tree-sitter-swift`.
+All six platform/architecture prebuilds are built from this vendored source by
+`.github/workflows/build-tree-sitter-prebuilds.yml`. Load through
+`requireVendoredGrammar`; do not copy the package into `node_modules`.
+See [the vendor update policy](../README.md), including the Swift release hold.
+Do not edit generated C files by hand.
 
 ![Parse rate badge](https://byob.yarr.is/alex-pinkus/tree-sitter-swift/parse_rate)
 [![Crates.io badge](https://byob.yarr.is/alex-pinkus/tree-sitter-swift/crates_io_version)](https://crates.io/crates/tree-sitter-swift)

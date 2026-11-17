@@ -18,10 +18,25 @@ rules:
       # untrusted half (pr-autofix.yml) runs fork code with permissions:{}
       # and produces only a diff artifact (data, not executable code). The
       # publish job consumes the artifact, allowlist-validates every field
-      # of metadata.json before exporting to $GITHUB_OUTPUT, never checks
-      # out fork code, and never executes anything fork-controlled. Header
-      # comment in the file documents the split.
+      # of metadata.json, then cross-checks identity against
+      # workflow_run.head_sha / head_repository / head_branch via
+      # pulls?head=owner:branch (commits/{sha}/pulls is empty for fork SHAs).
+      # It never checks out fork code and never executes anything
+      # fork-controlled. Header comment in the file documents the split.
       - pr-autofix-publish.yml
+
+      # workflow_run is the trusted half of the vendored-grammar prebuild
+      # pipeline (commit-fork-prebuilds.yml). The untrusted producer
+      # (build-tree-sitter-prebuilds.yml on a fork pull_request) builds +
+      # validates the .node prebuilds and uploads them as artifacts. This
+      # consumer downloads ONLY those artifacts + metadata.json,
+      # allowlist-validates every metadata field, cross-checks identity against
+      # workflow_run.head_sha / head_repository / head_branch via
+      # pulls?head=owner:branch (commits/{sha}/pulls is empty for fork SHAs), and
+      # checks out the fork head pinned to that HEAD SHA solely to ADD prebuild
+      # files (never executes fork code) before pushing. Header comment in the
+      # file documents the split.
+      - commit-fork-prebuilds.yml
 
       # pull_request_target needed by claude-code-action to access secrets
       # and post review comments on fork PRs. Mitigated by: PR checkouts pin
@@ -36,8 +51,19 @@ rules:
       # context) holds no write permissions. Header comment documents.
       - pr-labeler.yml
 
+      # pull_request_target is required for a label request on fork PRs to
+      # call the protected evaluator on main. This hosted handler checks
+      # out only github.sha (the trusted base commit), never PR code, and
+      # verifies the labeling actor's Maintain/Admin role plus the live
+      # label/head. Its token is read-only. The evaluator job calls trusted
+      # reusable workflow code under the existing main-only protected
+      # environment; no PR source is executed by this request handler.
+      # Tests lock down base checkout, maintainer gate and changed-head denial.
+      - pr-cost-evaluation.yml
+
   # Note: cache-poisoning is NOT exempted. The two prior findings in
-  # publish.yml and release-candidate.yml were fixed structurally by
-  # dropping `cache: npm` from those workflows (matches the pattern used
-  # by PyO3/maturin for the same audit). See the commit that added this
-  # file for the rationale.
+  # publish.yml and the former release-candidate.yml were fixed structurally
+  # by dropping `cache: npm` from those workflows (matches the pattern used
+  # by PyO3/maturin for the same audit). After the publish-workflow
+  # unification (issue #1609), only publish.yml remains; the same
+  # cache-poisoning hardening applies there.

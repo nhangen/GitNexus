@@ -10,16 +10,28 @@ import readline from 'readline';
 import { execSync, execFileSync } from 'child_process';
 import cliProgress from 'cli-progress';
 import { getGitRoot, isGitRepo } from '../storage/git.js';
+import { getStoragePaths, loadCLIConfig, saveCLIConfig } from '../storage/repo-manager.js';
 import {
-  getStoragePaths,
-  loadMeta,
-  loadCLIConfig,
-  saveCLIConfig,
-} from '../storage/repo-manager.js';
+  requireStoragePath,
+  STATUS_STORAGE_REQUIREMENTS,
+  StorageRequirementError,
+  isUnusableIndexInspection,
+} from '../storage/storage-resolver.js';
 import { WikiGenerator, type WikiOptions } from '../core/wiki/generator.js';
-import { resolveLLMConfig, type LLMProvider } from '../core/wiki/llm-client.js';
+import {
+  ANTHROPIC_BASE_URL,
+  ANTHROPIC_DEFAULT_MODEL,
+  MINIMAX_MODEL_IDS,
+  MINIMAX_OPENAI_BASE_URLS,
+  parseLLMAllowedInsecureHttpHosts,
+  resolveLLMConfig,
+  type LLMProvider,
+} from '../core/wiki/llm-client.js';
 import { detectCursorCLI } from '../core/wiki/cursor-client.js';
+import { detectGrokCLI } from '../core/wiki/grok-client.js';
+import { detectLocalCLI } from '../core/wiki/local-cli-client.js';
 import { logger } from '../core/logger.js';
+import { parseIntegerOption } from './int-option.js';
 
 export interface WikiCommandOptions {
   force?: boolean;
@@ -33,6 +45,32 @@ export interface WikiCommandOptions {
   provider?: LLMProvider;
   verbose?: boolean;
   review?: boolean;
+  timeout?: string;
+  retries?: string;
+  lang?: string;
+  allowInsecureConnection?: string;
+  maxCompletionTokens?: string;
+}
+
+function isLocalProvider(
+  provider: LLMProvider | undefined,
+): provider is 'cursor' | 'claude' | 'codex' | 'opencode' | 'grok' {
+  return (
+    provider === 'cursor' ||
+    provider === 'claude' ||
+    provider === 'codex' ||
+    provider === 'opencode' ||
+    provider === 'grok'
+  );
+}
+
+function localModelConfigKey(provider: 'cursor' | 'claude' | 'codex' | 'opencode' | 'grok') {
+  if (provider === 'cursor') return 'cursorModel';
+  if (provider === 'claude') return 'claudeModel';
+  if (provider === 'codex') return 'codexModel';
+  if (provider === 'opencode') return 'opencodeModel';
+  if (provider === 'grok') return 'grokModel';
+  throw new Error(`Unsupported local provider: ${provider satisfies never}`);
 }
 
 /**
@@ -87,6 +125,24 @@ function prompt(question: string, hide = false): Promise<string> {
 }
 
 export const wikiCommand = async (inputPath?: string, options?: WikiCommandOptions) => {
+  // Snapshot GITNEXUS_VERBOSE at entry — wikiCommand mutates it (the impl
+  // below) so cursor-client (process.env-driven) sees the right value during
+  // this run. Restored in finally so back-to-back wiki calls in long-running
+  // hosts don't leak verbose state from one invocation to the next. Pairs
+  // with the same snapshot/restore pattern in `analyzeCommand`.
+  const originalVerbose = process.env.GITNEXUS_VERBOSE;
+  try {
+    await wikiCommandImpl(inputPath, options);
+  } finally {
+    if (originalVerbose === undefined) {
+      delete process.env.GITNEXUS_VERBOSE;
+    } else {
+      process.env.GITNEXUS_VERBOSE = originalVerbose;
+    }
+  }
+};
+
+const wikiCommandImpl = async (inputPath?: string, options?: WikiCommandOptions): Promise<void> => {
   // Set verbose mode globally for cursor-client to pick up
   if (options?.verbose) {
     process.env.GITNEXUS_VERBOSE = '1';
@@ -115,12 +171,49 @@ export const wikiCommand = async (inputPath?: string, options?: WikiCommandOptio
   }
 
   // ── Check for existing index ────────────────────────────────────────
-  const { storagePath, lbugPath } = getStoragePaths(repoPath);
-  const meta = await loadMeta(storagePath);
-
-  if (!meta) {
-    console.log('  Error: No GitNexus index found.');
+  let storagePath: string;
+  try {
+    storagePath = await requireStoragePath(repoPath, STATUS_STORAGE_REQUIREMENTS);
+  } catch (error) {
+    if (!(error instanceof StorageRequirementError)) throw error;
+    const inspection = error.inspection;
+    if (!isUnusableIndexInspection(inspection)) {
+      console.log(`  Error: ${error.message}\n`);
+      process.exitCode = 1;
+      return;
+    }
+    console.log(`  Error: No GitNexus index found at ${error.inspection.storagePath}.`);
     console.log('  Run `gitnexus analyze` first to index this repository.\n');
+    process.exitCode = 1;
+    return;
+  }
+  const { lbugPath } = getStoragePaths(repoPath, undefined, storagePath);
+
+  let timeoutSeconds: number | undefined;
+  let retries: number | undefined;
+  let allowedInsecureHttpHosts: string[] | undefined;
+  let maxCompletionTokens: number | undefined;
+  try {
+    timeoutSeconds =
+      options?.timeout === undefined
+        ? undefined
+        : parseIntegerOption(options.timeout, '--timeout', { minimum: 1, scale: 1000 });
+    retries =
+      options?.retries === undefined
+        ? undefined
+        : parseIntegerOption(options.retries, '--retries', { minimum: 1 });
+    allowedInsecureHttpHosts =
+      options?.allowInsecureConnection === undefined
+        ? undefined
+        : parseLLMAllowedInsecureHttpHosts(options.allowInsecureConnection);
+    maxCompletionTokens =
+      options?.maxCompletionTokens === undefined
+        ? undefined
+        : parseIntegerOption(options.maxCompletionTokens, '--max-completion-tokens', {
+            minimum: 1,
+          });
+  } catch (error) {
+    console.log(`  Error: ${(error as Error).message}\n`);
     process.exitCode = 1;
     return;
   }
@@ -137,15 +230,43 @@ export const wikiCommand = async (inputPath?: string, options?: WikiCommandOptio
   ) {
     const existing = await loadCLIConfig();
     const updates: Partial<typeof existing> = {};
+    const providerChanged = !!options.provider && options.provider !== existing.provider;
+    if (providerChanged) {
+      updates.apiKey = undefined;
+      updates.baseUrl = undefined;
+      updates.model = undefined;
+      updates.apiVersion = undefined;
+      updates.isReasoningModel = undefined;
+    }
     if (options.apiKey) updates.apiKey = options.apiKey;
     if (options.baseUrl) updates.baseUrl = options.baseUrl;
     if (options.provider) updates.provider = options.provider;
     if (options.apiVersion) updates.apiVersion = options.apiVersion;
     if (options.reasoningModel !== undefined) updates.isReasoningModel = options.reasoningModel;
-    // Save model to appropriate field based on provider
+    if (options.provider === 'minimax') {
+      if (providerChanged && options.reasoningModel === undefined) {
+        updates.isReasoningModel = undefined;
+      }
+      if (!options.baseUrl && (providerChanged || !existing.baseUrl)) {
+        updates.baseUrl = MINIMAX_OPENAI_BASE_URLS.global_en;
+      }
+      if (!options.model && (providerChanged || !existing.model)) {
+        updates.model = MINIMAX_MODEL_IDS[0];
+      }
+    }
+    if (options.provider === 'anthropic') {
+      if (!options.baseUrl && (providerChanged || !existing.baseUrl)) {
+        updates.baseUrl = ANTHROPIC_BASE_URL;
+      }
+      if (!options.model && (providerChanged || !existing.model)) {
+        updates.model = ANTHROPIC_DEFAULT_MODEL;
+      }
+    }
+    // Save model to appropriate field based on provider.
     if (options.model) {
-      if (options.provider === 'cursor') {
-        updates.cursorModel = options.model;
+      const targetProvider = options.provider ?? existing.provider;
+      if (isLocalProvider(targetProvider)) {
+        updates[localModelConfigKey(targetProvider)] = options.model;
       } else {
         updates.model = options.model;
       }
@@ -156,8 +277,8 @@ export const wikiCommand = async (inputPath?: string, options?: WikiCommandOptio
 
   const savedConfig = await loadCLIConfig();
   const hasSavedConfig = !!(
-    savedConfig.provider === 'cursor' ||
-    (savedConfig.apiKey && savedConfig.baseUrl)
+    isLocalProvider(savedConfig.provider) ||
+    (savedConfig.apiKey && (savedConfig.baseUrl || savedConfig.provider === 'minimax'))
   );
   const hasCLIOverrides = !!(
     options?.apiKey ||
@@ -168,48 +289,108 @@ export const wikiCommand = async (inputPath?: string, options?: WikiCommandOptio
     options?.reasoningModel !== undefined
   );
 
-  let llmConfig = await resolveLLMConfig({
-    model: options?.model,
-    baseUrl: options?.baseUrl,
-    apiKey: options?.apiKey,
-    provider: options?.provider,
-    apiVersion: options?.apiVersion,
-    isReasoningModel: options?.reasoningModel,
-  });
+  let llmConfig;
+  try {
+    llmConfig = await resolveLLMConfig({
+      model: options?.model,
+      baseUrl: options?.baseUrl,
+      apiKey: options?.apiKey,
+      provider: options?.provider,
+      apiVersion: options?.apiVersion,
+      isReasoningModel: options?.reasoningModel,
+      allowedInsecureHttpHosts,
+      maxTokens: maxCompletionTokens,
+    });
+  } catch (error) {
+    console.log(`  Error: ${(error as Error).message}\n`);
+    process.exitCode = 1;
+    return;
+  }
 
   // Run interactive setup if no saved config and no CLI flags provided
   // (even if env vars exist — let user explicitly choose their provider)
   if (!hasSavedConfig && !hasCLIOverrides) {
     if (!process.stdin.isTTY) {
       // Non-interactive mode — need either API key or Cursor CLI
-      if (!llmConfig.apiKey && llmConfig.provider !== 'cursor') {
+      if (!llmConfig.apiKey && !isLocalProvider(llmConfig.provider)) {
         console.log('  Error: No LLM API key found.');
-        console.log('  Set OPENAI_API_KEY or GITNEXUS_API_KEY environment variable,');
-        console.log('  or pass --api-key <key>, or use --provider cursor.\n');
+        console.log(
+          '  Set MINIMAX_API_KEY, ANTHROPIC_API_KEY, GITNEXUS_API_KEY, or OPENAI_API_KEY,',
+        );
+        console.log(
+          '  or pass --api-key <key>, or use --provider cursor|claude|codex|opencode|grok.\n',
+        );
         process.exitCode = 1;
         return;
       }
       // Non-interactive with env var or cursor — just use it
     } else {
       console.log("  No LLM configured. Let's set it up.\n");
-      console.log(
-        '  Supports OpenAI, OpenRouter, Azure, any OpenAI-compatible API, or Cursor CLI.\n',
-      );
+      console.log('  Supports MiniMax, Anthropic, OpenAI-compatible APIs, and local agent CLIs.\n');
 
-      // Check if Cursor CLI is available
+      // Check if local agent CLIs are available.
       const hasCursor = detectCursorCLI();
+      const hasClaude = detectLocalCLI('claude');
+      const hasCodex = detectLocalCLI('codex');
+      const hasOpenCode = detectLocalCLI('opencode');
+      const hasGrok = detectGrokCLI();
+      const localChoices: Array<{
+        choice: string;
+        provider: 'cursor' | 'claude' | 'codex' | 'opencode' | 'grok';
+      }> = [];
 
       // Provider selection
       console.log('  [1] OpenAI (api.openai.com)');
       console.log('  [2] OpenRouter (openrouter.ai)');
       console.log('  [3] Azure OpenAI');
       console.log('  [4] Custom endpoint');
+      console.log('  [5] MiniMax Global (api.minimax.io)');
+      console.log('  [6] MiniMax China (api.minimaxi.com)');
+      console.log('  [7] Anthropic (api.anthropic.com)');
+      let nextChoice = 8;
       if (hasCursor) {
-        console.log('  [5] Cursor CLI (local, uses your Cursor subscription)');
+        const choice = String(nextChoice++);
+        localChoices.push({
+          choice,
+          provider: 'cursor',
+        });
+        console.log(`  [${choice}] Cursor CLI (local, uses your Cursor subscription)`);
+      }
+      if (hasClaude) {
+        const choice = String(nextChoice++);
+        localChoices.push({
+          choice,
+          provider: 'claude',
+        });
+        console.log(`  [${choice}] Claude CLI (local, uses your Claude Code login)`);
+      }
+      if (hasCodex) {
+        const choice = String(nextChoice++);
+        localChoices.push({
+          choice,
+          provider: 'codex',
+        });
+        console.log(`  [${choice}] Codex CLI (local, uses your Codex login)`);
+      }
+      if (hasOpenCode) {
+        const choice = String(nextChoice++);
+        localChoices.push({
+          choice,
+          provider: 'opencode',
+        });
+        console.log(`  [${choice}] OpenCode CLI (local, uses your OpenCode login/config)`);
+      }
+      if (hasGrok) {
+        const choice = String(nextChoice++);
+        localChoices.push({
+          choice,
+          provider: 'grok',
+        });
+        console.log(`  [${choice}] Grok CLI (local, uses your Grok Build login)`);
       }
       console.log('');
 
-      const maxChoice = hasCursor ? '5' : '4';
+      const maxChoice = String(nextChoice - 1);
       const choice = await prompt(`  Select provider (1/${maxChoice}): `);
 
       let baseUrl: string;
@@ -217,21 +398,21 @@ export const wikiCommand = async (inputPath?: string, options?: WikiCommandOptio
       let provider: LLMProvider = 'openai';
       let key = '';
 
-      if (choice === '5' && hasCursor) {
-        // Cursor CLI selected - model defaults to 'auto' (Cursor's default)
-        provider = 'cursor';
+      const selectedLocal = localChoices.find((item) => item.choice === choice);
+      if (selectedLocal) {
+        // Local CLI selected - model defaults to the CLI's configured default.
+        provider = selectedLocal.provider;
         baseUrl = '';
 
-        const modelInput = await prompt('  Model (leave empty for auto): ');
+        const modelInput = await prompt('  Model (leave empty for CLI default): ');
         const model = modelInput || '';
 
-        // Save config for Cursor
-        const cursorConfig: Record<string, string> = { provider: 'cursor' };
-        if (model) cursorConfig.cursorModel = model;
-        await saveCLIConfig(cursorConfig);
+        const localConfig = { ...savedConfig, provider };
+        if (model) (localConfig as Record<string, unknown>)[localModelConfigKey(provider)] = model;
+        await saveCLIConfig(localConfig);
         console.log('  Config saved to ~/.gitnexus/config.json\n');
 
-        llmConfig = { ...llmConfig, provider: 'cursor', model, apiKey: '', baseUrl: '' };
+        llmConfig = { ...llmConfig, provider, model, apiKey: '', baseUrl: '' };
       } else if (choice === '3') {
         // Azure OpenAI guided setup — minimal prompts
         console.log('\n  Azure OpenAI setup.\n');
@@ -279,6 +460,7 @@ export const wikiCommand = async (inputPath?: string, options?: WikiCommandOptio
         const azureBaseUrl = `${endpoint}/openai/v1`;
 
         await saveCLIConfig({
+          ...savedConfig,
           apiKey: azureKey,
           baseUrl: azureBaseUrl,
           model: deploymentName,
@@ -294,10 +476,10 @@ export const wikiCommand = async (inputPath?: string, options?: WikiCommandOptio
           provider: 'azure',
         };
       } else {
-        // OpenAI-compatible provider (OpenAI, OpenRouter, Custom)
+        // OpenAI-compatible provider setup
         if (choice === '2') {
           baseUrl = 'https://openrouter.ai/api/v1';
-          defaultModel = 'minimax/minimax-m2.5';
+          defaultModel = '';
           provider = 'openrouter';
         } else if (choice === '4') {
           baseUrl = await prompt('  Base URL (e.g. http://localhost:11434/v1): ');
@@ -308,6 +490,15 @@ export const wikiCommand = async (inputPath?: string, options?: WikiCommandOptio
           }
           defaultModel = 'gpt-4o-mini';
           provider = 'custom';
+        } else if (choice === '5' || choice === '6') {
+          baseUrl =
+            choice === '6' ? MINIMAX_OPENAI_BASE_URLS.cn_zh : MINIMAX_OPENAI_BASE_URLS.global_en;
+          defaultModel = MINIMAX_MODEL_IDS[0];
+          provider = 'minimax';
+        } else if (choice === '7') {
+          baseUrl = ANTHROPIC_BASE_URL;
+          defaultModel = ANTHROPIC_DEFAULT_MODEL;
+          provider = 'anthropic';
         } else {
           baseUrl = 'https://api.openai.com/v1';
           defaultModel = 'gpt-4o-mini';
@@ -315,11 +506,23 @@ export const wikiCommand = async (inputPath?: string, options?: WikiCommandOptio
         }
 
         // Model
-        const modelInput = await prompt(`  Model (default: ${defaultModel}): `);
+        const modelInput = await prompt(
+          defaultModel ? `  Model (default: ${defaultModel}): ` : '  Model: ',
+        );
         const model = modelInput || defaultModel;
+        if (!model) {
+          console.log('\n  No model provided. Aborting.\n');
+          process.exitCode = 1;
+          return;
+        }
 
         // API key — pre-fill hint if env var exists
-        const envKey = process.env.GITNEXUS_API_KEY || process.env.OPENAI_API_KEY || '';
+        const envKey =
+          (provider === 'minimax' ? process.env.MINIMAX_API_KEY : undefined) ||
+          (provider === 'anthropic' ? process.env.ANTHROPIC_API_KEY : undefined) ||
+          process.env.GITNEXUS_API_KEY ||
+          (provider === 'anthropic' ? undefined : process.env.OPENAI_API_KEY) ||
+          '';
         if (envKey) {
           const masked = envKey.slice(0, 6) + '...' + envKey.slice(-4);
           const useEnv = await prompt(`  Use existing env key (${masked})? (Y/n): `);
@@ -339,12 +542,28 @@ export const wikiCommand = async (inputPath?: string, options?: WikiCommandOptio
         }
 
         // Save
-        await saveCLIConfig({ apiKey: key, baseUrl, model, provider });
+        await saveCLIConfig({
+          ...savedConfig,
+          apiKey: key,
+          baseUrl,
+          model,
+          provider,
+          apiVersion: undefined,
+          isReasoningModel: undefined,
+        });
         console.log('  Config saved to ~/.gitnexus/config.json\n');
 
         llmConfig = { ...llmConfig, apiKey: key, baseUrl, model, provider };
       }
     }
+  }
+
+  // ── Apply per-run overrides not saved to config ────────────────────
+  if (timeoutSeconds !== undefined) {
+    llmConfig.requestTimeoutMs = timeoutSeconds * 1000;
+  }
+  if (retries !== undefined) {
+    llmConfig.maxAttempts = retries;
   }
 
   // ── Setup progress bar with elapsed timer ──────────────────────────
@@ -383,6 +602,7 @@ export const wikiCommand = async (inputPath?: string, options?: WikiCommandOptio
     force: options?.force,
     concurrency: options?.concurrency ? parseInt(options.concurrency, 10) : undefined,
     reviewOnly: options?.review,
+    lang: options?.lang,
   };
 
   const generator = new WikiGenerator(
@@ -461,7 +681,7 @@ export const wikiCommand = async (inputPath?: string, options?: WikiCommandOptio
         console.log('  Save and close the editor when done.\n');
 
         try {
-          execFileSync(editor, [treeFile], { stdio: 'inherit' });
+          execFileSync(editor, [treeFile], { stdio: 'inherit', windowsHide: true });
         } catch {
           console.log(`  Could not open editor. Please edit manually:\n  ${treeFile}\n`);
           console.log('  Then run `gitnexus wiki` to continue.\n');
@@ -501,7 +721,10 @@ export const wikiCommand = async (inputPath?: string, options?: WikiCommandOptio
       bar.stop();
 
       const totalElapsed = ((Date.now() - t0) / 1000).toFixed(1);
-      console.log(`\n  Wiki generated successfully (${totalElapsed}s)\n`);
+      const incomplete = !!continueResult.failedModules?.length;
+      console.log(
+        `\n  ${incomplete ? 'Wiki generation incomplete' : 'Wiki generated successfully'} (${totalElapsed}s)\n`,
+      );
       console.log(`  Mode: ${continueResult.mode}`);
       console.log(`  Pages: ${continueResult.pagesGenerated}`);
       console.log(`  Output: ${wikiDir}`);
@@ -512,6 +735,9 @@ export const wikiCommand = async (inputPath?: string, options?: WikiCommandOptio
         for (const mod of continueResult.failedModules) {
           console.log(`    - ${mod}`);
         }
+        console.log('  Re-run to retry failed modules (pages will be regenerated).\n');
+        process.exitCode = 1;
+        return;
       }
 
       console.log('');
@@ -528,7 +754,10 @@ export const wikiCommand = async (inputPath?: string, options?: WikiCommandOptio
       return;
     }
 
-    console.log(`\n  Wiki generated successfully (${elapsed}s)\n`);
+    const incomplete = !!result.failedModules?.length;
+    console.log(
+      `\n  ${incomplete ? 'Wiki generation incomplete' : 'Wiki generated successfully'} (${elapsed}s)\n`,
+    );
     console.log(`  Mode: ${result.mode}`);
     console.log(`  Pages: ${result.pagesGenerated}`);
     console.log(`  Output: ${wikiDir}`);
@@ -540,6 +769,9 @@ export const wikiCommand = async (inputPath?: string, options?: WikiCommandOptio
         console.log(`    - ${mod}`);
       }
       console.log('  Re-run to retry failed modules (pages will be regenerated).');
+      console.log('');
+      process.exitCode = 1;
+      return;
     }
 
     console.log('');
@@ -551,6 +783,8 @@ export const wikiCommand = async (inputPath?: string, options?: WikiCommandOptio
 
     if (err.message?.includes('No source files')) {
       console.log(`\n  ${err.message}\n`);
+    } else if (err.message?.includes('LLM request timed out after')) {
+      console.log(`\n  Timeout: ${err.message}\n`);
     } else if (err.message?.includes('content filter')) {
       // Content filter block — actionable message
       console.log(`\n  Content Filter: ${err.message}\n`);
@@ -595,7 +829,7 @@ export const wikiCommand = async (inputPath?: string, options?: WikiCommandOptio
 
 function hasGhCLI(): boolean {
   try {
-    execSync('gh --version', { stdio: 'ignore' });
+    execSync('gh --version', { stdio: 'ignore', windowsHide: true });
     return true;
   } catch {
     return false;
@@ -639,7 +873,7 @@ function publishGist(htmlPath: string): { url: string; rawUrl: string } | null {
     const output = execFileSync(
       'gh',
       ['gist', 'create', htmlPath, '--desc', 'Repository Wiki — generated by GitNexus', '--public'],
-      { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+      { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true },
     ).trim();
 
     // `gh gist create` prints the gist URL as a line in the output. Find the

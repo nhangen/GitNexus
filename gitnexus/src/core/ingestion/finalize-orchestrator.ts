@@ -48,9 +48,14 @@ import {
   buildModuleScopeIndex,
   buildQualifiedNameIndex,
   buildScopeTree,
+  createEagerImportVisibility,
+  createGroupedImportVisibility,
   finalize,
 } from 'gitnexus-shared';
 import type { ScopeResolutionIndexes } from './model/scope-resolution-indexes.js';
+import { parseTruthyEnv } from './utils/env.js';
+import { isDebugHeapEnabled, logHeapProbe } from './utils/heap-probe.js';
+import { TransitionalScopeTree } from '../../storage/scope-index-store.js';
 
 // ─── Public entry point ─────────────────────────────────────────────────────
 
@@ -66,6 +71,8 @@ export interface FinalizeOrchestratorOptions {
    * merge for bindings.
    */
   readonly hooks?: Partial<FinalizeHooks>;
+  /** Optional exact module export surface, independent of nested definitions. */
+  readonly moduleExports?: (file: ParsedFile) => ReadonlyMap<string, SymbolDefinition>;
   /**
    * Opaque workspace context forwarded to hooks. `undefined` today; Ring
    * 2 PKG #922 populates this with a real cross-file index for the
@@ -78,9 +85,9 @@ export interface FinalizeOrchestratorOptions {
  * Produce a fully materialized `ScopeResolutionIndexes` from the
  * workspace's per-file artifacts.
  *
- * Pure function (given pure hooks). No I/O, no globals consulted. The
- * pipeline calls this once per ingestion run and hands the result to
+ * The pipeline calls this once per ingestion run and hands the result to
  * `MutableSemanticModel.attachScopeIndexes`.
+ * Optional heap diagnostics use the pipeline's existing debug flags.
  */
 export function finalizeScopeModel(
   parsedFiles: readonly ParsedFile[],
@@ -88,15 +95,21 @@ export function finalizeScopeModel(
 ): ScopeResolutionIndexes {
   const hooks = withDefaultHooks(options.hooks ?? {});
   const workspaceIndex: WorkspaceIndex = options.workspaceIndex ?? undefined;
+  const onProgress = isDebugHeapEnabled()
+    ? (phase: string) => logHeapProbe(`sr-finalize-${phase}`)
+    : undefined;
 
   // ── Step 1: Shared finalize — runs SCC-aware cross-file link + binding
   // materialization. Returns linked imports + merged bindings per module
   // scope + SCC condensation + stats.
+  onProgress?.('input-start');
   const finalizeInput = {
-    files: parsedFiles.map(toFinalizeFile),
+    files: parsedFiles.map((file) => toFinalizeFile(file, options.moduleExports?.(file))),
     workspaceIndex,
+    onProgress,
   };
   const finalizeOut = finalize(finalizeInput, hooks);
+  onProgress?.('indexes-start');
 
   // ── Step 2: Workspace-wide indexes built from the per-file unions.
   // These are pure aggregations — no algorithm beyond what the builders
@@ -114,14 +127,24 @@ export function finalizeScopeModel(
     moduleEntries.push({ filePath: file.filePath, moduleScopeId: file.moduleScope });
   }
 
-  const scopeTree = buildScopeTree(allScopes);
+  // Out-of-core scope index: when enabled, build a TransitionalScopeTree
+  // (validated + fully resident now; sealed to disk by run.ts just before emit so
+  // the heavy Scope.bindings payload is reclaimed). Default off → the in-heap
+  // buildScopeTree result exactly, byte-identical.
+  const scopeTree = parseTruthyEnv(process.env.GITNEXUS_DISK_SCOPE_INDEX)
+    ? new TransitionalScopeTree(allScopes)
+    : buildScopeTree(allScopes);
+  onProgress?.('scopeTree-end');
   const defs = buildDefIndex(allDefs);
+  onProgress?.('defs-end');
   const qualifiedNames = buildQualifiedNameIndex(allDefs);
+  onProgress?.('qualifiedNames-end');
   const moduleScopes = buildModuleScopeIndex(moduleEntries);
+  onProgress?.('moduleScopes-end');
 
   // ── Step 3: MethodDispatchIndex. Today we lack per-language MRO
   // strategies wired into this orchestrator (that belongs with the
-  // HeritageMap bridge, a separate piece of work). Ship an EMPTY index
+  // MRO bridge, a separate piece of work). Ship an EMPTY index
   // so the bundle shape is consistent; the callbacks return `[]` for
   // every owner and `implementsOf` returns `[]`. Populating this
   // properly is tracked alongside the per-language provider hooks.
@@ -137,13 +160,24 @@ export function finalizeScopeModel(
     qualifiedNames,
     moduleScopes,
     methodDispatch,
-    imports: finalizeOut.imports,
+    // Finalize reports `importEntries` only when it stored an import as a
+    // group; every other run keeps one edge per imported file.
+    imports:
+      finalizeOut.importEntries === undefined
+        ? createEagerImportVisibility(finalizeOut.imports)
+        : createGroupedImportVisibility(finalizeOut.importEntries, finalizeOut.imports),
     bindings: finalizeOut.bindings,
     // Empty post-finalize augmentation channel. Populated (if at all)
     // by language hooks like `populateCsharpNamespaceSiblings` running
     // AFTER `finalizeScopeModel` returns, before `resolveReferenceSites`
     // consumes the bundle. Most languages leave it empty.
     bindingAugmentations: new Map(),
+    workspaceFqnBindings: new Map(),
+    workspaceTypeBindings: new Map(),
+    namespaceFqnBindings: new Map(),
+    namespaceTypeBindings: new Map(),
+    accessibleNamespacesByScope: new Map(),
+    namespaceLookupTiersByScope: new Map(),
     referenceSites: Object.freeze([...allReferenceSites]),
     sccs: finalizeOut.sccs,
     stats: finalizeOut.stats,
@@ -152,15 +186,32 @@ export function finalizeScopeModel(
 
 // ─── Internal ───────────────────────────────────────────────────────────────
 
-/** Shape-reduce a `ParsedFile` to the narrower `FinalizeFile` the shared
- *  algorithm reads. The subset is stable — `FinalizeFile` is a proper
- *  subset of `ParsedFile`. */
-function toFinalizeFile(file: ParsedFile): FinalizeFile {
+/** Shape-reduce parse output and attach the provider's exact export surface. */
+function toFinalizeFile(
+  file: ParsedFile,
+  localExports?: ReadonlyMap<string, SymbolDefinition>,
+): FinalizeFile {
+  const moduleScope = file.scopes.find((scope) => scope.id === file.moduleScope);
+  const moduleBindings = new Map(moduleScope?.bindings ?? []);
+  // Namespace members historically participate in the same-file unqualified
+  // fallback (notably C/C++ anonymous namespaces). Keep that language surface
+  // while excluding function/class-body bindings that caused #3499.
+  for (const scope of file.scopes) {
+    if (scope.kind !== 'Namespace') continue;
+    for (const [name, refs] of scope.bindings) {
+      moduleBindings.set(name, [...(moduleBindings.get(name) ?? []), ...refs]);
+    }
+  }
   return {
     filePath: file.filePath,
     moduleScope: file.moduleScope,
     parsedImports: file.parsedImports,
     localDefs: file.localDefs,
+    localExports,
+    // The extractor always emits the module scope. Its binding map is the
+    // authoritative lexical surface; `ownedDefs` is structural ownership and
+    // excludes hoisted top-level function/class declarations.
+    moduleBindings,
   };
 }
 
@@ -187,8 +238,17 @@ function collectReferenceSites(parsedFiles: readonly ParsedFile[]) {
  */
 function withDefaultHooks(partial: Partial<FinalizeHooks>): FinalizeHooks {
   return {
+    ownedMembersBindAtModuleScope: partial.ownedMembersBindAtModuleScope,
+    importsBindAtLexicalScope: partial.importsBindAtLexicalScope === true,
+    groupsWildcardTargets: partial.groupsWildcardTargets === true,
     resolveImportTarget: partial.resolveImportTarget ?? (() => null),
+    isNamespaceImport: partial.isNamespaceImport,
+    wildcardCollisionIsAmbiguous: partial.wildcardCollisionIsAmbiguous === true,
+    namedImportsBindTopLevelOnly: partial.namedImportsBindTopLevelOnly === true,
+    wildcardReexportExcludedNames: partial.wildcardReexportExcludedNames,
     expandsWildcardTo: partial.expandsWildcardTo ?? (() => []),
+    filterWildcardNames: partial.filterWildcardNames,
+    mergeBindingsAreAssociative: partial.mergeBindingsAreAssociative,
     mergeBindings:
       partial.mergeBindings ??
       ((

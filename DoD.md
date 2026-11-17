@@ -113,7 +113,7 @@ Run the commands relevant to the touched area. If something cannot be run in the
 
 ### 4.1 Build ordering
 
-- [ ] `gitnexus-shared/` dist is built before consuming packages are typechecked or tested (CI uses the `setup-gitnexus` action for this — local runs must match).
+- [ ] `gitnexus-shared/` dist is built before consuming packages are typechecked or tested (CI uses the `setup-gitnexus` action, which compiles shared with the parent TypeScript 7 `lib/tsc.js` — local runs must match).
 
 ### 4.2 If `gitnexus/` changed
 
@@ -123,18 +123,18 @@ Run the commands relevant to the touched area. If something cannot be run in the
 
 ### 4.3 If `gitnexus-web/` changed
 
-- [ ] `cd gitnexus-web && npx tsc -b --noEmit`
+- [ ] `cd gitnexus-web && npx tsc -b --noEmit` (TypeScript 7 typechecks React/JSX: `jsx: react-jsx`, `lib` includes `DOM`)
 - [ ] `cd gitnexus-web && npm test`
 - [ ] `cd gitnexus-web && npm run test:e2e` when browser flows or user-facing UI behavior changed
 
 ### 4.4 If `gitnexus-shared/` changed
 
-- [ ] Shared package builds cleanly (`npm run build` in `gitnexus-shared/`)
+- [ ] Shared package builds cleanly from a parent TypeScript 7 shim after that parent is installed (`cd gitnexus-shared && node ../gitnexus/node_modules/typescript/lib/tsc.js`, or `node ../gitnexus-web/node_modules/typescript/lib/tsc.js` after a web install). Do not `npm install` / `npm ci` in `gitnexus-shared/` for this check.
 - [ ] Dependent packages still typecheck and test after the shared change — verify both CLI and web consumers together
 
 ### 4.5 If CI workflows or release pipelines changed
 
-- [ ] The workflow passes a dry-run or triggered run before merge; concurrency (`cancel-in-progress`) and the `setup-gitnexus` action remain wired correctly.
+- [ ] The workflow passes a dry-run or triggered run; concurrency (`cancel-in-progress`) and the `setup-gitnexus` action remain wired correctly. Workflows that only execute once registered on the default branch (an `issue_comment` trigger, or a newly added `workflow_dispatch`) cannot be dry-run pre-merge — merge them **registered but disabled**, then validate same-repo and fork execution post-merge before enabling.
 - [ ] `CHANGELOG.md` is **not** edited here — it is owned by the release process.
 
 ## 5. Review Gates

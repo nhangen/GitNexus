@@ -60,6 +60,32 @@ describe('ManifestExtractor', () => {
     expect(result.crossLinks[0].to.repo).toBe('sales/crm/backend');
   });
 
+  it('records the declared provider repo on the consumer contract, whichever side the link starts from (#1188)', async () => {
+    const result = await extractor.extractFromManifest([
+      { from: 'svc/payments', to: 'svc/orders', type: 'topic', contract: 'paid', role: 'provider' },
+      {
+        from: 'svc/web',
+        to: 'svc/catalog',
+        type: 'http',
+        contract: 'GET::/items',
+        role: 'consumer',
+      },
+    ]);
+
+    const metaOf = (role: 'provider' | 'consumer', repo: string) =>
+      result.contracts.find((c) => c.role === role && c.repo === repo)?.meta;
+    expect(metaOf('consumer', 'svc/orders')).toEqual({
+      source: 'manifest',
+      providerRepo: 'svc/payments',
+    });
+    expect(metaOf('consumer', 'svc/web')).toEqual({
+      source: 'manifest',
+      providerRepo: 'svc/catalog',
+    });
+    expect(metaOf('provider', 'svc/payments')).toEqual({ source: 'manifest' });
+    expect(metaOf('provider', 'svc/catalog')).toEqual({ source: 'manifest' });
+  });
+
   it('resolves grpc manifest provider by exact method name (no .proto fallback)', async () => {
     const links: GroupManifestLink[] = [
       {
@@ -839,7 +865,17 @@ describe('ManifestExtractor', () => {
 
     await extractor.extractFromManifest(links, dbExecutors);
 
-    expect(capturedCypher).toContain('Function|Method|Class|Interface|Struct|Enum|Trait');
+    // This `custom`-branch list contains the reserved keywords `Macro`/`Union`,
+    // which make LadybugDB's parser reject the `MATCH (n:A|B|C)` disjunction
+    // (#2325), so the allowlist is carried as `labels(n) IN [...]`, not `n:A|B`.
+    expect(capturedCypher).toContain('labels(n) IN [');
+    // Membership checks that tolerate label order/spacing changes in the
+    // production allowlist (the negative guards below are the real regression
+    // check — a re-introduced `:A|B` disjunction has no quoted labels at all).
+    expect(capturedCypher).toContain("'Function'");
+    expect(capturedCypher).toContain("'Method'");
+    expect(capturedCypher).toContain("'CodeElement'");
+    expect(capturedCypher).not.toContain('Function|Method');
     expect(capturedCypher).not.toContain('NOT n:File');
   });
 

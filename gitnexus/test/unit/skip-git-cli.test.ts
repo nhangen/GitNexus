@@ -6,6 +6,32 @@ import fs from 'fs';
 
 describe('--skip-git CLI flag', () => {
   const cliPath = path.resolve(__dirname, '../../dist/cli/index.js');
+  const ftsUnavailableMessage = 'FTS extension unavailable - cannot create FTS index';
+
+  interface ExecSyncLikeError {
+    message?: string;
+    stdout?: string | Buffer;
+    stderr?: string | Buffer;
+  }
+
+  const isFtsUnavailableError = (err: unknown): boolean => {
+    if (!err || typeof err !== 'object') return false;
+    const e = err as ExecSyncLikeError;
+    return (
+      e.message?.includes(ftsUnavailableMessage) ||
+      e.stdout?.toString().includes(ftsUnavailableMessage) ||
+      e.stderr?.toString().includes(ftsUnavailableMessage)
+    );
+  };
+
+  const shouldSkipForFtsUnavailable = (err: unknown, testName: string): boolean => {
+    if (!isFtsUnavailableError(err)) return false;
+
+    console.warn(
+      `[skip-git-cli.test] Skipping "${testName}" because FTS extension is unavailable.`,
+    );
+    return true;
+  };
 
   it('Commander maps --skip-git to options.skipGit (not --no-git inversion)', () => {
     // Verify the CLI defines --skip-git and --skip-agents-md in analyze help.
@@ -13,11 +39,66 @@ describe('--skip-git CLI flag', () => {
       cwd: path.resolve(__dirname, '../..'),
       encoding: 'utf8',
       timeout: 10000,
+      env: { ...process.env, GITNEXUS_LANG: 'en' },
     });
 
     expect(helpOutput).toContain('--skip-git');
-    expect(helpOutput).toContain('--skip-agents-md');
+    const helpFlat = helpOutput.replace(/\s+/g, ' ');
+    expect(helpFlat).toContain('--skip-agents-md');
+    expect(helpFlat).toContain('Does not skip standard skills in .claude/skills');
+    expect(helpFlat).toContain('Community skills from --skills are unaffected');
+    expect(helpFlat).toContain('--skip-skills');
+    expect(helpOutput).toContain('directly under .claude/skills/');
+    expect(helpOutput).toContain('.agents/skills/');
+    expect(helpOutput).toContain('.claude/skills/gitnexus-area-*');
+    expect(helpOutput).toContain('--index-only');
     expect(helpOutput).not.toContain('--no-git');
+  });
+
+  it('warns when --index-only overrides --skills (PR 1485)', () => {
+    // `--index-only` suppresses the post-index skill step that `--skills`
+    // would otherwise trigger. Without an explicit warning, the user sees a
+    // pipeline re-index complete and silently no skill files written — the
+    // silent-contradiction case flagged in PR 1485 review.
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gn-index-only-skills-'));
+    const gitnexusHome = fs.mkdtempSync(path.join(os.tmpdir(), 'gn-index-only-skills-home-'));
+    // Make tmpDir a git repo so analyze accepts it without --skip-git.
+    execSync('git init', { cwd: tmpDir, stdio: 'ignore' });
+    fs.writeFileSync(path.join(tmpDir, 'a.ts'), 'export const a = 1;\n');
+
+    const env = {
+      ...process.env,
+      HOME: gitnexusHome,
+      GITNEXUS_HOME: gitnexusHome,
+      // This suite tests repository-root selection, not extension installation.
+      // Keep child CLI runs offline so an unavailable FTS download cannot consume
+      // Vitest's per-test timeout.
+      GITNEXUS_LBUG_EXTENSION_INSTALL: 'never',
+    };
+
+    try {
+      let output: string;
+      try {
+        output = execSync(
+          `node "${cliPath}" analyze "${tmpDir}" --index-only --skills --skip-agents-md`,
+          {
+            encoding: 'utf8',
+            timeout: 60000,
+            env,
+          },
+        );
+      } catch (err: unknown) {
+        if (
+          shouldSkipForFtsUnavailable(err, 'warns when --index-only overrides --skills (PR 1485)')
+        )
+          return;
+        throw err;
+      }
+      expect(output).toContain('--index-only overrides --skills');
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+      fs.rmSync(gitnexusHome, { recursive: true, force: true });
+    }
   });
 
   it('rejects non-git folder without --skip-git', () => {
@@ -59,11 +140,22 @@ describe('--skip-git CLI flag', () => {
     };
 
     try {
-      execSync(`node "${cliPath}" analyze "${tmpDir}" --skip-git --skip-agents-md`, {
-        encoding: 'utf8',
-        timeout: 60000,
-        env,
-      });
+      try {
+        execSync(`node "${cliPath}" analyze "${tmpDir}" --skip-git --skip-agents-md`, {
+          encoding: 'utf8',
+          timeout: 60000,
+          env,
+        });
+      } catch (err: unknown) {
+        if (
+          shouldSkipForFtsUnavailable(
+            err,
+            'still respects .gitnexusignore when run with --skip-git',
+          )
+        )
+          return;
+        throw err;
+      }
 
       const keepContext = execSync(
         `node "${cliPath}" context keep --repo "${path.basename(tmpDir)}"`,
@@ -73,24 +165,31 @@ describe('--skip-git CLI flag', () => {
           env,
         },
       );
-      // stdout is a pipe here (non-TTY), so output() emits compact JSON —
-      // the isTTY-only indentation upstream #3947/#3953 ported to this fork.
-      expect(keepContext).toContain('"status":"found"');
-      expect(keepContext).toContain('"filePath":"src/keep.ts"');
+      expect(JSON.parse(keepContext)).toMatchObject({
+        status: 'found',
+        symbol: { filePath: 'src/keep.ts' },
+      });
 
-      // The ported #2469/#2915 fail-closed block makes an error payload exit 1,
-      // so read stdout from the non-zero exit instead of execSync returning it.
+      // Since #2470 a backend error payload also exits non-zero, so capture
+      // the payload from the exec failure instead of expecting exit 0.
       let leakedContext = '';
+      let leakedStatus = 0;
       try {
-        execSync(`node "${cliPath}" context leaked --repo "${path.basename(tmpDir)}"`, {
-          encoding: 'utf8',
-          timeout: 60000,
-          env,
-        });
-      } catch (err: any) {
-        leakedContext = err.stdout || '';
+        leakedContext = execSync(
+          `node "${cliPath}" context leaked --repo "${path.basename(tmpDir)}"`,
+          {
+            encoding: 'utf8',
+            timeout: 60000,
+            env,
+          },
+        );
+      } catch (err: unknown) {
+        const execErr = err as { status?: number; stdout?: string | Buffer };
+        leakedStatus = execErr.status ?? 0;
+        leakedContext = String(execErr.stdout ?? '');
       }
-      expect(leakedContext).toContain(`"error":"Symbol 'leaked' not found"`);
+      expect(leakedStatus).toBe(1);
+      expect(JSON.parse(leakedContext).error).toBe("Symbol 'leaked' not found");
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
       fs.rmSync(gitnexusHome, { recursive: true, force: true });
@@ -104,7 +203,7 @@ describe('--skip-git CLI flag', () => {
     function testEnv() {
       return {
         ...process.env,
-        HOME: parentDir,
+        HOME: gitnexusHome,
         GITNEXUS_HOME: gitnexusHome,
         GITNEXUS_LBUG_EXTENSION_INSTALL: 'never',
       };
@@ -195,12 +294,24 @@ describe('--skip-git CLI flag', () => {
       createTestStructure();
       try {
         // Run analyze from COOLIO with --skip-git
-        const output = execSync(`node "${cliPath}" analyze --skip-git --skip-agents-md`, {
-          cwd: path.join(parentDir, 'COOLIO'),
-          encoding: 'utf8',
-          timeout: 60000,
-          env: testEnv(),
-        });
+        let output: string;
+        try {
+          output = execSync(`node "${cliPath}" analyze --skip-git --skip-agents-md`, {
+            cwd: path.join(parentDir, 'COOLIO'),
+            encoding: 'utf8',
+            timeout: 60000,
+            env: testEnv(),
+          });
+        } catch (err: unknown) {
+          if (
+            shouldSkipForFtsUnavailable(
+              err,
+              'from subdir inside parent git repo, indexes subdir not parent',
+            )
+          )
+            return;
+          throw err;
+        }
         // Should mention COOLIO not the parent dir name
         expect(output).toContain('COOLIO');
 
@@ -229,12 +340,23 @@ describe('--skip-git CLI flag', () => {
           stdio: 'ignore',
         });
 
-        execSync(`node "${cliPath}" analyze --skip-git --skip-agents-md`, {
-          cwd: path.join(parentDir, 'COOLIO'),
-          encoding: 'utf8',
-          timeout: 60000,
-          env: testEnv(),
-        });
+        try {
+          execSync(`node "${cliPath}" analyze --skip-git --skip-agents-md`, {
+            cwd: path.join(parentDir, 'COOLIO'),
+            encoding: 'utf8',
+            timeout: 60000,
+            env: testEnv(),
+          });
+        } catch (err: unknown) {
+          if (
+            shouldSkipForFtsUnavailable(
+              err,
+              'keeps parent git status clean for --skip-git subdir analyze (#1233)',
+            )
+          )
+            return;
+          throw err;
+        }
 
         expect(
           fs.readFileSync(path.join(parentDir, 'COOLIO', '.gitnexus', '.gitignore'), 'utf8'),
@@ -252,12 +374,21 @@ describe('--skip-git CLI flag', () => {
     it('explicit input path with --skip-git indexes subdir', () => {
       createTestStructure();
       try {
-        const output = execSync(`node "${cliPath}" analyze ./COOLIO --skip-git --skip-agents-md`, {
-          cwd: parentDir,
-          encoding: 'utf8',
-          timeout: 60000,
-          env: testEnv(),
-        });
+        let output: string;
+        try {
+          output = execSync(`node "${cliPath}" analyze ./COOLIO --skip-git --skip-agents-md`, {
+            cwd: parentDir,
+            encoding: 'utf8',
+            timeout: 60000,
+            env: testEnv(),
+          });
+        } catch (err: unknown) {
+          if (
+            shouldSkipForFtsUnavailable(err, 'explicit input path with --skip-git indexes subdir')
+          )
+            return;
+          throw err;
+        }
         expect(output).toContain('COOLIO');
 
         expectCoolioRegistryEntry();

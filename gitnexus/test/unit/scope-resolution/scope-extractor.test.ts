@@ -16,8 +16,13 @@ import type {
   ReferenceKind,
   Scope,
   ScopeKind,
+  SymbolDefinition,
 } from 'gitnexus-shared';
-import { extract, type ScopeExtractorHooks } from '../../../src/core/ingestion/scope-extractor.js';
+import {
+  extract,
+  selectNodeBearingDef,
+  type ScopeExtractorHooks,
+} from '../../../src/core/ingestion/scope-extractor.js';
 
 // ─── Synthetic-capture helpers ──────────────────────────────────────────────
 
@@ -195,16 +200,68 @@ describe('Pass 1: scope tree', () => {
     ).toThrow(/overlap/i);
   });
 
-  it('throws when no Module scope is present', () => {
-    expect(() => extract([scopeMatch('function', 1, 0, 10, 0)], 'a.ts', mockProvider())).toThrow(
-      /Module/,
-    );
+  it('synthesizes a Module scope and re-parents orphan Function when no Module is present', () => {
+    const result = extract([scopeMatch('function', 1, 0, 10, 0)], 'a.ts', mockProvider());
+    const moduleScope = result.scopes.find((s) => s.kind === 'Module');
+    expect(moduleScope).toBeDefined();
+    const fnScope = result.scopes.find((s) => s.kind === 'Function');
+    expect(fnScope).toBeDefined();
+    expect(fnScope!.parent).toBe(moduleScope!.id);
   });
 });
 
 // ─── §Pass 2: declarations + local bindings ────────────────────────────────
 
 describe('Pass 2: declarations + local bindings', () => {
+  it.each([undefined, 'visible', ''])(
+    'retains graph identity with binding-name override %j',
+    (bindingName) => {
+      const extras =
+        bindingName === undefined
+          ? {}
+          : {
+              '@declaration.binding-name': cap(
+                '@declaration.binding-name',
+                5,
+                0,
+                10,
+                0,
+                bindingName,
+              ),
+            };
+      const result = extract(
+        [scopeMatch('module', 1, 0, 100, 0), declMatch('function', 'display', 5, 0, 10, 0, extras)],
+        'a.ts',
+        mockProvider(),
+      );
+      const module = result.scopes[0]!;
+      expect(result.localDefs).toHaveLength(1);
+      expect(module.ownedDefs).toEqual(result.localDefs);
+      expect(result.localDefs[0]!.nodeId).toBe('def:a.ts#5:0:Function:display');
+      expect([...module.bindings.keys()]).toEqual(
+        bindingName === '' ? [] : [bindingName ?? 'display'],
+      );
+    },
+  );
+  it('routes one multi-topic match through both scope and declaration passes', () => {
+    const result = extract(
+      [
+        scopeMatch('module', 1, 0, 100, 0),
+        {
+          '@scope.function': cap('@scope.function', 5, 0, 20, 0, 'render'),
+          '@declaration.function': cap('@declaration.function', 5, 0, 20, 0, 'render'),
+          '@declaration.name': cap('@declaration.name', 5, 0, 5, 6, 'render'),
+        },
+      ],
+      'a.ts',
+      mockProvider(),
+    );
+
+    expect(result.scopes.some((scope) => scope.kind === 'Function')).toBe(true);
+    expect(result.localDefs).toHaveLength(1);
+    expect(result.localDefs[0]!.qualifiedName).toBe('render');
+  });
+
   it('attaches a Class declaration to its enclosing Module scope', () => {
     const result = extract(
       [
@@ -232,6 +289,38 @@ describe('Pass 2: declarations + local bindings', () => {
     );
     expect(result.localDefs).toHaveLength(1);
     expect(result.localDefs[0]!.type).toBe('Function');
+  });
+
+  it('backfills return types across duplicate declaration captures', () => {
+    const plain = declMatch('function', 'makeStore', 5, 0, 10, 0);
+    const annotated = declMatch('function', 'makeStore', 5, 0, 10, 0, {
+      '@declaration.return-type': cap('@declaration.return-type', 5, 0, 10, 0, 'Store'),
+    });
+    const result = extract(
+      [scopeMatch('module', 1, 0, 100, 0), scopeMatch('function', 5, 0, 10, 0), plain, annotated],
+      'Support.swift',
+      mockProvider(),
+    );
+
+    expect(result.localDefs).toHaveLength(2);
+    expect(new Set(result.localDefs.map((def) => def.nodeId)).size).toBe(1);
+    expect(result.localDefs.map((def) => def.returnType)).toEqual(['Store', 'Store']);
+  });
+
+  it('preserves a synthetic declaration marker on the definition', () => {
+    const result = extract(
+      [
+        scopeMatch('module', 1, 0, 100, 0),
+        declMatch('class', 'Worker$1', 5, 0, 10, 0, {
+          '@declaration.is-synthetic': cap('@declaration.is-synthetic', 5, 0, 10, 0, 'true'),
+        }),
+      ],
+      'a.ts',
+      mockProvider(),
+    );
+
+    expect(result.localDefs).toHaveLength(1);
+    expect(result.localDefs[0]!.isSynthetic).toBe(true);
   });
 
   it('honors `provider.bindingScopeFor` to hoist a binding to an outer scope', () => {
@@ -286,7 +375,13 @@ describe('Pass 3: raw imports', () => {
         interpretImport: () => named,
       }),
     );
-    expect(result.parsedImports).toEqual([named]);
+    expect(result.parsedImports).toEqual([
+      {
+        ...named,
+        declaredAtScope: result.moduleScope,
+        atRange: { startLine: 3, startCol: 0, endLine: 3, endCol: 30 },
+      },
+    ]);
   });
 
   it('drops imports when `interpretImport` returns null', () => {
@@ -307,6 +402,181 @@ describe('Pass 3: raw imports', () => {
       mockProvider(),
     );
     expect(result.parsedImports).toEqual([]);
+  });
+});
+
+// ─── §Pass 3: `runsOnlyWhenCalled` ────────────────────────────────────────
+//
+// The one scope fact Pass 3 reads before flattening the imports into a
+// per-file list. It has to be decided here: `FinalizeFile.parsedImports` is
+// flat, and finalize publishes a file's edges under `file.moduleScope`, so no
+// later stage can tell where a statement sat (see
+// `ParsedImport.runsOnlyWhenCalled`). Posed captures rather than a language,
+// because the rule is language-agnostic and every scope kind has to be covered
+// — no single grammar produces them all.
+
+describe('Pass 3: runsOnlyWhenCalled', () => {
+  const named: ParsedImport = {
+    kind: 'named',
+    localName: 'User',
+    importedName: 'User',
+    targetRaw: './models',
+  };
+
+  /**
+   * Mark an import sitting at line 12 against a scope tree posed as nested
+   * `@scope.*` captures, and report whether it came out deferred.
+   */
+  const deferredUnder = (...kinds: readonly Lowercase<ScopeKind>[]): boolean => {
+    // Each scope nests inside the previous one and all of them contain line 12.
+    const scopes = kinds.map((kind, depth) => scopeMatch(kind, 1 + depth, 0, 100 - depth, 0));
+    const result = extract(
+      [...scopes, importMatch(12, 0, 12, 30)],
+      'a.ts',
+      mockProvider({ interpretImport: () => named }),
+    );
+    expect(result.parsedImports).toHaveLength(1);
+    return result.parsedImports[0]!.runsOnlyWhenCalled === true;
+  };
+
+  it('a module-level import is not marked', () => {
+    expect(deferredUnder('module')).toBe(false);
+  });
+
+  it('an import inside a Function IS marked', () => {
+    expect(deferredUnder('module', 'function')).toBe(true);
+  });
+
+  it('the walk climbs past every non-Function kind to reach the Function', () => {
+    // A `Block` inside a function does not run at initialization even though
+    // `Block` on its own does. Reading only the immediate scope kind fails
+    // every one of these.
+    expect(deferredUnder('module', 'function', 'block')).toBe(true);
+    expect(deferredUnder('module', 'function', 'block', 'block')).toBe(true);
+    expect(deferredUnder('module', 'function', 'class')).toBe(true);
+    expect(deferredUnder('module', 'function', 'expression')).toBe(true);
+    expect(deferredUnder('module', 'function', 'object')).toBe(true);
+    expect(deferredUnder('module', 'class', 'function', 'block')).toBe(true);
+  });
+
+  it('kinds that execute where they are defined are NOT marked', () => {
+    // `if (FLAG) { require('./x'); }` at module top level really does force an
+    // initialization order, and so do class, namespace, object-literal and
+    // comprehension bodies. Only a `Function` defers.
+    expect(deferredUnder('module', 'block')).toBe(false);
+    expect(deferredUnder('module', 'namespace')).toBe(false);
+    expect(deferredUnder('module', 'class')).toBe(false);
+    expect(deferredUnder('module', 'namespace', 'class')).toBe(false);
+    expect(deferredUnder('module', 'expression')).toBe(false);
+    expect(deferredUnder('module', 'object')).toBe(false);
+    expect(deferredUnder('module', 'class', 'block')).toBe(false);
+  });
+
+  it('a sibling function does not mark an import outside it', () => {
+    // Containment decides, not "the file has a function somewhere".
+    const result = extract(
+      [
+        scopeMatch('module', 1, 0, 100, 0),
+        scopeMatch('function', 20, 0, 40, 0),
+        importMatch(3, 0, 3, 30),
+      ],
+      'a.ts',
+      mockProvider({ interpretImport: () => named }),
+    );
+    expect(result.parsedImports[0]!.runsOnlyWhenCalled).toBeUndefined();
+  });
+
+  it('the property is absent, not false, when the import initializes', () => {
+    // Absence is the fail-safe reading, and it keeps an un-deferred
+    // `ParsedImport` byte-identical to what it was before the field existed —
+    // which is what the fixture suites across fourteen languages assert.
+    const result = extract(
+      [scopeMatch('module', 1, 0, 100, 0), importMatch(3, 0, 3, 30)],
+      'a.ts',
+      mockProvider({ interpretImport: () => named }),
+    );
+    expect(result.parsedImports).toEqual([
+      {
+        ...named,
+        declaredAtScope: result.moduleScope,
+        atRange: { startLine: 3, startCol: 0, endLine: 3, endCol: 30 },
+      },
+    ]);
+  });
+
+  // ─── The provider capability that opts out of the position rule ──────────
+  //
+  // The walk answers "does this run only when the enclosing function is
+  // called?", which presupposes the import is a statement that RUNS. C/C++
+  // `#include` is not — the preprocessor splices the header in before the
+  // program starts, wherever the directive sits — and neither is a Rust `use`,
+  // a compile-time path alias. Both are legal inside a function body.
+  // Deferring one would make `check --cycles` drop a cycle that is entirely
+  // real, and suppressing a true cycle is the failure direction that matters.
+  //
+  // The opt-out is a capability on the provider, checked here, rather than a
+  // language test inside the walk: shared `core/ingestion/` pipeline code must
+  // not name languages (AGENTS.md). These cases pin the CONTRACT — that the
+  // flag is read at all, that its default is unchanged, and which of its two
+  // values is the opt-out — with no language in sight.
+  // `function-local-import-chain.test.ts` pins the C and Rust provider ends of
+  // it against real source.
+
+  it('a provider whose imports do not execute where written is never marked', () => {
+    const result = extract(
+      [
+        scopeMatch('module', 1, 0, 100, 0),
+        scopeMatch('function', 2, 0, 99, 0),
+        importMatch(12, 0, 12, 30),
+      ],
+      'a.c',
+      mockProvider({ interpretImport: () => named, importsExecuteWhereWritten: false }),
+    );
+    // Scope provenance survives, without adding the execution-deferral flag.
+    expect(result.parsedImports).toEqual([
+      {
+        ...named,
+        declaredAtScope: 'scope:a.c#2:0-99:0:Function',
+        atRange: { startLine: 12, startCol: 0, endLine: 12, endCol: 30 },
+      },
+    ]);
+  });
+
+  it('the identical captures ARE marked for a provider that does not declare it', () => {
+    // The control that makes the case above mean something: same scopes, same
+    // import position, only the capability differs.
+    const captures = [
+      scopeMatch('module', 1, 0, 100, 0),
+      scopeMatch('function', 2, 0, 99, 0),
+      importMatch(12, 0, 12, 30),
+    ];
+    expect(
+      extract(captures, 'a.ts', mockProvider({ interpretImport: () => named })).parsedImports,
+    ).toEqual([
+      {
+        ...named,
+        declaredAtScope: 'scope:a.ts#2:0-99:0:Function',
+        runsOnlyWhenCalled: true,
+        atRange: { startLine: 12, startCol: 0, endLine: 12, endCol: 30 },
+      },
+    ]);
+    // Absent must mean `true`, not merely "not false" — the default is the
+    // safe direction (position defers), and only an explicit `false` withholds
+    // deferral. Spelling `true` therefore has to behave exactly like absent.
+    expect(
+      extract(
+        captures,
+        'a.ts',
+        mockProvider({ interpretImport: () => named, importsExecuteWhereWritten: true }),
+      ).parsedImports,
+    ).toEqual([
+      {
+        ...named,
+        declaredAtScope: 'scope:a.ts#2:0-99:0:Function',
+        runsOnlyWhenCalled: true,
+        atRange: { startLine: 12, startCol: 0, endLine: 12, endCol: 30 },
+      },
+    ]);
   });
 });
 
@@ -358,6 +628,27 @@ describe('Pass 4: type bindings', () => {
 // ─── §Pass 5: reference sites ─────────────────────────────────────────────
 
 describe('Pass 5: reference sites', () => {
+  it.each([
+    '@reference.caller-scope',
+    '@reference.lookup-scope',
+    '@reference.lookup-purpose',
+    '@reference.receiver-chain',
+  ])('does not mistake leading %s metadata for a call anchor', (tag) => {
+    const result = extract(
+      [
+        scopeMatch('module', 1, 0, 10, 0),
+        { [tag]: cap(tag, 2, 0, 2, 20, 'metadata'), ...refMatch('call.free', 'run', 2, 2, 2, 7) },
+      ],
+      'a.ts',
+      mockProvider(),
+    );
+    expect(result.referenceSites).toHaveLength(1);
+    expect(result.referenceSites[0]).toMatchObject({
+      name: 'run',
+      kind: 'call',
+      atRange: { startLine: 2, startCol: 2, endLine: 2, endCol: 7 },
+    });
+  });
   it('emits a call reference with the innermost scope anchor', () => {
     const result = extract(
       [
@@ -463,6 +754,261 @@ describe('Pass 5: reference sites', () => {
     );
     expect(result.referenceSites[0]!.arity).toBe(2);
   });
+
+  // #2782: languages whose member-read pattern also matches the callee of a
+  // member call mark that site rather than dropping it — the phantom-vs-genuine
+  // decision needs the resolved tail's kind and so belongs at edge emission.
+  it('records @reference.callee-position as inCalleePosition without becoming the anchor', () => {
+    const result = extract(
+      [
+        scopeMatch('module', 1, 0, 100, 0),
+        refMatch('read', 'Work', 3, 0, 3, 10, {
+          // Widest capture in the match: if it were not a known sub-tag it
+          // would win `anchorCaptureFor` and route the site to an unknown kind.
+          '@reference.callee-position': cap(
+            '@reference.callee-position',
+            3,
+            0,
+            3,
+            20,
+            'h.dep.Work',
+          ),
+        }),
+      ],
+      'a.ts',
+      mockProvider(),
+    );
+    expect(result.referenceSites).toHaveLength(1);
+    expect(result.referenceSites[0]).toMatchObject({
+      name: 'Work',
+      kind: 'read',
+      inCalleePosition: true,
+    });
+  });
+
+  it('leaves inCalleePosition unset on an ordinary read', () => {
+    const result = extract(
+      [scopeMatch('module', 1, 0, 100, 0), refMatch('read', 'Label', 3, 0, 3, 10)],
+      'a.ts',
+      mockProvider(),
+    );
+    expect(result.referenceSites[0]!.inCalleePosition).toBeUndefined();
+  });
+});
+
+// ─── §Pass 6: callable-value-flow facts ───────────────────────────────────
+
+describe('Pass 6: callable-value-flow facts', () => {
+  it('omits callableFlowSites when the provider emits no flow captures', () => {
+    const result = extract([scopeMatch('module', 1, 0, 100, 0)], 'a.ts', mockProvider());
+    expect(result.callableFlowSites).toBeUndefined();
+  });
+
+  it('materializes every normalized fact shape with lexical scopes and JSON-safe metadata', () => {
+    const matches: CaptureMatch[] = [
+      scopeMatch('module', 1, 0, 100, 0),
+      scopeMatch('function', 10, 0, 60, 0),
+      {
+        '@callable-flow.seed': cap('@callable-flow.seed', 20, 2, 20, 20),
+        '@callable-flow.destination': cap('@callable-flow.destination', 20, 2, 20, 4, 'fp'),
+        '@callable-flow.target': cap('@callable-flow.target', 20, 8, 20, 14, 'target'),
+        '@callable-flow.target-name': cap('@callable-flow.target-name', 20, 8, 20, 14, 'target'),
+        '@callable-flow.target-qualified-name': cap(
+          '@callable-flow.target-qualified-name',
+          20,
+          8,
+          20,
+          14,
+          'Ns.target',
+        ),
+        '@callable-flow.expected-arity': cap('@callable-flow.expected-arity', 20, 2, 20, 2, '1'),
+        '@callable-flow.expected-types': cap(
+          '@callable-flow.expected-types',
+          20,
+          2,
+          20,
+          2,
+          '["int"]',
+        ),
+        '@callable-flow.expected-type-classes': cap(
+          '@callable-flow.expected-type-classes',
+          20,
+          2,
+          20,
+          2,
+          '[{"base":"int","cv":"none","indirection":"value","pointerDepth":0}]',
+        ),
+      },
+      {
+        '@callable-flow.copy': cap('@callable-flow.copy', 21, 2, 21, 10),
+        '@callable-flow.source': cap('@callable-flow.source', 21, 8, 21, 10, 'fp'),
+        '@callable-flow.destination': cap('@callable-flow.destination', 21, 2, 21, 5, 'fp2'),
+      },
+      {
+        '@callable-flow.alias': cap('@callable-flow.alias', 22, 2, 22, 10),
+        '@callable-flow.source': cap('@callable-flow.source', 22, 8, 22, 10, 'fp'),
+        '@callable-flow.destination': cap('@callable-flow.destination', 22, 2, 22, 5, 'ref'),
+      },
+      {
+        '@callable-flow.address': cap('@callable-flow.address', 23, 2, 23, 12),
+        '@callable-flow.source': cap('@callable-flow.source', 23, 9, 23, 11, 'fp'),
+        '@callable-flow.destination': cap('@callable-flow.destination', 23, 2, 23, 6, 'slot'),
+      },
+      {
+        '@callable-flow.store': cap('@callable-flow.store', 24, 2, 24, 14),
+        '@callable-flow.source': cap('@callable-flow.source', 24, 10, 24, 14, 'next'),
+        '@callable-flow.pointer': cap('@callable-flow.pointer', 24, 3, 24, 7, 'slot'),
+        '@callable-flow.pointer-indirection': cap(
+          '@callable-flow.pointer-indirection',
+          24,
+          3,
+          24,
+          3,
+          '1',
+        ),
+      },
+      {
+        '@callable-flow.load': cap('@callable-flow.load', 25, 2, 25, 14),
+        '@callable-flow.pointer': cap('@callable-flow.pointer', 25, 10, 25, 14, 'slot'),
+        '@callable-flow.destination': cap('@callable-flow.destination', 25, 2, 25, 5, 'out'),
+      },
+      {
+        '@callable-flow.formal': cap('@callable-flow.formal', 10, 0, 60, 0),
+        '@callable-flow.owner': cap('@callable-flow.owner', 10, 0, 60, 0, 'invoke'),
+        '@callable-flow.binding': cap('@callable-flow.binding', 10, 15, 10, 17, 'cb'),
+        '@callable-flow.parameter-index': cap(
+          '@callable-flow.parameter-index',
+          10,
+          15,
+          10,
+          15,
+          '0',
+        ),
+        '@callable-flow.passing-mode': cap(
+          '@callable-flow.passing-mode',
+          10,
+          15,
+          10,
+          15,
+          'reference',
+        ),
+      },
+      {
+        '@callable-flow.argument': cap('@callable-flow.argument', 30, 2, 30, 12),
+        '@callable-flow.source': cap('@callable-flow.source', 30, 9, 30, 11, 'fp'),
+        '@callable-flow.parameter-index': cap('@callable-flow.parameter-index', 30, 9, 30, 9, '0'),
+        '@callable-flow.direct-callee-name': cap(
+          '@callable-flow.direct-callee-name',
+          30,
+          2,
+          30,
+          8,
+          'invoke',
+        ),
+      },
+      {
+        '@callable-flow.invoke': cap('@callable-flow.invoke', 40, 2, 40, 14),
+        '@callable-flow.callee': cap('@callable-flow.callee', 40, 8, 40, 10, 'cb'),
+        '@callable-flow.receiver': cap('@callable-flow.receiver', 40, 3, 40, 6, 'obj'),
+        '@callable-flow.invocation-kind': cap(
+          '@callable-flow.invocation-kind',
+          40,
+          2,
+          40,
+          2,
+          'member-pointer',
+        ),
+        '@callable-flow.arity': cap('@callable-flow.arity', 40, 2, 40, 2, '0'),
+      },
+      // Malformed facts are ignored defensively.
+      { '@callable-flow.seed': cap('@callable-flow.seed', 50, 2, 50, 8) },
+    ];
+
+    const result = extract(matches, 'a.ts', mockProvider());
+    const sites = result.callableFlowSites!;
+    expect(sites.map((site) => site.kind)).toEqual([
+      'seed',
+      'copy',
+      'alias',
+      'address',
+      'store',
+      'load',
+      'formal',
+      'argument',
+      'invoke',
+    ]);
+    const fnScope = result.scopes.find((scope) => scope.kind === 'Function')!;
+    expect(sites[0]).toMatchObject({
+      destination: { name: 'fp', inScope: fnScope.id, indirection: 0 },
+      targetName: 'target',
+      targetQualifiedName: 'Ns.target',
+      expectedSignature: { parameterCount: 1, parameterTypes: ['int'] },
+    });
+    expect(sites[4]).toMatchObject({ pointer: { name: 'slot', indirection: 1 } });
+    expect(sites[6]).toMatchObject({
+      ownerName: 'invoke',
+      parameterIndex: 0,
+      passingMode: 'reference',
+      binding: { name: 'cb', inScope: fnScope.id },
+    });
+    expect(sites[7]).toMatchObject({ directCalleeName: 'invoke' });
+    expect(sites[8]).toMatchObject({
+      invocationKind: 'member-pointer',
+      arity: 0,
+      callee: { name: 'cb' },
+      receiver: { name: 'obj' },
+    });
+    expect(JSON.parse(JSON.stringify(sites))).toEqual(sites);
+  });
+});
+
+describe('Pass 7: call-result assignment identity', () => {
+  it('keeps same-name calls isolated by exact call-expression position', () => {
+    const result = extract(
+      [
+        scopeMatch('module', 1, 0, 100, 0),
+        scopeMatch('function', 10, 0, 40, 0),
+        {
+          '@call-result-assignment.call': cap(
+            '@call-result-assignment.call',
+            20,
+            14,
+            20,
+            25,
+            'makeStore()',
+          ),
+          '@call-result-assignment.lhs': cap('@call-result-assignment.lhs', 20, 6, 20, 11, 'store'),
+        },
+        {
+          '@call-result-assignment.call': cap(
+            '@call-result-assignment.call',
+            21,
+            14,
+            21,
+            25,
+            'makeStore()',
+          ),
+          '@call-result-assignment.lhs': cap('@call-result-assignment.lhs', 21, 6, 21, 11, 'other'),
+        },
+      ],
+      'a.swift',
+      mockProvider(),
+    );
+
+    const fnScope = result.scopes.find((scope) => scope.kind === 'Function')!;
+    expect(result.callResultAssignmentSites).toEqual([
+      {
+        callSite: { startLine: 20, startCol: 14, endLine: 20, endCol: 25 },
+        inScope: fnScope.id,
+        lhs: 'store',
+      },
+      {
+        callSite: { startLine: 21, startCol: 14, endLine: 21, endCol: 25 },
+        inScope: fnScope.id,
+        lhs: 'other',
+      },
+    ]);
+  });
 });
 
 // ─── §End-to-end fixture ──────────────────────────────────────────────────
@@ -527,7 +1073,13 @@ describe('end-to-end fixture (all 5 passes together)', () => {
     expect(fn.bindings.get('save')).toBeDefined();
 
     // Import collected.
-    expect(result.parsedImports).toEqual([parsedImport]);
+    expect(result.parsedImports).toEqual([
+      {
+        ...parsedImport,
+        declaredAtScope: result.moduleScope,
+        atRange: { startLine: 3, startCol: 0, endLine: 3, endCol: 30 },
+      },
+    ]);
 
     // Type binding attached to function scope.
     expect(fn.typeBindings.get('name')?.rawName).toBe('string');
@@ -545,5 +1097,56 @@ describe('end-to-end fixture (all 5 passes together)', () => {
     // Module scope id matches the ParsedFile header.
     const mod = result.scopes.find((s) => s.kind === 'Module')!;
     expect(result.moduleScope).toBe(mod.id);
+  });
+});
+
+describe('selectNodeBearingDef — #1876 one-node-per-binding collapse rule', () => {
+  const def = (type: SymbolDefinition['type'], name = 'x'): SymbolDefinition => ({
+    nodeId: `def:test.ts#1:0:${type}:${name}`,
+    filePath: 'test.ts',
+    type,
+    qualifiedName: name,
+  });
+
+  it('returns undefined for an empty group', () => {
+    expect(selectNodeBearingDef([])).toBeUndefined();
+  });
+
+  it('returns the only def for a single-element group', () => {
+    const only = def('Variable');
+    expect(selectNodeBearingDef([only])).toBe(only);
+  });
+
+  it('prefers a Function over a co-bound Variable (direct arrow / HOC)', () => {
+    const fn = def('Function');
+    const variable = def('Variable');
+    // Order-independent: function-like wins regardless of position.
+    expect(selectNodeBearingDef([variable, fn])).toBe(fn);
+    expect(selectNodeBearingDef([fn, variable])).toBe(fn);
+  });
+
+  it('prefers a Method over a co-bound value def', () => {
+    const method = def('Method');
+    const variable = def('Variable');
+    expect(selectNodeBearingDef([variable, method])).toBe(method);
+  });
+
+  it('returns the value def when no function-like def is present (array-method result)', () => {
+    const constDef = def('Const');
+    expect(selectNodeBearingDef([constDef])).toBe(constDef);
+    const variable = def('Variable');
+    expect(selectNodeBearingDef([variable])).toBe(variable);
+  });
+
+  it('prefers a value def even when an unranked label appears first', () => {
+    const cls = def('Class');
+    const variable = def('Variable');
+    expect(selectNodeBearingDef([cls, variable])).toBe(variable);
+  });
+
+  it('falls back to the first def for label sets the rule does not rank', () => {
+    const cls = def('Class');
+    const iface = def('Interface');
+    expect(selectNodeBearingDef([cls, iface])).toBe(cls);
   });
 });

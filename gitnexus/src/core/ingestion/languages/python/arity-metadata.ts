@@ -5,23 +5,26 @@
  *
  * Mirrors the legacy `buildMethodProps` conversion so scope-extracted
  * defs carry the same arity semantics as the parse-worker path:
- *   - `self` / `cls` are stripped (consumed by `extractPythonParameters`).
+ *   - A bound method's first positional receiver is stripped by class and
+ *     decorator context, independent of spelling; static/free functions keep it.
  *   - Defaulted params contribute to `optionalCount`, flipping
  *     `requiredParameterCount = total − optionalCount`.
- *   - Variadic (`*args` / `**kwargs`) collapses `parameterCount` to
- *     `undefined`, which `pythonArityCompatibility` then treats as
- *     `'unknown'` — keeping the candidate in the registry's lookup set.
+ *   - Variadic (`*args` / `**kwargs`) leaves both count-only bounds unknown:
+ *     parameter kinds are not retained, so a required keyword-only argument
+ *     cannot safely be treated as a positional minimum.
  *   - `parameterTypes` is populated only with real type text, matching
  *     legacy behavior.
  */
 
 import type { SyntaxNode } from '../../utils/ast-helpers.js';
 import { pythonMethodConfig } from '../../method-extractors/configs/python.js';
+import { declarationParameterTypes } from '../../method-extractors/declaration-facts.js';
 
 interface PythonArityMetadata {
   readonly parameterCount: number | undefined;
   readonly requiredParameterCount: number | undefined;
   readonly parameterTypes: readonly string[] | undefined;
+  readonly parameterNames: readonly string[];
 }
 
 export function computePythonArityMetadata(fnNode: SyntaxNode): PythonArityMetadata {
@@ -29,11 +32,10 @@ export function computePythonArityMetadata(fnNode: SyntaxNode): PythonArityMetad
 
   let hasVariadic = false;
   let optionalCount = 0;
-  const types: string[] = [];
+  const types = declarationParameterTypes(params);
   for (const p of params) {
     if (p.isVariadic) hasVariadic = true;
     else if (p.isOptional) optionalCount++;
-    if (p.type !== null) types.push(p.type);
   }
 
   const total = params.length;
@@ -50,5 +52,6 @@ export function computePythonArityMetadata(fnNode: SyntaxNode): PythonArityMetad
     parameterCount,
     requiredParameterCount,
     parameterTypes: types.length > 0 ? types : undefined,
+    parameterNames: params.map((parameter) => parameter.name),
   };
 }

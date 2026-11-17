@@ -41,15 +41,16 @@ describe('FieldRegistry', () => {
     expect(reg.lookupFieldByOwner('class:Order', 'name')?.nodeId).toBe('prop:Order.name');
   });
 
-  it('last-wins on duplicate (ownerNodeId, fieldName) — registry is flat, not an overload list', () => {
+  it('accumulates multiple defs under the same (ownerNodeId, fieldName)', () => {
     const reg = createFieldRegistry();
-    const first = makeDef({ nodeId: 'prop:User.name#first' });
-    const second = makeDef({ nodeId: 'prop:User.name#second' });
+    const first = makeDef({ nodeId: 'prop:User.name#first', type: 'Property' });
+    const second = makeDef({ nodeId: 'def:User.name#var', type: 'Variable' });
 
     reg.register('class:User', 'name', first);
     reg.register('class:User', 'name', second);
 
-    expect(reg.lookupFieldByOwner('class:User', 'name')?.nodeId).toBe('prop:User.name#second');
+    expect(reg.lookupFieldByOwner('class:User', 'name')?.nodeId).toBe('prop:User.name#first');
+    expect(reg.lookupAllByOwner('class:User', 'name')).toEqual([first, second]);
   });
 
   it('clear() empties the registry', () => {
@@ -70,5 +71,11 @@ describe('FieldRegistry', () => {
     reg.register('class:User', 'name', makeDef({ nodeId: 'prop:second' }));
 
     expect(reg.lookupFieldByOwner('class:User', 'name')?.nodeId).toBe('prop:second');
+  });
+
+  it('returns the same frozen empty array on miss', () => {
+    const reg = createFieldRegistry();
+    expect(reg.lookupAllByOwner('class:Nope', 'x')).toBe(reg.lookupAllByOwner('class:Nope', 'y'));
+    expect(Object.isFrozen(reg.lookupAllByOwner('class:Nope', 'x'))).toBe(true);
   });
 });

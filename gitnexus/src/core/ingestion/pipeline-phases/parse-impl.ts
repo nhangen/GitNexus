@@ -2,9 +2,12 @@
  * Parse implementation — chunked parse + resolve loop.
  *
  * This is the core parsing engine of the ingestion pipeline. It reads
- * source files in byte-budget chunks (~20MB each), parses via worker
- * pool (or sequential fallback), resolves imports/calls/heritage per
- * chunk, and synthesizes wildcard import bindings.
+ * source files in stable hash-bucket packs (~2MB each by default), parses via the worker
+ * pool (the sole parse path — there is no sequential fallback), and emits
+ * route CALLS edges. Import,
+ * call, and inheritance resolution are owned by the scope-resolution
+ * phase, not here (RING4-1 #942 removed the legacy call DAG; RING4-2 #943
+ * removed the legacy per-file import resolution + wildcard synthesis).
  *
  * Consumed by the parse phase (`parse.ts`) — the phase file handles
  * dependency wiring while the heavy implementation lives here.
@@ -12,68 +15,228 @@
  * @module
  */
 
+import type { LanguageProvider } from '../language-provider.js';
+import type { FetchWrapperCall, FetchWrapperReexport } from '../route-extractors/fetch-wrapper.js';
+import { resolveFetchWrapperTargets } from '../route-extractors/fetch-wrapper-index.js';
 import {
   BindingAccumulator,
   enrichExportedTypeMap,
   type BindingEntry,
 } from '../binding-accumulator.js';
-import { processParsing } from '../parsing-processor.js';
+import { mergeChunkResults, dispatchChunkParseRound } from '../parsing-processor.js';
 import {
-  processImports,
-  processImportsFromExtracted,
-  buildImportResolutionContext,
-} from '../import-processor.js';
-import { EMPTY_INDEX } from '../import-resolvers/utils.js';
+  fileContentHash,
+  computeFileResultKey,
+  ensureFileParseCache,
+  loadParseCacheFiles,
+  persistParseCacheFiles,
+  markParseCacheChunkStale,
+  packParseCacheChunks,
+} from '../../../storage/parse-cache.js';
 import {
-  processCalls,
-  processCallsFromExtracted,
-  processAssignmentsFromExtracted,
+  clearParsedFileStore,
+  persistParsedFileChunk,
+  loadParsedFilesForPaths,
+} from '../../../storage/parsedfile-store.js';
+import type { ParseWorkerInput, ParseWorkerResult } from '../workers/parse-worker.js';
+import {
+  decodeFileResultSection,
+  type EncodedFileResult,
+} from '../../../storage/file-result-codec.js';
+import { pinFileResults } from '../../../storage/file-result-store.js';
+import { resolveParseWorkerUrl } from '../workers/worker-entry.js';
+import { DEFAULT_PDG_MAX_FUNCTION_LINES } from '../cfg/collect.js';
+import type { WorkerExtractedData } from '../parsing-processor.js';
+import {
   processRoutesFromExtracted,
-  seedCrossFileReceiverTypes,
+  resolveRouteHandlerSymbols,
   buildExportedTypeMapFromGraph,
   type ExportedTypeMap,
 } from '../call-processor.js';
-import { buildHeritageMap } from '../model/heritage-map.js';
+import { createSemanticModel, type MutableSemanticModel } from '../model/index.js';
 import {
-  processHeritage,
-  processHeritageFromExtracted,
-  extractExtractedHeritageFromFiles,
-  getHeritageStrategyForLanguage,
-} from '../heritage-processor.js';
-import { createResolutionContext } from '../model/resolution-context.js';
-import { ASTCache, createASTCache } from '../ast-cache.js';
-import { type PipelineProgress, getLanguageFromFilename } from 'gitnexus-shared';
+  type PipelineProgress,
+  getLanguageFromFilename,
+  type ParsedImport,
+  SupportedLanguages,
+} from 'gitnexus-shared';
 import { readFileContents } from '../filesystem-walker.js';
-import { isLanguageAvailable } from '../../tree-sitter/parser-loader.js';
-import { createWorkerPool } from '../workers/worker-pool.js';
+import {
+  isLanguageAvailable,
+  isGrammarRuntimeSkipped,
+  createParserForLanguage,
+} from '../../tree-sitter/parser-loader.js';
+import { parseSourceSafe } from '../../tree-sitter/safe-parse.js';
+import {
+  getProvider,
+  getProviderForFile,
+  needsContentLanguageClassification,
+  providers,
+} from '../languages/index.js';
+import { classifyContentLanguages } from '../content-language-classification.js';
+import { SCOPE_RESOLVERS } from '../scope-resolution/pipeline/registry.js';
+import { DATA_ROUTE_TABLE_SOURCE } from '../route-extractors/data-route-table.js';
+import type Parser from 'tree-sitter';
+import {
+  createWorkerPool,
+  workerPoolDisabledByEnv,
+  resolveAutoPoolSize,
+  envWorkerPoolSize,
+  resolveHostParallelism,
+  WorkerPoolInitializationError,
+  WorkerPoolDisabledError,
+} from '../workers/worker-pool.js';
 import type { WorkerPool } from '../workers/worker-pool.js';
 import type {
-  ExtractedAssignment,
-  ExtractedCall,
   ExtractedDecoratorRoute,
   ExtractedFetchCall,
+  ExtractedModuleConstants,
   ExtractedORMQuery,
   ExtractedRoute,
   ExtractedToolDef,
-  FileConstructorBindings,
+  FetchWrapperDef,
 } from '../workers/parse-worker.js';
-import type { ExtractedHeritage } from '../model/heritage-map.js';
+import type {
+  ExtractedRouterConstructorPrefix,
+  ExtractedRouterImport,
+  ExtractedRouterInclude,
+  ExtractedRouterModuleAlias,
+} from '../route-extractors/fastapi-router-bindings.js';
+import {
+  mergeMountPrefixes,
+  resolveFastAPIRouterPrefixes,
+} from '../route-extractors/fastapi-router-prefixes.js';
+import { normalizeExtractedRoutePath } from '../route-extractors/route-path.js';
+import { resolveOperands } from '../route-extractors/python-const-resolver.js';
+import type { ModuleConstants } from '../route-extractors/constant-resolver.js';
+import { prepareRouteConstantsByProvider } from '../language-provider.js';
+import {
+  resolveInheritedSpringRoutes,
+  type SharedSpringType,
+} from '../route-extractors/spring-shared.js';
 import type { KnowledgeGraph } from '../../graph/types.js';
 import type { PipelineOptions } from '../pipeline.js';
-import { extractFetchCallsFromFiles } from '../call-processor.js';
 import fs from 'node:fs';
+import { heapPressureRemedy, memoryAutopilotDisabled } from '../utils/effective-ram.js';
 import path from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import v8 from 'node:v8';
 
 import { isDev } from '../utils/env.js';
-import { synthesizeWildcardImportBindings, needsSynthesis } from './wildcard-synthesis.js';
-import { extractORMQueriesInline } from './orm-extraction.js';
+import { isVerboseIngestionEnabled } from '../utils/verbose.js';
+import {
+  endTimer,
+  isDeferredResolutionProfileEnabled,
+  logDeferredProfile,
+  startTimer,
+} from '../utils/deferred-resolution-profile.js';
+import { isDebugHeapEnabled, logHeapProbe } from '../utils/heap-probe.js';
 
 import { logger } from '../../logger.js';
+import { createRoundBudget } from './parse-round-budget.js';
 // ── Constants ──────────────────────────────────────────────────────────────
 
-/** Max bytes of source content to load per parse chunk. */
-const CHUNK_BYTE_BUDGET = 20 * 1024 * 1024; // 20MB
+/**
+ * Heap-scale guardrail constants (#2649). Measured on a Linux-kernel analyze:
+ * ~75 graph nodes per PARSEABLE file (~5M nodes / ~65k parseable files;
+ * validated against heap probes at chunks 25/50/75 of 113 — the first
+ * calibration divided by total scanned files and under-projected by ~30%),
+ * main-thread heap per node. C-heavy corpus; other language mixes vary — these
+ * feed a WARNING and an emergency abort, never a hard admission gate, so
+ * estimate error only shifts when the operator hears about the problem, not
+ * whether analyze runs.
+ *
+ * RECALIBRATED for streamed structural emit (#2680), which is on by default for
+ * full rebuilds and holds relationships out of the JS heap. The original 2250
+ * was measured against the object-based graph; an A/B at 400k nodes / 1.08M
+ * edges put streaming at 1.40x smaller (819 MB -> 584 MB), so the corpus-
+ * calibrated figure is divided by that ratio: 2250 / 1.40 ~= 1600. Scaling the
+ * measured constant rather than substituting a synthetic one keeps #2649's
+ * kernel calibration intact and changes only the one thing that actually moved.
+ *
+ * If streaming is disabled (GITNEXUS_STREAM_GRAPH_EMIT=0, or any non-force run)
+ * this UNDER-projects by ~40%, so the preflight warning may stay quiet on a repo
+ * that then struggles. That is the safe direction to be wrong in: the abort
+ * below reads LIVE heap use, not this projection, so it still catches the real
+ * condition — only the early warning is affected.
+ */
+const PROJECTED_NODES_PER_FILE = 75;
+const PROJECTED_HEAP_BYTES_PER_NODE = 1600;
+/** Warn at scan end when the projection crosses this share of the heap limit. */
+const PREFLIGHT_WARN_FRACTION = 0.85;
+/**
+ * Abort the chunk loop when live heap use crosses this share of the limit.
+ * Above ~0.95 V8 enters the ineffective-mark-compact death spiral (2s+ GC
+ * pauses that also falsely idle-timeout healthy workers, #2649); 0.92 leaves
+ * one chunk's worth of headroom to fail with an actionable message instead.
+ * `GITNEXUS_MEMORY=off` declines the abort (proceed-at-own-risk).
+ */
+const HEAP_ABORT_FRACTION = 0.92;
+
+/** Projected main-thread heap need for the parse phase (#2649). */
+export function projectParseHeapNeedBytes(parseableFileCount: number): number {
+  return parseableFileCount * PROJECTED_NODES_PER_FILE * PROJECTED_HEAP_BYTES_PER_NODE;
+}
+
+/** True when the mid-loop heap guard should abort the parse (#2649). */
+export function shouldAbortForHeapPressure(heapUsedBytes: number, heapLimitBytes: number): boolean {
+  if (memoryAutopilotDisabled()) return false;
+  return heapUsedBytes > heapLimitBytes * HEAP_ABORT_FRACTION;
+}
+
+/** Max bytes of source content to load per parse cache pack.
+ *
+ * Granularity knob for the parse cache: a single file change invalidates only
+ * its enclosing pack. Override via GITNEXUS_CHUNK_BYTE_BUDGET. Resolution
+ * happens at call time (U14 from PR #1693) — not at module load.
+ */
+const DEFAULT_CHUNK_BYTE_BUDGET = 2 * 1024 * 1024;
+
+/**
+ * Byte unit for auto pool sizing (one worker per this much source). Same
+ * magnitude as the default cache pack, but not a membership input (#3088).
+ */
+const CHUNK_BYTES_PER_WORKER = DEFAULT_CHUNK_BYTE_BUDGET;
+
+/**
+ * Target jobs-per-worker per dispatch. More jobs than workers gives the pool's
+ * idle-slot assignment room to load-balance (a slow job doesn't strand a worker
+ * while the rest finish early). Drives the derived `subBatchMaxBytes`.
+ */
+const TARGET_JOBS_PER_WORKER = 3;
+
+/** Floor for a derived sub-batch so jobs don't shrink to per-file IPC churn. */
+const MIN_SUB_BATCH_BYTES = 256 * 1024;
+
+/**
+ * Source bytes an open round may HOLD — cache hits and misses alike — before
+ * it is dispatched and drained.
+ *
+ * A `dispatch` is a barrier, so one round-trip per cache pack leaves most slots
+ * idle: packs are keyed by `(language, hash(path) % 128)` and routinely land far
+ * under {@link DEFAULT_CHUNK_BYTE_BUDGET} (this repo: 1285 packs where the byte
+ * budget alone needs 16, 549 of them holding a single file). Rounds batch packs
+ * into one `dispatchGroups` call without touching pack identity.
+ *
+ * This is the in-flight cap, the same role Piscina's `maxQueue` plays: bigger
+ * rounds remove more barriers but hold more file content and more un-merged
+ * worker output on the main thread at once. Defaulting to one chunk budget
+ * keeps in-flight source bytes at the magnitude the loop already prefetched
+ * (`parseChunkConcurrency`, 2 chunks ahead). Override via
+ * `GITNEXUS_PARSE_ROUND_BYTES`.
+ */
+function resolveParseRoundByteBudget(options?: PipelineOptions): number {
+  const env = Number(process.env.GITNEXUS_PARSE_ROUND_BYTES);
+  if (Number.isFinite(env) && env > 0) return env;
+  return resolveChunkByteBudget(options);
+}
+
+function resolveChunkByteBudget(options?: PipelineOptions): number {
+  const opt = options?.chunkByteBudget;
+  if (typeof opt === 'number' && Number.isFinite(opt) && opt > 0) return opt;
+  const env = Number(process.env.GITNEXUS_CHUNK_BYTE_BUDGET);
+  if (Number.isFinite(env) && env > 0) return env;
+  return DEFAULT_CHUNK_BYTE_BUDGET;
+}
 
 // ── Main parse + resolve function ──────────────────────────────────────────
 
@@ -81,15 +244,199 @@ type ScannedFile = { path: string; size: number };
 type ProgressFn = (progress: PipelineProgress) => void;
 
 /**
+ * Whole-repo, cross-file route extraction (main thread).
+ *
+ * Some frameworks define their route table from a single root file that pulls
+ * in other files across the repo — e.g. Django follows
+ * `manage.py → DJANGO_SETTINGS_MODULE → ROOT_URLCONF → root urls.py`, then walks
+ * `include()` chains across many files. Unlike single-file route files (Laravel
+ * `routes/*.php`), which the parse worker extracts in isolation, these need a
+ * whole-repo view and on-demand cross-file reads — neither of which the
+ * filesystem-free worker can provide, and which a per-chunk worker view gets
+ * wrong whenever the root file and its includes land in different chunks.
+ *
+ * So it runs here, once, after every file is scanned — mirroring the FastAPI
+ * router-include join further below. The pass is language-agnostic: any
+ * {@link LanguageProvider} exposing both `discoverRootRouteFile` and
+ * `extractRoutes` participates (today only Python/Django). For repos without
+ * such a framework the cost is a path scan plus one `manage.py`-style miss.
+ */
+export async function extractCrossFileRoutes(
+  allPaths: string[],
+  repoPath: string,
+): Promise<ExtractedRoute[]> {
+  const out: ExtractedRoute[] = [];
+
+  // Languages whose provider implements the cross-file route hooks. Route
+  // results are intentionally NOT persisted across analyze runs, so a repo
+  // using such a framework (e.g. Django) re-derives its routes on every run;
+  // a repo without one does effectively nothing here. Cross-run route caching
+  // is a deliberate follow-up — see #1836.
+  const routeCapableLangs = new Set<SupportedLanguages>();
+  for (const provider of Object.values(providers)) {
+    if (provider.discoverRootRouteFiles && provider.extractRoutes) {
+      routeCapableLangs.add(provider.id);
+    }
+  }
+  if (routeCapableLangs.size === 0) return out;
+
+  // Bucket only the paths whose language can contribute routes, so a non-
+  // framework repo never pays to bucket the languages it doesn't use here.
+  const pathsByLang = new Map<SupportedLanguages, string[]>();
+  for (const p of allPaths) {
+    const lang = getLanguageFromFilename(p);
+    if (!lang || !routeCapableLangs.has(lang)) continue;
+    let bucket = pathsByLang.get(lang);
+    if (!bucket) {
+      bucket = [];
+      pathsByLang.set(lang, bucket);
+    }
+    bucket.push(p);
+  }
+
+  for (const [lang, langPaths] of pathsByLang) {
+    if (!isLanguageAvailable(lang)) continue;
+    const provider = getProvider(lang);
+    if (!provider.discoverRootRouteFiles || !provider.extractRoutes) continue;
+
+    // Disk-backed reader keyed on repo-relative paths. Discovery and the
+    // include() walk read through this; nothing is pre-loaded, so a repo that
+    // lacks the framework pays only the reads its own discovery probes trigger.
+    const readCache = new Map<string, string | null>();
+    const reader = (relativePath: string): string | null => {
+      const cached = readCache.get(relativePath);
+      if (cached !== undefined) return cached;
+      let content: string | null = null;
+      try {
+        content = fs.readFileSync(path.join(repoPath, relativePath), 'utf-8');
+      } catch {
+        content = null;
+      }
+      readCache.set(relativePath, content);
+      return content;
+    };
+
+    // One root route file per discoverable project (a monorepo can have several).
+    const rootPaths = provider.discoverRootRouteFiles(
+      langPaths.map((p) => ({ path: p })),
+      undefined,
+      reader,
+    );
+    if (rootPaths.length === 0) continue;
+
+    // One parser per language — the grammar is language-scoped, so it is reused
+    // for every project root and every include() re-parse.
+    let parser: Parser;
+    try {
+      parser = await createParserForLanguage(lang, rootPaths[0]);
+    } catch {
+      continue; // grammar unavailable — skip the language, mirrors worker safety net
+    }
+
+    for (const rootPath of rootPaths) {
+      const rootContent = reader(rootPath);
+      if (rootContent === null) continue; // skip this root only, not the language
+
+      let rootTree: Parser.Tree;
+      try {
+        rootTree = parseSourceSafe(parser, rootContent);
+      } catch {
+        logger.warn(`Skipping unparseable root route file: ${rootPath}`);
+        continue; // skip this root only
+      }
+
+      // Isolate a misbehaving provider: a throw here must not abort the whole
+      // analyze (mirrors the worker's per-file isolation). Skip this root, warn.
+      try {
+        const routes = provider.extractRoutes(rootTree, rootPath, reader, parser);
+        for (const r of routes) out.push(r);
+      } catch (err) {
+        logger.warn({ err }, `Cross-file route extraction failed for ${rootPath}`);
+      }
+    }
+  }
+
+  return out;
+}
+
+/**
+ * Handle a worker-pool startup failure by FAILING FAST with the captured cause
+ * (#1741). The pool self-heals *transient* worker crashes on its own — a
+ * bounded, jittered startup restart loop (see worker-pool.ts) — so this is
+ * reached only when that self-heal is EXHAUSTED, or a deterministic crash-loop
+ * was detected, or the pool could not even be constructed. In every such case
+ * the workers genuinely cannot start.
+ *
+ * There is no sequential parser to silently degrade to — that fallback was
+ * removed (and it had masked a worker-startup regression as a 2-hour "stuck"
+ * run in #1741, rc99: a dropped `logger.warn` plus an unbounded sequential
+ * grind). GitNexus surfaces the real crash and aborts so the operator fixes the
+ * worker startup (commonly a missing build). The pool's own crash
+ * classification (`crashClass` on WorkerPoolInitializationError) sharpens the
+ * message.
+ *
+ * @throws always — an actionable Error carrying the captured worker crash.
+ * @internal Exported for unit tests; production callers are the parse loop's
+ *           two worker-startup catch sites below.
+ */
+export function handleWorkerStartupFailure(err: Error): never {
+  const isInit = err instanceof WorkerPoolInitializationError;
+  const readinessFailures = isInit ? err.readinessFailures : [];
+  const crashClass = isInit ? err.crashClass : undefined;
+  // Surface the real cause verbatim: readiness failures for an init crash, or
+  // the construction error message (e.g. "Worker script not found: …") when the
+  // pool never got to spawn workers.
+  const failureDetail =
+    readinessFailures.length > 0
+      ? ` Underlying worker failure(s): ${readinessFailures.join(' | ')}`
+      : isInit
+        ? ''
+        : ` Underlying error: ${err.message}`;
+
+  // Always surface the real crash — never let a startup failure pass silently.
+  logger.error(
+    { err: err.message, readinessFailures, crashClass },
+    'Worker pool failed to start — workers could not start (bounded self-heal exhausted).',
+  );
+
+  const cause =
+    crashClass === 'deterministic-startup'
+      ? `every worker crashed identically during startup (a deterministic ` +
+        `crash-loop — retrying cannot help), so the pool has no usable workers.`
+      : isInit
+        ? `workers exhausted the bounded startup retry budget without reporting ` +
+          `ready, so the pool has no usable workers.`
+        : `the worker pool could not be constructed.`;
+
+  // Class-aware fix hint: a missing/broken native binding is the likely cause
+  // when workers crashed during init, but it is the WRONG guess for a pool that
+  // never constructed (commonly a missing build / unresolvable worker path).
+  const fixHint = isInit
+    ? `Fix the worker startup failure shown above (often a missing/broken native ` +
+      `binding or a top-of-script import error in parse-worker).`
+    : `Fix the worker pool construction error shown above (commonly a missing ` +
+      `build, so dist/ has no parse-worker, or an unresolvable worker path).`;
+
+  throw new Error(
+    `Worker pool failed to start: ${cause}${failureDetail}\n\n` +
+      `The worker pool is GitNexus's only parse path — there is no sequential ` +
+      `fallback to hide this crash behind (silently degrading masked a ` +
+      `worker-startup regression as a 2-hour "stuck" run in #1741). Fix:\n` +
+      `  • ${fixHint}`,
+  );
+}
+
+/**
  * Chunked parse + resolve loop.
  *
- * Reads source in byte-budget chunks (~20MB each). For each chunk:
- * 1. Parse via worker pool (or sequential fallback)
- * 2. Resolve imports from extracted data
- * 3. Synthesize wildcard import bindings (Go/Ruby/C++/Swift/Python)
- * 4. Resolve heritage + routes per chunk; defer worker CALLS until all chunks
- *    have contributed heritage so interface-dispatch implementor map is complete
- * 5. Collect TypeEnv bindings for cross-file propagation
+ * Reads source in byte-budget chunks (~20MB each):
+ * 1. Parse each chunk via the worker pool (the sole parse path)
+ * 2. After all chunks parse, emit route CALLS edges (deferred so resolution
+ *    sees the full repo graph) and collect the exported-type map
+ * 3. Collect TypeEnv bindings for cross-file propagation
+ *
+ * Import, call, and inheritance edges are emitted by the scope-resolution
+ * phase, not here (RING4-1 #942 / RING4-2 #943 removed the legacy passes).
  */
 export async function runChunkedParseAndResolve(
   graph: KnowledgeGraph,
@@ -100,288 +447,518 @@ export async function runChunkedParseAndResolve(
   pipelineStart: number,
   onProgress: ProgressFn,
   options?: PipelineOptions,
+  capturedResolutionConfigs?: ReadonlyMap<SupportedLanguages, unknown>,
+  recordSourceHash?: (filePath: string, hash: string) => void,
 ): Promise<{
   exportedTypeMap: ExportedTypeMap;
   allFetchCalls: ExtractedFetchCall[];
+  allFetchWrapperDefs: FetchWrapperDef[];
+  allFetchWrapperCalls: FetchWrapperCall[];
   allExtractedRoutes: ExtractedRoute[];
   allDecoratorRoutes: ExtractedDecoratorRoute[];
+  selectedRoutes: ReadonlySet<ExtractedRoute | ExtractedDecoratorRoute>;
   allToolDefs: ExtractedToolDef[];
   allORMQueries: ExtractedORMQuery[];
   bindingAccumulator: BindingAccumulator;
-  resolutionContext: ReturnType<typeof createResolutionContext>;
+  /** Route URL → resolved handler symbol UID (Part 2, #2138). Lets the routes
+   *  phase stamp `handlerSymbolId` on Route nodes so contract extraction can
+   *  read the handler from the graph instead of re-parsing source. */
+  routeHandlerSymbols: ReadonlyMap<string, string>;
+  /** SemanticModel populated during parse — scope-resolution reads its
+   *  TypeRegistry / MethodRegistry / SymbolTable indexes. */
+  model: MutableSemanticModel;
+  /** Whether a worker pool was actually constructed for this run. False
+   *  means no pool was needed: a warm all-cache-hit run replays cached
+   *  worker output without spawning workers, or there were no parseable
+   *  files. There is no sequential parser — the pool is the sole parse path
+   *  whenever a chunk misses the cache. */
   usedWorkerPool: boolean;
-  /** Cross-phase tree-sitter Tree cache populated by the sequential
-   *  parse path. Distinct from the chunk-local `astCache` used inside
-   *  the parse loop (that one is cleared between chunks). Empty when
-   *  every chunk ran via the worker pool (workers can't return native
-   *  tree-sitter Trees across the MessageChannel). Downstream phases
-   *  (scope-resolution) read from this to skip re-parsing the same
-   *  source. See plan
-   *  docs/plans/2026-04-20-002-perf-parse-heritage-mro-plan.md (Unit 4). */
-  scopeTreeCache: ASTCache;
+  /** Files dispatched to parser workers after parse-cache lookup. */
+  reparsedFileCount: number;
+  /** Files restored from parse-cache chunks without parser-worker dispatch. */
+  parseCacheHitFileCount: number;
+  /** Worker-produced ParsedFile artifacts aggregated across chunks.
+   *  Threaded into scope-resolution as a re-extract cache so the warm-
+   *  cache analyze run can skip the dominant `extractParsedFile` cost
+   *  (otherwise ~58s on a 1000-file repo). */
+  parsedFiles: import('gitnexus-shared').ParsedFile[];
+  /**
+   * Content-derived language decisions for extension-ambiguous files.
+   *
+   * The source text used to classify these paths is released before parsing
+   * begins. Scope resolution consumes this snapshot instead of reading the
+   * same files again just to repeat classification.
+   */
+  contentLanguageByPath: ReadonlyMap<string, SupportedLanguages | null>;
+  /** Repo-wide harvested constants, already prepared per provider. See
+   *  `ParseOutput.moduleConstants` for why this leaves the parse phase. */
+  moduleConstants: ReadonlyMap<string, ModuleConstants>;
+  scopeExtractionFailures: string[];
+  /** Files excluded because their non-standalone language parser was unavailable. */
+  unavailableScopeLanguageFiles: number;
 }> {
-  const ctx = createResolutionContext();
-  const symbolTable = ctx.model.symbols;
+  const model = createSemanticModel();
+  const symbolTable = model.symbols;
 
+  const contentClassifiedPaths = scannedFiles
+    .map((file) => file.path)
+    .filter(needsContentLanguageClassification);
+  const contentLanguageByPath =
+    contentClassifiedPaths.length > 0
+      ? await classifyContentLanguages(repoPath, contentClassifiedPaths)
+      : new Map<string, SupportedLanguages | null>();
+  const languageForScannedFile = (file: (typeof scannedFiles)[number]) => {
+    return contentLanguageByPath.has(file.path)
+      ? (contentLanguageByPath.get(file.path) ?? null)
+      : getLanguageFromFilename(file.path);
+  };
   const parseableScanned = scannedFiles.filter((f) => {
-    const lang = getLanguageFromFilename(f.path);
+    const lang = languageForScannedFile(f);
     return lang && isLanguageAvailable(lang);
   });
 
   // Warn about files skipped due to unavailable parsers
   const skippedByLang = new Map<string, number>();
   for (const f of scannedFiles) {
-    const lang = getLanguageFromFilename(f.path);
-    if (lang && !isLanguageAvailable(lang)) {
+    const lang = languageForScannedFile(f);
+    const provider = lang === null ? undefined : getProvider(lang);
+    if (lang && provider?.parseStrategy !== 'standalone' && !isLanguageAvailable(lang)) {
       skippedByLang.set(lang, (skippedByLang.get(lang) || 0) + 1);
     }
   }
   for (const [lang, count] of skippedByLang) {
-    logger.warn(
-      `Skipping ${count} ${lang} file(s) — ${lang} parser not available (native binding may not have built). Try: npm rebuild tree-sitter-${lang}`,
-    );
+    // Distinguish a deliberate runtime opt-out from a genuinely-missing binding
+    // so we don't tell a user who set GITNEXUS_SKIP_OPTIONAL_GRAMMARS to
+    // `npm rebuild` a grammar that built fine (#2091/#2093 review).
+    if (isGrammarRuntimeSkipped(lang as SupportedLanguages)) {
+      logger.warn(
+        `Skipping ${count} ${lang} file(s) — ${lang} parsing disabled via GITNEXUS_SKIP_OPTIONAL_GRAMMARS.`,
+      );
+    } else {
+      logger.warn(
+        `Skipping ${count} ${lang} file(s) — ${lang} parser not available (native binding may not have built). Try: npm rebuild tree-sitter-${lang}`,
+      );
+    }
   }
+  const unavailableScopeLanguageFiles = [...skippedByLang.values()].reduce(
+    (total, count) => total + count,
+    0,
+  );
 
   const totalParseable = parseableScanned.length;
+  const totalBytes = parseableScanned.reduce((sum, f) => sum + f.size, 0);
 
   if (totalParseable === 0) {
     onProgress({
       phase: 'parsing',
-      percent: 82,
+      // Skip directly to the end of the parse-phase progress band (M2 from PR
+      // #1693 review). Parse 20-70%, deferred 70-95%; nothing in either runs
+      // when there's no parseable file, so jump to 95.
+      percent: 95,
       message: 'No parseable files found — skipping parsing phase',
       stats: { filesProcessed: 0, totalFiles: 0, nodesCreated: graph.nodeCount },
     });
   }
 
-  // Build byte-budget chunks
-  const chunks: string[][] = [];
-  let currentChunk: string[] = [];
-  let currentBytes = 0;
-  for (const file of parseableScanned) {
-    if (currentChunk.length > 0 && currentBytes + file.size > CHUNK_BYTE_BUDGET) {
-      chunks.push(currentChunk);
-      currentChunk = [];
-      currentBytes = 0;
+  // Sequential parsing has been removed: the worker pool (quarantine +
+  // respawn/recycle + circuit breaker) is the sole parse path. The three
+  // channels that used to select an in-process parser are now hard errors, so
+  // an operator who set one gets an actionable message instead of a silently
+  // slower (now nonexistent) fallback. Validated before any chunk work; a
+  // zero-parseable-file repo is exempt (nothing to parse).
+  if (totalParseable > 0) {
+    const requestedPoolSize = options?.workerPoolSize;
+    const disabledByEnv = requestedPoolSize === undefined && workerPoolDisabledByEnv();
+    if (options?.skipWorkers || requestedPoolSize === 0 || disabledByEnv) {
+      const reason = options?.skipWorkers
+        ? '`skipWorkers: true` was passed'
+        : requestedPoolSize === 0
+          ? '`--workers 0` (workerPoolSize=0) was requested'
+          : '`GITNEXUS_WORKER_POOL_SIZE=0` is set';
+      throw new WorkerPoolDisabledError(
+        `Worker-pool parsing cannot be disabled (${reason}). GitNexus no longer ` +
+          `has a sequential parser — the worker pool self-heals via quarantine + ` +
+          `respawn, so there is no slower path to fall back to. Pass ` +
+          `\`--workers <N>\` with N>=1, or omit it for an auto-sized pool.`,
+      );
     }
-    currentChunk.push(file.path);
-    currentBytes += file.size;
   }
-  if (currentChunk.length > 0) chunks.push(currentChunk);
+
+  // Build byte-budget chunks. The budget is resolved per-call (U14): options
+  // first, then env, then the built-in default. Pre-U14 this was a
+  // module-load IIFE constant, which froze the env value at import time
+  // and made `PipelineOptions.chunkByteBudget` silently no-op on warm test
+  // runs. Resolving in the function body restores per-call configurability
+  // and matches the pattern used by resolveAutoPoolSize and the U1
+  // parseChunkConcurrency resolver.
+  // Effective worker count: explicit `--workers <N>` pins it; otherwise
+  // cores-based auto size is capped by source bytes / CHUNK_BYTES_PER_WORKER
+  // so a tiny repo does not spawn a full idle pool. Cache pack membership
+  // is independent of this number (#3088).
+  // `--workers <N>` and `GITNEXUS_WORKER_POOL_SIZE` are both deliberate
+  // operator input, so both bypass the work-proportional cap below. Only the
+  // env path used to be clamped by it, which made the documented escape hatch
+  // silently do nothing: on a 30MB repo the cap resolves to 16, so an operator
+  // asking for 24 still got 16 with no warning, while `--workers 24` got 24.
+  const explicitPoolSize = options?.workerPoolSize ?? envWorkerPoolSize();
+  // Cores-based auto size, bounded by source bytes so a tiny repo does not
+  // spawn a full idle pool.
+  const workProportionalCap = Math.max(1, Math.ceil(totalBytes / CHUNK_BYTES_PER_WORKER));
+  // An operator's number is honored, but never exceeds the number of files
+  // there are to parse — `GITNEXUS_WORKER_POOL_SIZE=100000` on a five-file repo
+  // should not become the literal thread count. This bounds `--workers` and the
+  // env var identically, keeping the parity above intact. Note it does NOT
+  // shrink an incremental re-analyze: `totalParseable` counts every parseable
+  // file in the scan, not the changed ones, so a warm run of a large repo still
+  // spawns the full requested pool.
+  const workerResources = options?.workerResources;
+  if (
+    totalParseable > 0 &&
+    workerResources &&
+    (!Number.isSafeInteger(workerResources.workers) ||
+      workerResources.workers < 1 ||
+      !Number.isSafeInteger(workerResources.workerHeapMb) ||
+      workerResources.workerHeapMb < 512 ||
+      (explicitPoolSize !== undefined && explicitPoolSize > workerResources.workers))
+  )
+    throw new Error('Parser worker configuration exceeds its admitted resource budget');
+  const effectivePoolSize = Math.min(
+    explicitPoolSize && explicitPoolSize > 0
+      ? Math.min(explicitPoolSize, Math.max(1, totalParseable))
+      : Math.min(resolveAutoPoolSize(), workProportionalCap),
+    workerResources?.workers ?? Infinity,
+  );
+  // Deliberate over-subscription is the operator's call, so this warns rather
+  // than caps — silently capping is what the override exists to stop. But an
+  // exported `GITNEXUS_WORKER_POOL_SIZE` applies to EVERY analyze in a
+  // long-lived caller (watch auto-sync, the MCP server), including small
+  // incremental ones, and that is easy to set once and forget.
+  if (explicitPoolSize && explicitPoolSize > 0) {
+    const hostParallelism = resolveHostParallelism();
+    if (effectivePoolSize > hostParallelism) {
+      logger.warn(
+        { requested: explicitPoolSize, spawning: effectivePoolSize, hostParallelism },
+        `Worker pool size ${effectivePoolSize} exceeds this host's ${hostParallelism} usable core(s); ` +
+          `parsing is CPU-bound, so the extra workers add memory pressure without throughput. ` +
+          `This applies to every analyze while the override is set.`,
+      );
+    }
+  }
+  // Cache packs: stable (language, hash(path) mod 128) buckets, then the
+  // per-call byte budget inside each bucket (#3088). Pool size is used only
+  // for worker count and sub-batch fan-out, not membership.
+  const chunkByteBudget = resolveChunkByteBudget(options);
+  // Sub-batch size so a 2 MiB pack fans into ~TARGET_JOBS_PER_WORKER jobs
+  // per worker, floored at MIN_SUB_BATCH_BYTES (256 KiB) so an 8-worker
+  // pool still gets ~8 jobs from one pack instead of one idle-heavy job
+  // (#worker-idle). Do not derive this from pool×2 MiB while dispatching a
+  // 2 MiB pack. An explicit GITNEXUS_WORKER_SUB_BATCH_MAX_BYTES wins.
+  const subBatchEnv = Number(process.env.GITNEXUS_WORKER_SUB_BATCH_MAX_BYTES);
+  const dispatchSubBatchMaxBytes =
+    Number.isFinite(subBatchEnv) && subBatchEnv > 0
+      ? subBatchEnv
+      : Math.max(
+          MIN_SUB_BATCH_BYTES,
+          Math.ceil(chunkByteBudget / (effectivePoolSize * TARGET_JOBS_PER_WORKER)),
+        );
+  // Heap-scale guardrails (#2649), measured on a Linux-kernel analyze
+  // (94,773 files): ~55 graph nodes per parseable file and ~2.2KB of
+  // main-thread heap per node, linear across 113 chunks (see
+  // docs/plans/2026-07-23-gitnexus-plan-large-repo-analyze-oom.md §2).
+  // Estimates, not contracts — used only to warn early (preflight) and to
+  // convert a certain multi-minute GC death spiral into an immediate
+  // actionable error (mid-loop guard).
+  const projectedHeapNeedBytes = projectParseHeapNeedBytes(parseableScanned.length);
+  const heapLimitBytes = v8.getHeapStatistics().heap_size_limit;
+  if (projectedHeapNeedBytes > heapLimitBytes * PREFLIGHT_WARN_FRACTION) {
+    logger.warn(
+      `Large repository: analyzing ${parseableScanned.length} files needs roughly ${Math.round(projectedHeapNeedBytes / 1024 / 1024 / 1024)}GB of memory, ` +
+        `but Node is limited to ${Math.round(heapLimitBytes / 1024 / 1024 / 1024)}GB — analyze may stop early. ${heapPressureRemedy(heapLimitBytes)}`,
+    );
+  }
+
+  const chunks: string[][] = packParseCacheChunks(
+    parseableScanned.map((file) => ({
+      path: file.path,
+      size: file.size,
+      language: getLanguageFromFilename(file.path) ?? 'unknown',
+    })),
+    chunkByteBudget,
+  );
 
   const numChunks = chunks.length;
 
   if (isDev) {
     const totalMB = parseableScanned.reduce((s, f) => s + f.size, 0) / (1024 * 1024);
     logger.info(
-      `📂 Scan: ${totalFiles} paths, ${totalParseable} parseable (${totalMB.toFixed(0)}MB), ${numChunks} chunks @ ${CHUNK_BYTE_BUDGET / (1024 * 1024)}MB budget`,
+      `📂 Scan: ${totalFiles} paths, ${totalParseable} parseable (${totalMB.toFixed(0)}MB), ${numChunks} chunks @ ${chunkByteBudget / (1024 * 1024)}MB budget`,
     );
   }
 
-  onProgress({
-    phase: 'parsing',
-    percent: 20,
-    message: `Parsing ${totalParseable} files in ${numChunks} chunk${numChunks !== 1 ? 's' : ''}...`,
-    stats: { filesProcessed: 0, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
-  });
-
-  // Don't spawn workers for tiny repos — overhead exceeds benefit.
-  // Test suites may lower the thresholds via `options.workerThresholdsForTest`
-  // to exercise the worker-pool path with small fixtures; see PipelineOptions.
-  const MIN_FILES_FOR_WORKERS = options?.workerThresholdsForTest?.minFiles ?? 15;
-  const MIN_BYTES_FOR_WORKERS = options?.workerThresholdsForTest?.minBytes ?? 512 * 1024;
-  const totalBytes = parseableScanned.reduce((s, f) => s + f.size, 0);
-
-  // Create worker pool once, reuse across chunks
-  let workerPool: WorkerPool | undefined;
-  if (
-    !options?.skipWorkers &&
-    (totalParseable >= MIN_FILES_FOR_WORKERS || totalBytes >= MIN_BYTES_FOR_WORKERS)
-  ) {
-    try {
-      let workerUrl = new URL('../workers/parse-worker.js', import.meta.url);
-      // When running under vitest, import.meta.url points to src/ where no .js exists.
-      // Fall back to the compiled dist/ worker so the pool can spawn real worker threads.
-      const thisDir = fileURLToPath(new URL('.', import.meta.url));
-      if (!fs.existsSync(fileURLToPath(workerUrl))) {
-        const distWorker = path.resolve(
-          thisDir,
-          '..',
-          '..',
-          '..',
-          '..',
-          'dist',
-          'core',
-          'ingestion',
-          'workers',
-          'parse-worker.js',
-        );
-        if (fs.existsSync(distWorker)) {
-          workerUrl = pathToFileURL(distWorker);
-        }
-      }
-      workerPool = createWorkerPool(workerUrl);
-    } catch (err) {
-      logger.warn(
-        { err: (err as Error).message },
-        'Worker pool creation failed, using sequential fallback:',
-      );
-    }
+  // Skip the "Parsing N files..." announcement when there's nothing to parse
+  // — the early-return branch above already emitted percent 95 ("skipping
+  // parsing phase"), and emitting percent 20 here would regress the
+  // progress stream non-monotonically (M2 from PR #1693 review).
+  if (totalParseable > 0) {
+    onProgress({
+      phase: 'parsing',
+      percent: 20,
+      message: `Parsing ${totalParseable} files in ${numChunks} chunk${numChunks !== 1 ? 's' : ''}...`,
+      stats: { filesProcessed: 0, totalFiles: totalParseable, nodesCreated: graph.nodeCount },
+    });
   }
 
+  // Create the worker pool lazily, reusing it across cache-miss chunks.
+  //
+  // KTD-8 — the pool is intentionally NOT created before the parse-cache
+  // lookup: a warm-cache all-hit run must replay cached worker output without
+  // loading parse-worker.js or any tree-sitter/N-API native bindings. So
+  // `getOrCreateWorkerPool` is called only from inside the chunk loop, on the
+  // first cache MISS. There is no longer a "should we use workers?" gate:
+  // sequential parsing was removed and the disabled channels (`--workers 0` /
+  // env=0 / `skipWorkers`) threw above, so for any repo with parseable files
+  // the pool is always the parse path.
+  let workerPool: WorkerPool | undefined;
+  const getOrCreateWorkerPool = (): WorkerPool => {
+    if (workerPool) return workerPool;
+    try {
+      // Reuse the exact entry captured before cache lookup. Direct pipeline
+      // callers use the same resolver without loading a worker on cache hits.
+      const workerUrl =
+        options?.parseWorkerUrl ??
+        resolveParseWorkerUrl(import.meta.url, options?.workerUrlForTest);
+      // Thread the ParsedFile store path into the pool so workers write their
+      // own shards (#1983 parallel serialization). `parsedFileStorePath` is
+      // declared below but this closure only runs from inside the chunk loop,
+      // after it is initialized; `undefined` drives the worker no-store
+      // fallback (return ParsedFiles in the result).
+      workerPool = createWorkerPool(workerUrl, effectivePoolSize, {
+        ...(workerResources
+          ? { heapLimitMb: workerResources.workerHeapMb, requireDrain: true }
+          : {}),
+        parsedFileStoreStoragePath: parseCache ? undefined : parsedFileStorePath,
+        fileResults: parseCache !== undefined,
+        // CFG/PDG opt-in (#2081 M1) — baked into each worker's workerData so the
+        // worker builds + attaches cfgSideChannel. Off by default.
+        pdg: options?.pdg === true,
+        pdgMaxFunctionLines: options?.pdgMaxFunctionLines,
+        // Fan each chunk across the whole pool (#worker-idle): without this a
+        // chunk smaller than the 8 MB sub-batch cap became a single job on a
+        // single worker. Honors an explicit `subBatchMaxBytes` / env override.
+        subBatchMaxBytes: dispatchSubBatchMaxBytes,
+      });
+      return workerPool;
+    } catch (err) {
+      // Pool *construction* failed (e.g. the worker script is missing — a
+      // broken install). Fail fast with the cause (#1741). There is no
+      // sequential parser to fall back to; the operator must fix the worker
+      // startup (commonly a missing build so dist/ has no parse-worker).
+      handleWorkerStartupFailure(err as Error);
+    }
+  };
+
   let filesParsedSoFar = 0;
+  let reportedParseFiles = 0;
+  const reportParsingProgress = (current: number, message: string, detail?: string): void => {
+    reportedParseFiles = Math.max(reportedParseFiles, current);
+    onProgress({
+      phase: 'parsing',
+      percent: Math.round(20 + (reportedParseFiles / totalParseable) * 50),
+      message,
+      detail,
+      stats: {
+        filesProcessed: reportedParseFiles,
+        totalFiles: totalParseable,
+        nodesCreated: graph.nodeCount,
+      },
+    });
+  };
 
-  // Two caches with different lifetimes:
-  //   - `astCache` (chunk-local, cleared between chunks) — call /
-  //     heritage / import processors read it during parse to avoid
-  //     re-parsing within the same chunk.
-  //   - `scopeTreeCache` (total-parseable-sized, never cleared by
-  //     parse-impl) — exposed via ParseOutput so scope-resolution can
-  //     skip a second tree-sitter parse. Worker-mode parses don't
-  //     populate either; consumers fall back to a fresh parse.
-  // See plan docs/plans/2026-04-20-002-perf-parse-heritage-mro-plan.md (Unit 4).
-  const maxChunkFiles = chunks.reduce((max, c) => Math.max(max, c.length), 0);
-  let astCache = createASTCache(maxChunkFiles);
-  const scopeTreeCache = createASTCache(Math.max(parseableScanned.length, 1));
-
-  // Build import resolution context once — suffix index, file lists, resolve cache.
-  const importCtx = buildImportResolutionContext(allPaths);
-  const allPathObjects = allPaths.map((p) => ({ path: p }));
-
-  const sequentialChunkPaths: string[][] = [];
-  const chunkNeedsSynthesis = chunks.map((paths) =>
-    paths.some((p) => {
-      const lang = getLanguageFromFilename(p);
-      return lang != null && needsSynthesis(lang);
-    }),
-  );
   const exportedTypeMap: ExportedTypeMap = new Map();
   const bindingAccumulator = new BindingAccumulator();
-  // Tracks whether per-chunk or fallback wildcard-binding synthesis already
-  // ran, so the unconditional final call below can be skipped when redundant.
-  // synthesizeWildcardImportBindings is graph-global; once any chunk runs it
-  // after parsing wildcard files, later non-wildcard chunks add no work for
-  // it, and later wildcard chunks re-run it themselves.
-  let hasSynthesized = false;
   const allFetchCalls: ExtractedFetchCall[] = [];
+  let allFetchWrapperDefs: FetchWrapperDef[] = [];
+  let allFetchWrapperCalls: FetchWrapperCall[] = [];
+  const allFetchWrapperReexports: FetchWrapperReexport[] = [];
   const allExtractedRoutes: ExtractedRoute[] = [];
   const allDecoratorRoutes: ExtractedDecoratorRoute[] = [];
+  const allRouteFacts: { filePath: string; facts: unknown; routePosition: number }[] = [];
+  const allRouterIncludes: ExtractedRouterInclude[] = [];
+  const allRouterImports: ExtractedRouterImport[] = [];
+  const allRouterConstructorPrefixes: ExtractedRouterConstructorPrefix[] = [];
+  const allRouterModuleAliases: ExtractedRouterModuleAlias[] = [];
+  // Per-file Python module constants (#2391); resolved into decorator route paths
+  // below, after cross-file aggregation, alongside the include_router prefix pass.
+  const allModuleConstants: ExtractedModuleConstants[] = [];
+  const allSpringTypes: SharedSpringType[] = [];
   const allToolDefs: ExtractedToolDef[] = [];
   const allORMQueries: ExtractedORMQuery[] = [];
-  const deferredWorkerCalls: ExtractedCall[] = [];
-  const deferredWorkerHeritage: ExtractedHeritage[] = [];
-  const deferredConstructorBindings: FileConstructorBindings[] = [];
-  const deferredAssignments: ExtractedAssignment[] = [];
+  // Aggregated per-file ParsedFile artifacts produced by workers' calls
+  // to `extractParsedFile`. Threaded through to the scope-resolution
+  // phase so it can SKIP its own re-extraction on cache hits — this is
+  // the second-half of the parse-cache speedup since scope-resolution's
+  // re-parse otherwise dominates the warm-cache wall-clock time.
+  const allParsedFiles: import('gitnexus-shared').ParsedFile[] = [];
+  const scopeExtractionFailures = new Set<string>();
+
+  // Reuse one file's facts independently of scheduling chunks and worker jobs.
+  const parseCache = options?.parseCache;
+  if (parseCache) await ensureFileParseCache(parseCache);
+  // Disk-backed ParsedFile store (#1983): when a storage path is available we
+  // flush worker-produced ParsedFiles to disk per chunk (instead of retaining
+  // them in `allParsedFiles`) and scope-resolution streams them back per
+  // language — avoiding both the ~1× semantic-model RAM cost of holding them
+  // and, critically, the unbounded native tree-sitter re-parse leak that
+  // scope-resolution's main-thread re-extraction otherwise accumulates. When
+  // there is no storage path (tests / direct pipeline calls), we fall back to
+  // retaining them in `allParsedFiles` (small-repo path, preserves prior
+  // behavior). Cleared up-front so a prior run's shards never leak in.
+  const parsedFileStorePath = options?.parsedFileStorePath ?? parseCache?.writeStoragePath;
+  if (parsedFileStorePath) await clearParsedFileStore(parsedFileStorePath);
+  let chunkCacheHits = 0;
+  let chunkCacheMisses = 0;
+  let parseCacheHitFileCount = 0;
+  let reparsedFileCount = 0;
+  let parseFailure: unknown;
+  let parsingFailed = false;
 
   try {
-    for (let chunkIdx = 0; chunkIdx < numChunks; chunkIdx++) {
-      const chunkPaths = chunks[chunkIdx];
+    // U1 — bounded chunk concurrency (B1 from PR #1693 review): pre-fetch
+    // chunk file contents up to `parseChunkConcurrency` chunks ahead of the
+    // dispatch cursor so file I/O overlaps with worker compute. Worker
+    // dispatch itself stays serial because `WorkerPool.dispatch` is not
+    // reentrant (concurrent calls would race on the shared per-slot
+    // busy/in-flight state). With concurrency=1 behavior is identical to
+    // the pure-serial loop. F4: deferred-state aggregation still happens
+    // in chunkIdx order (the for-loop below iterates sequentially), so
+    // cross-chunk processors see deterministic input regardless of
+    // file-read completion order. Honors options.parseChunkConcurrency
+    // (threaded from the CLI), then GITNEXUS_PARSE_CHUNK_CONCURRENCY env
+    // (default 2 — matches the help text the CLI advertises).
+    const parseChunkConcurrency = ((): number => {
+      const opt = options?.parseChunkConcurrency;
+      if (typeof opt === 'number' && Number.isInteger(opt) && opt >= 1) return opt;
+      const env = Number(process.env.GITNEXUS_PARSE_CHUNK_CONCURRENCY);
+      if (Number.isInteger(env) && env >= 1) return env;
+      return 2;
+    })();
+    const chunkContentPromises = new Array<Promise<Map<string, string>> | undefined>(numChunks);
+    const startChunkPrefetch = (i: number): void => {
+      if (i >= numChunks || chunkContentPromises[i] !== undefined) return;
+      chunkContentPromises[i] = readFileContents(repoPath, chunks[i]);
+    };
+    for (let i = 0; i < Math.min(parseChunkConcurrency, numChunks); i++) {
+      startChunkPrefetch(i);
+    }
 
-      const chunkContents = await readFileContents(repoPath, chunkPaths);
-      const chunkFiles = chunkPaths
-        .filter((p) => chunkContents.has(p))
-        .map((p) => ({ path: p, content: chunkContents.get(p)! }));
+    // Hoisted loop-invariant: GITNEXUS_VERBOSE / NODE_ENV are read once
+    // (not on every chunk). Previously evaluated at the top of the loop
+    // body, which re-read process.env on every iteration even though
+    // the env can't change mid-run.
+    const verboseThroughputLog = isDev || isVerboseIngestionEnabled();
+    const heapProbeEveryN = isDebugHeapEnabled() ? 25 : 0;
 
-      const chunkWorkerData = await processParsing(
-        graph,
-        chunkFiles,
-        symbolTable,
-        astCache,
-        scopeTreeCache,
-        (current, _total, filePath) => {
-          const globalCurrent = filesParsedSoFar + current;
-          const parsingProgress = 20 + (globalCurrent / totalParseable) * 62;
-          onProgress({
-            phase: 'parsing',
-            percent: Math.round(parsingProgress),
-            message: `Parsing chunk ${chunkIdx + 1}/${numChunks}...`,
-            detail: filePath,
-            stats: {
-              filesProcessed: globalCurrent,
-              totalFiles: totalParseable,
-              nodesCreated: graph.nodeCount,
-            },
-          });
-        },
-        workerPool,
-      );
-
-      const chunkBasePercent = 20 + (filesParsedSoFar / totalParseable) * 62;
-
-      if (chunkWorkerData) {
-        await processImportsFromExtracted(
-          graph,
-          allPathObjects,
-          chunkWorkerData.imports,
-          ctx,
-          (current, total) => {
-            onProgress({
-              phase: 'parsing',
-              percent: Math.round(chunkBasePercent),
-              message: `Resolving imports (chunk ${chunkIdx + 1}/${numChunks})...`,
-              detail: `${current}/${total} files`,
-              stats: {
-                filesProcessed: filesParsedSoFar,
-                totalFiles: totalParseable,
-                nodesCreated: graph.nodeCount,
-              },
-            });
-          },
-          repoPath,
-          importCtx,
-        );
-        if (chunkNeedsSynthesis[chunkIdx]) {
-          synthesizeWildcardImportBindings(graph, ctx);
-          hasSynthesized = true;
+    // ── Dispatch rounds + merge pipelining (#worker-idle) ────────────────────
+    // Two separate idle sources, handled together here.
+    //
+    // 1. Barrier per chunk. `dispatch` resolves only when every job it created
+    //    has committed, so dispatching one cache pack at a time strands the
+    //    pool whenever a pack is smaller than it — which stable packs usually
+    //    are. Chunks accumulate into a ROUND (bounded by `roundByteBudget` of
+    //    cache-missing source) and go out in one `dispatchGroups` call.
+    // 2. Serial merge. Merging worker results into the graph is the only
+    //    remaining serial main-thread step (ParsedFile serialization now runs
+    //    in workers). A dispatched round is parked in `pendingRound` and
+    //    merged only AFTER the following round's dispatch has started, so the
+    //    workers parse round N+1 while the main thread merges round N.
+    //
+    // Chunk ORDER is preserved throughout — rounds drain in order and entries
+    // inside a round finalize by `chunkIdx` — which keeps deferred aggregation
+    // deterministic regardless of how chunks were batched. Cache hits ride
+    // along as round entries so they observe the same ordering without forcing
+    // a dispatch.
+    /**
+     * One chunk queued into the current round. A `hit` already has its worker
+     * output (from the parse cache); a `miss` gets it from the round's single
+     * `dispatchGroups` call. Both are finalized in `chunkIdx` order when the
+     * round drains, which is what keeps deferred aggregation deterministic
+     * regardless of how chunks were batched.
+     */
+    type RoundEntry =
+      | {
+          readonly kind: 'hit';
+          readonly chunkIdx: number;
+          // A hit never reaches a worker, so it needs the file COUNT (progress,
+          // throughput log) but never the source strings. Holding those would
+          // pin the whole repo's text for a warm run, which is what the
+          // buffered budget below exists to bound.
+          readonly fileCount: number;
+          readonly chunkStartMs: number | null;
+          readonly cachedRaw: ParseWorkerResult[];
         }
-        if (exportedTypeMap.size > 0 && ctx.namedImportMap.size > 0) {
-          const { enrichedCount } = seedCrossFileReceiverTypes(
-            chunkWorkerData.calls,
-            ctx.namedImportMap,
-            exportedTypeMap,
-          );
-          if (isDev && enrichedCount > 0) {
-            logger.info(
-              `🔗 E1: Seeded ${enrichedCount} cross-file receiver types (chunk ${chunkIdx + 1})`,
+      | {
+          readonly kind: 'miss';
+          readonly chunkIdx: number;
+          readonly chunkFiles: ParseWorkerInput[];
+          readonly fileCount: number;
+          readonly selection?: Array<{ key: string; path: string }>;
+          readonly hits?: Map<string, ParseWorkerResult>;
+          readonly chunkStartMs: number | null;
+        };
+
+    const roundByteBudget = resolveParseRoundByteBudget(options);
+    let roundEntries: RoundEntry[] = [];
+    /**
+     * Bytes an open round is HOLDING, counting hits as well as misses.
+     *
+     * Counting only the cache-MISSING bytes would bound just what the workers
+     * are asked to do, so a warm run — where nothing misses — would never reach
+     * the close condition and would buffer every chunk's cached output until
+     * the tail drain. That is the #2649 heap failure on a large repo. Counting
+     * both keeps a hits-only run draining at the same cadence as a cold one;
+     * `startRound` already supports a round with no misses.
+     *
+     * Measured in UTF-8 bytes, matching `estimateItemBytes` in the worker pool,
+     * so the cap means the same thing here as it does for a job's payload.
+     */
+    const roundBudget = createRoundBudget(roundByteBudget);
+    /**
+     * Files QUEUED into rounds so far. `filesParsedSoFar` only advances when a
+     * round drains, so it is the right number for the throughput log but would
+     * pin a warm run's progress bar at the phase floor for the whole loop.
+     */
+    let queuedFilesSoFar = 0;
+    let pendingRound: { entries: RoundEntry[]; missResults: ParseWorkerResult[][] } | null = null;
+
+    // Apply one chunk's merged worker data: per-chunk aggregation into the
+    // run-level accumulators + the throughput log. Shared by the cache-hit
+    // (inline) and worker (deferred) paths. The `| null` guard is defensive —
+    // every live caller passes real worker data now that sequential parsing
+    // (which was the only path that passed null) is gone.
+    const applyChunkResults = async (
+      chunkWorkerData: WorkerExtractedData | null,
+      chunkIdx: number,
+      fileCount: number,
+      chunkStartMs: number | null,
+    ): Promise<void> => {
+      if (chunkWorkerData) {
+        for (const filePath of chunkWorkerData.scopeExtractionFailures) {
+          scopeExtractionFailures.add(filePath);
+        }
+        if (chunkWorkerData.parsedFiles?.length) {
+          if (parsedFileStorePath) {
+            const wrote = await persistParsedFileChunk(
+              parsedFileStorePath,
+              `chunk-${chunkIdx}`,
+              chunkWorkerData.parsedFiles,
             );
+            if (!wrote) {
+              for (const item of chunkWorkerData.parsedFiles) allParsedFiles.push(item);
+            }
+          } else {
+            for (const item of chunkWorkerData.parsedFiles) allParsedFiles.push(item);
           }
         }
-        for (const item of chunkWorkerData.calls) deferredWorkerCalls.push(item);
-        for (const item of chunkWorkerData.heritage) deferredWorkerHeritage.push(item);
-        for (const item of chunkWorkerData.constructorBindings)
-          deferredConstructorBindings.push(item);
-        if (chunkWorkerData.assignments?.length) {
-          for (const item of chunkWorkerData.assignments) deferredAssignments.push(item);
-        }
-
-        await Promise.all([
-          processHeritageFromExtracted(graph, chunkWorkerData.heritage, ctx, (current, total) => {
-            onProgress({
-              phase: 'parsing',
-              percent: Math.round(chunkBasePercent),
-              message: `Resolving heritage (chunk ${chunkIdx + 1}/${numChunks})...`,
-              detail: `${current}/${total} records`,
-              stats: {
-                filesProcessed: filesParsedSoFar,
-                totalFiles: totalParseable,
-                nodesCreated: graph.nodeCount,
-              },
-            });
-          }),
-          processRoutesFromExtracted(graph, chunkWorkerData.routes ?? [], ctx, (current, total) => {
-            onProgress({
-              phase: 'parsing',
-              percent: Math.round(chunkBasePercent),
-              message: `Resolving routes (chunk ${chunkIdx + 1}/${numChunks})...`,
-              detail: `${current}/${total} routes`,
-              stats: {
-                filesProcessed: filesParsedSoFar,
-                totalFiles: totalParseable,
-                nodesCreated: graph.nodeCount,
-              },
-            });
-          }),
-        ]);
-
         if (chunkWorkerData.fileScopeBindings?.length) {
           for (const { filePath, bindings } of chunkWorkerData.fileScopeBindings) {
             if (typeof filePath !== 'string' || filePath.length === 0) continue;
@@ -401,11 +978,42 @@ export async function runChunkedParseAndResolve(
         if (chunkWorkerData.fetchCalls?.length) {
           for (const item of chunkWorkerData.fetchCalls) allFetchCalls.push(item);
         }
+        for (const item of chunkWorkerData.fetchWrapperCalls ?? []) allFetchWrapperCalls.push(item);
+        for (const item of chunkWorkerData.fetchWrapperReexports ?? [])
+          allFetchWrapperReexports.push(item);
+        if (chunkWorkerData.fetchWrapperDefs?.length) {
+          for (const item of chunkWorkerData.fetchWrapperDefs) allFetchWrapperDefs.push(item);
+        }
         if (chunkWorkerData.routes?.length) {
           for (const item of chunkWorkerData.routes) allExtractedRoutes.push(item);
         }
+        for (const item of chunkWorkerData.routeFacts ?? [])
+          allRouteFacts.push({
+            ...item,
+            routePosition: item.routePosition + allDecoratorRoutes.length,
+          });
         if (chunkWorkerData.decoratorRoutes?.length) {
           for (const item of chunkWorkerData.decoratorRoutes) allDecoratorRoutes.push(item);
+        }
+        if (chunkWorkerData.routerIncludes?.length) {
+          for (const item of chunkWorkerData.routerIncludes) allRouterIncludes.push(item);
+        }
+        if (chunkWorkerData.routerImports?.length) {
+          for (const item of chunkWorkerData.routerImports) allRouterImports.push(item);
+        }
+        if (chunkWorkerData.routerConstructorPrefixes?.length) {
+          for (const item of chunkWorkerData.routerConstructorPrefixes) {
+            allRouterConstructorPrefixes.push(item);
+          }
+        }
+        if (chunkWorkerData.routerModuleAliases?.length) {
+          for (const item of chunkWorkerData.routerModuleAliases) allRouterModuleAliases.push(item);
+        }
+        if (chunkWorkerData.moduleConstants?.length) {
+          for (const item of chunkWorkerData.moduleConstants) allModuleConstants.push(item);
+        }
+        if (chunkWorkerData.springTypes?.length) {
+          for (const item of chunkWorkerData.springTypes) allSpringTypes.push(item);
         }
         if (chunkWorkerData.toolDefs?.length) {
           for (const item of chunkWorkerData.toolDefs) allToolDefs.push(item);
@@ -413,167 +1021,457 @@ export async function runChunkedParseAndResolve(
         if (chunkWorkerData.ormQueries?.length) {
           for (const item of chunkWorkerData.ormQueries) allORMQueries.push(item);
         }
-      } else {
-        await processImports(graph, chunkFiles, astCache, ctx, undefined, repoPath, allPaths);
-        sequentialChunkPaths.push(chunkPaths);
       }
 
-      filesParsedSoFar += chunkFiles.length;
-      astCache.clear();
-    }
+      filesParsedSoFar += fileCount;
 
-    const fullWorkerHeritageMap =
-      deferredWorkerHeritage.length > 0
-        ? buildHeritageMap(deferredWorkerHeritage, ctx, getHeritageStrategyForLanguage)
-        : undefined;
-
-    if (deferredWorkerCalls.length > 0) {
-      await processCallsFromExtracted(
-        graph,
-        deferredWorkerCalls,
-        ctx,
-        (current, total) => {
-          onProgress({
-            phase: 'parsing',
-            percent: 82,
-            message: 'Resolving calls (all chunks)...',
-            detail: `${current}/${total} files`,
-            stats: {
-              filesProcessed: filesParsedSoFar,
-              totalFiles: totalParseable,
-              nodesCreated: graph.nodeCount,
-            },
-          });
-        },
-        deferredConstructorBindings.length > 0 ? deferredConstructorBindings : undefined,
-        fullWorkerHeritageMap,
-        bindingAccumulator,
-      );
-    }
-
-    if (deferredAssignments.length > 0) {
-      processAssignmentsFromExtracted(
-        graph,
-        deferredAssignments,
-        ctx,
-        deferredConstructorBindings.length > 0 ? deferredConstructorBindings : undefined,
-        bindingAccumulator,
-      );
-    }
-  } finally {
-    await workerPool?.terminate();
-  }
-
-  // Sequential fallback chunks.
-  //
-  // U6: wrap the fallback loop and the finalize/enrich steps in a try/finally
-  // so cleanup still runs on a mid-fallback throw. The `finally` guarantees:
-  //   1. `astCache.clear()` releases any tree-sitter trees held by the most
-  //      recently allocated per-chunk cache, mirroring the per-chunk
-  //      `astCache.clear()` calls on the happy path.
-  //   2. `bindingAccumulator.finalize()` runs before `crossFile` disposes the
-  //      accumulator downstream — callers that inspect partial TypeEnv state
-  //      (or consume it via `enrichExportedTypeMap` on a partial recovery)
-  //      still see a finalized accumulator.
-  //   3. `enrichExportedTypeMap` runs so any bindings already accumulated
-  //      are propagated into `exportedTypeMap` even if the fallback aborted.
-  //
-  // Disposal of the accumulator remains with `crossFile` (owned by U2). We do
-  // NOT call `bindingAccumulator.dispose()` here.
-  try {
-    if (sequentialChunkPaths.length > 0) {
-      synthesizeWildcardImportBindings(graph, ctx);
-      hasSynthesized = true;
-    }
-    const allSequentialHeritage: ExtractedHeritage[] = [];
-    const cachedSequentialChunkFiles: Array<Array<{ path: string; content: string }>> = [];
-    for (const chunkPaths of sequentialChunkPaths) {
-      const chunkContents = await readFileContents(repoPath, chunkPaths);
-      const chunkFiles = chunkPaths
-        .filter((p) => chunkContents.has(p))
-        .map((p) => ({ path: p, content: chunkContents.get(p)! }));
-      cachedSequentialChunkFiles.push(chunkFiles);
-      astCache = createASTCache(chunkFiles.length);
-      const sequentialHeritage = await extractExtractedHeritageFromFiles(chunkFiles, astCache);
-      for (const h of sequentialHeritage) allSequentialHeritage.push(h);
-      astCache.clear();
-    }
-    const sequentialHeritageMap =
-      allSequentialHeritage.length > 0
-        ? buildHeritageMap(allSequentialHeritage, ctx, getHeritageStrategyForLanguage)
-        : undefined;
-
-    for (let chunkIdx = 0; chunkIdx < sequentialChunkPaths.length; chunkIdx++) {
-      const chunkFiles = cachedSequentialChunkFiles[chunkIdx];
-      astCache = createASTCache(chunkFiles.length);
-      const rubyHeritage = await processCalls(
-        graph,
-        chunkFiles,
-        astCache,
-        ctx,
-        undefined,
-        exportedTypeMap,
-        undefined,
-        undefined,
-        undefined,
-        sequentialHeritageMap,
-        bindingAccumulator,
-      );
-      await processHeritage(graph, chunkFiles, astCache, ctx);
-      if (rubyHeritage.length > 0) {
-        await processHeritageFromExtracted(graph, rubyHeritage, ctx);
-      }
-      const chunkFetchCalls = await extractFetchCallsFromFiles(chunkFiles, astCache);
-      if (chunkFetchCalls.length > 0) {
-        for (const item of chunkFetchCalls) allFetchCalls.push(item);
-      }
-      for (const f of chunkFiles) {
-        extractORMQueriesInline(f.path, f.content, allORMQueries);
-      }
-      astCache.clear();
-      cachedSequentialChunkFiles[chunkIdx] = [];
-    }
-
-    // Log resolution cache stats
-    if (isDev) {
-      const rcStats = ctx.getStats();
-      const total = rcStats.cacheHits + rcStats.cacheMisses;
-      const hitRate = total > 0 ? ((rcStats.cacheHits / total) * 100).toFixed(1) : '0';
-      logger.info(
-        `🔍 Resolution cache: ${rcStats.cacheHits} hits, ${rcStats.cacheMisses} misses (${hitRate}% hit rate)`,
-      );
-    }
-  } finally {
-    // Clearing an already-empty cache is a no-op, so this is idempotent-safe
-    // on the happy path where every per-chunk block already cleared astCache.
-    astCache.clear();
-
-    // Run finalize + enrichment inside try/catch so a cleanup failure never
-    // masks the original fallback error. finalize must precede crossFile's
-    // dispose (U2) and enrichExportedTypeMap depends on finalized bindings.
-    try {
-      bindingAccumulator.finalize();
-      const enriched = enrichExportedTypeMap(bindingAccumulator, graph, exportedTypeMap);
-      if (isDev && enriched > 0) {
+      if (verboseThroughputLog && chunkStartMs !== null) {
+        const elapsedMs = Date.now() - chunkStartMs;
+        const filesPerSec = elapsedMs > 0 ? (fileCount * 1000) / elapsedMs : 0;
+        const stats = workerPool?.getStats?.();
+        const poolFrag = stats
+          ? ` pool: ${stats.activeSlots}/${stats.size} active, ` +
+            `${stats.quarantined} quarantined${stats.poolBroken ? ', BROKEN' : ''}`
+          : ' (cache replay)';
         logger.info(
-          `🔗 Worker TypeEnv enrichment: ${enriched} fixpoint-inferred exports added to ExportedTypeMap`,
+          `📊 chunk ${chunkIdx + 1}/${numChunks}: ${fileCount} files in ${elapsedMs}ms ` +
+            `(${filesPerSec.toFixed(1)} files/s)${poolFrag}`,
         );
       }
-    } catch (enrichErr) {
-      if (isDev) {
-        logger.warn(
-          { err: (enrichErr as Error).message },
-          'Post-fallback finalize/enrich failed during cleanup:',
+    };
+
+    // Merge + finalize a parked worker chunk: graph merge (the overlapped
+    // main-thread step) → parse-cache write-guard → run-level aggregation.
+    const finalizeWorkerChunk = async (
+      p: Extract<RoundEntry, { kind: 'miss' }>,
+      rawResults: ParseWorkerResult[],
+    ): Promise<void> => {
+      let ordered = rawResults;
+      if (parseCache && p.selection) {
+        const strings = new Map<string, string>();
+        const resolved = new Map(p.hits);
+        const expected = new Map(p.chunkFiles.map((file) => [file.cacheKey!, file.path]));
+        const fresh = new Map<string, EncodedFileResult>();
+        const quarantined = new Set(workerPool?.getQuarantinedPaths?.() ?? []);
+        for (const result of rawResults) {
+          if (!result.fileResults && result.fileCount > 0)
+            throw new Error('Parser worker omitted per-file results; rebuild the worker');
+          for (const entry of result.fileResults ?? []) {
+            if (expected.get(entry.key) !== entry.path || resolved.has(entry.key))
+              throw new Error('Parser worker returned an unexpected per-file result');
+            if ('raw' in entry) {
+              resolved.set(entry.key, entry.raw);
+              markParseCacheChunkStale(parseCache, entry.key);
+              continue;
+            }
+            const record = entry.encoded;
+            if (record.key !== entry.key || record.path !== entry.path)
+              throw new Error('Parser file-result identity mismatch');
+            // Share repeated strings before merging fresh facts into the graph.
+            // Interning is optional: retain valid output if that traversal fails.
+            const decoded =
+              decodeFileResultSection(record.facts, record.key, record.path, 'facts', strings) ??
+              decodeFileResultSection(record.facts, record.key, record.path, 'facts');
+            if (!decoded) throw new Error(`Invalid encoded parser facts for ${record.path}`);
+            resolved.set(record.key, decoded.value as ParseWorkerResult);
+            fresh.set(record.key, record);
+            if (!record.cacheable || quarantined.has(record.path))
+              markParseCacheChunkStale(parseCache, record.key);
+          }
+        }
+        await persistParseCacheFiles(parseCache, [...fresh.values()]);
+        const stage = parseCache.fileResults?.stage;
+        let pinned = new Set<string>();
+        if (stage && parsedFileStorePath) {
+          const keys = [...fresh.keys()].filter(
+            (key) => parseCache.stagedKeys?.has(key) && stage.records.has(key),
+          );
+          try {
+            await pinFileResults(stage, keys, parsedFileStorePath);
+            pinned = new Set(keys);
+          } catch {
+            /* Use the existing transient/memory fallback for this run. */
+          }
+        }
+        for (const [key, record] of fresh) {
+          if (pinned.has(key)) continue;
+          const scope = decodeFileResultSection(record.scopes, key, record.path, 'scopes');
+          if (!scope) throw new Error(`Invalid encoded parser scopes for ${record.path}`);
+          resolved.get(key)!.parsedFiles = scope.value as ParseWorkerResult['parsedFiles'];
+        }
+        ordered = [];
+        for (const file of p.selection) {
+          const result = resolved.get(file.key);
+          if (result) ordered.push(result);
+          else markParseCacheChunkStale(parseCache, file.key);
+        }
+      }
+      const data = mergeChunkResults(graph, symbolTable, ordered, exportedTypeMap);
+      await applyChunkResults(data, p.chunkIdx, p.fileCount, p.chunkStartMs);
+    };
+
+    /**
+     * Dispatch a round's cache misses as ONE pool round. Returns the parked
+     * round; the caller drains it after starting the next one so the workers
+     * parse round N+1 while the main thread merges round N (the same overlap
+     * the per-chunk loop had, at round granularity).
+     */
+    const startRound = async (
+      entries: RoundEntry[],
+    ): Promise<{ entries: RoundEntry[]; results: Promise<ParseWorkerResult[][]> } | null> => {
+      if (entries.length === 0) return null;
+      const misses = entries.filter((entry) => entry.kind === 'miss');
+      if (misses.length === 0) {
+        return { entries, results: Promise.resolve([]) };
+      }
+      const roundFiles = misses.reduce((sum, miss) => sum + miss.chunkFiles.length, 0);
+      const firstIdx = misses[0].chunkIdx;
+      const lastIdx = misses[misses.length - 1].chunkIdx;
+      const progressForRound = (current: number, _total: number, filePath: string) => {
+        // Rounds queued before this one are already counted in
+        // `queuedFilesSoFar`; `current` is this round's own worker progress.
+        const globalCurrent = queuedFilesSoFar - roundFiles + current;
+        reportParsingProgress(
+          globalCurrent,
+          firstIdx === lastIdx
+            ? `Parsing chunk ${firstIdx + 1}/${numChunks}...`
+            : `Parsing chunks ${firstIdx + 1}-${lastIdx + 1}/${numChunks}...`,
+          filePath,
+        );
+      };
+      const activeWorkerPool = getOrCreateWorkerPool();
+      if (verboseThroughputLog) {
+        logger.info(
+          `🚚 round: ${misses.length} chunk(s) ${firstIdx + 1}-${lastIdx + 1}/${numChunks}, ` +
+            `${roundFiles} files in one dispatch`,
         );
       }
+      const results = dispatchChunkParseRound(
+        misses.map((miss) => ({
+          items: miss.chunkFiles,
+        })),
+        activeWorkerPool,
+        progressForRound,
+      );
+      // Mark handled so a rejection during the overlap drain below isn't
+      // flagged as unhandled; the `await` in drainRound re-throws it for real
+      // handling.
+      results.catch(() => {});
+      return { entries, results };
+    };
+
+    /**
+     * Merge + finalize every chunk of a parked round, in `chunkIdx` order.
+     * Takes RESOLVED worker output: the round's dispatch must already have
+     * settled before this runs, because the pool allows only one dispatch in
+     * flight at a time (see `closeRound`).
+     */
+    const drainRound = async (round: {
+      entries: RoundEntry[];
+      missResults: ParseWorkerResult[][];
+    }): Promise<void> => {
+      const missResults = round.missResults;
+      const missCount = round.entries.filter((entry) => entry.kind === 'miss').length;
+      // `dispatchGroups` returns one array per input group. If that contract
+      // ever breaks, every later entry in this round would silently merge the
+      // wrong chunk's results and skip its cache write, with a clean exit.
+      if (missResults.length !== missCount) {
+        throw new Error(
+          `Parse round result mismatch: ${missResults.length} result group(s) for ${missCount} dispatched chunk(s).`,
+        );
+      }
+      let missIdx = 0;
+      for (const entry of round.entries) {
+        options?.signal?.throwIfAborted();
+        if (entry.kind === 'hit') {
+          const chunkWorkerData = mergeChunkResults(
+            graph,
+            symbolTable,
+            entry.cachedRaw,
+            exportedTypeMap,
+          );
+          await applyChunkResults(
+            chunkWorkerData,
+            entry.chunkIdx,
+            entry.fileCount,
+            entry.chunkStartMs,
+          );
+          continue;
+        }
+        await finalizeWorkerChunk(entry, missResults[missIdx++]);
+      }
+    };
+
+    /**
+     * Close the accumulated round.
+     *
+     * `WorkerPool.dispatch`/`dispatchGroups` is NOT reentrant — concurrent
+     * calls race on the shared per-slot busy/in-flight state and wedge the
+     * pool until every worker idle-times out. So exactly one dispatch is in
+     * flight here: start this round, merge the PREVIOUS round (whose results
+     * are already resolved) while these workers run, then await this round and
+     * park it resolved for the next close to merge.
+     */
+    const closeRound = async (): Promise<void> => {
+      options?.signal?.throwIfAborted();
+      const started = await startRound(roundEntries);
+      roundEntries = [];
+      roundBudget.reset();
+      const previous = pendingRound;
+      pendingRound = null;
+      if (previous) {
+        try {
+          await drainRound(previous);
+        } catch (err) {
+          // The round started above is still on the workers. Unwinding now
+          // reaches this function's `finally`, which calls `terminate()` — and
+          // terminate kills busy workers outright, which is the #2432
+          // mid-N-API SIGABRT hazard. Let the in-flight round settle first so
+          // the pool is idle, then propagate the original failure.
+          await started?.results.catch(() => undefined);
+          throw err;
+        }
+      }
+      if (!started) return;
+      let missResults: ParseWorkerResult[][];
+      try {
+        missResults = await started.results;
+      } catch (err) {
+        if (!(err instanceof WorkerPoolInitializationError)) throw err;
+        // Every worker crashed during startup and the pool's bounded self-heal
+        // was exhausted. Fail fast (#1741) — there is no sequential parser to
+        // degrade to. `handleWorkerStartupFailure` always throws, so
+        // `missResults` stays definitely assigned for the parked round below.
+        handleWorkerStartupFailure(err);
+      }
+      pendingRound = { entries: started.entries, missResults };
+    };
+
+    for (let chunkIdx = 0; chunkIdx < numChunks; chunkIdx++) {
+      options?.signal?.throwIfAborted();
+      if (heapProbeEveryN > 0 && chunkIdx > 0 && chunkIdx % heapProbeEveryN === 0) {
+        logHeapProbe(
+          `parse-chunk-${chunkIdx}`,
+          `nodes=${graph.nodeCount} parsedFiles=${allParsedFiles.length}`,
+        );
+      }
+      // #2649 mid-loop heap guard: fail actionably BEFORE V8 enters the
+      // ineffective-mark-compact death spiral (which also falsely times out
+      // healthy workers). The pool is torn down by this function's finally.
+      const heapUsedNow = process.memoryUsage().heapUsed;
+      const heapLimitNow = v8.getHeapStatistics().heap_size_limit;
+      if (shouldAbortForHeapPressure(heapUsedNow, heapLimitNow)) {
+        throw new Error(
+          `Analyze stopped before running out of memory: ${Math.round(heapUsedNow / 1024 / 1024)}MB of the ` +
+            `${Math.round(heapLimitNow / 1024 / 1024)}MB Node heap in use at parse chunk ${chunkIdx + 1}/${numChunks} (#2649). ` +
+            heapPressureRemedy(heapLimitNow),
+        );
+      }
+      const chunkPaths = chunks[chunkIdx];
+      // Start wall-clock for the per-chunk throughput log emitted at end
+      // of this iteration. The gate is computed once above; here we just
+      // sample the clock if the gate is on. Computed when either
+      // NODE_ENV=development OR the operator passed `--verbose`
+      // (GITNEXUS_VERBOSE) — the previous `isDev`-only gate meant
+      // operators running `gitnexus analyze --verbose` in production
+      // never saw the log (M3 from PR #1693 review).
+      const chunkStartMs: number | null = verboseThroughputLog ? Date.now() : null;
+
+      const chunkContentPromise = chunkContentPromises[chunkIdx];
+      if (!chunkContentPromise) {
+        throw new Error(`Missing prefetched parse chunk ${chunkIdx + 1}/${numChunks}`);
+      }
+      const chunkContents = await chunkContentPromise;
+      chunkContentPromises[chunkIdx] = undefined; // release the in-memory copy
+      startChunkPrefetch(chunkIdx + parseChunkConcurrency);
+      const chunkFiles: Array<{ path: string; content: string }> = [];
+      for (const p of chunkPaths) {
+        const content = chunkContents.get(p);
+        if (content !== undefined) chunkFiles.push({ path: p, content });
+      }
+
+      const selection = chunkFiles.map((file) => {
+        const contentHash = fileContentHash(file.content);
+        recordSourceHash?.(file.path, contentHash);
+        const key = parseCache
+          ? computeFileResultKey(
+              file.path,
+              contentHash,
+              parseCache.identity,
+              options?.pdg === true
+                ? {
+                    pdg: true,
+                    maxFunctionLines:
+                      options?.pdgMaxFunctionLines ?? DEFAULT_PDG_MAX_FUNCTION_LINES,
+                  }
+                : false,
+            )
+          : '';
+        if (parseCache) parseCache.usedKeys.add(key);
+        return { key, path: file.path };
+      });
+      const hits = parseCache
+        ? await loadParseCacheFiles(parseCache, selection, parsedFileStorePath)
+        : new Map<string, ParseWorkerResult>();
+      const misses: ParseWorkerInput[] = [];
+      for (let i = 0; i < chunkFiles.length; i++) {
+        if (!hits.has(selection[i].key))
+          misses.push({ ...chunkFiles[i], ...(parseCache ? { cacheKey: selection[i].key } : {}) });
+      }
+      parseCacheHitFileCount += hits.size;
+      reparsedFileCount += misses.length;
+      if (hits.size) chunkCacheHits++;
+      if (misses.length) chunkCacheMisses++;
+      if (misses.length === 0) {
+        roundEntries.push({
+          kind: 'hit',
+          chunkIdx,
+          fileCount: chunkFiles.length,
+          chunkStartMs,
+          cachedRaw: selection.map((file) => hits.get(file.key)!),
+        });
+        reportParsingProgress(
+          queuedFilesSoFar + chunkFiles.length,
+          `Parsing chunk ${chunkIdx + 1}/${numChunks} (cache)...`,
+        );
+      } else {
+        roundEntries.push({
+          kind: 'miss',
+          chunkIdx,
+          chunkFiles: misses,
+          fileCount: chunkFiles.length,
+          chunkStartMs,
+          ...(parseCache ? { selection, hits } : {}),
+        });
+      }
+      const roundIsFull = roundBudget.addChunk(chunkFiles.map((file) => file.content));
+      queuedFilesSoFar += chunkFiles.length;
+
+      // One cap, on what the main thread is holding. That bounds the worker
+      // round too, since a round's dispatched bytes are a subset of its
+      // buffered bytes.
+      if (roundIsFull) await closeRound();
+
+      // (Per-chunk aggregation + parse-cache write + throughput log now run in
+      // `applyChunkResults` / `finalizeWorkerChunk` — see the merge-pipelining
+      // block above. Route/import/inheritance edges are emitted later: route
+      // resolution in the single end-of-loop pass below, the rest by the
+      // scope-resolution phase, RING4-2 #943.)
+    }
+
+    // Drain the tail: close the partially-filled round, then drain the round
+    // it parked — the last round has no successor to overlap its merge with.
+    if (roundEntries.length > 0) await closeRound();
+    if (pendingRound) {
+      const last = pendingRound;
+      pendingRound = null;
+      await drainRound(last);
+    }
+
+    if (isDev && parseCache && (chunkCacheHits > 0 || chunkCacheMisses > 0)) {
+      logger.info(
+        `📦 parse-cache summary: ${chunkCacheHits} chunk hit(s), ${chunkCacheMisses} miss(es) across ${numChunks} chunk(s)`,
+      );
+    }
+
+    logHeapProbe(
+      'post-parse-chunks',
+      `routes=${allExtractedRoutes.length} nodes=${graph.nodeCount} parsedFiles=${allParsedFiles.length}`,
+    );
+
+    // Deferred end-of-loop extraction (moved out of the per-chunk block):
+    //   1. route resolution on all chunks' routes
+    // Resolution sees the full repo graph instead of just current-and-earlier
+    // chunks. Import, call, and inheritance edges are emitted by the
+    // scope-resolution phase, not here (RING4-1 #942 removed the legacy call
+    // DAG; RING4-2 #943 removed the legacy import-map resolution + wildcard
+    // synthesis). Progress band: the route stage gets a slice of the 70-95
+    // range; a zero-length input leaves its band as a no-op jump.
+    //   routes:   80 -> 85 (5)
+    const deferredProfile = isDeferredResolutionProfileEnabled();
+    if (deferredProfile) {
+      logDeferredProfile(`deferred band start: routes=${allExtractedRoutes.length}`);
+    }
+    // Populate `exportedTypeMap` from the in-progress graph so the post-parse
+    // enrichment pass (enrichExportedTypeMap) sees cross-file export types.
+    if (exportedTypeMap.size === 0 && graph.nodeCount > 0) {
+      logHeapProbe('pre-buildExportedTypeMapFromGraph');
+      const graphExports = buildExportedTypeMapFromGraph(graph, model.symbols);
+      for (const [fp, exports] of graphExports) exportedTypeMap.set(fp, exports);
+      logHeapProbe('post-buildExportedTypeMapFromGraph');
+    }
+    // Whole-repo, cross-file route extraction (e.g. Django) runs on the main
+    // thread — the worker has no filesystem access and can't follow `include()`
+    // chains across files. Merge its routes in before `processRoutesFromExtracted`
+    // and the routes phase consume `allExtractedRoutes`.
+    const crossFileRoutes = await extractCrossFileRoutes(allPaths, repoPath);
+    if (crossFileRoutes.length > 0) {
+      for (const r of crossFileRoutes) allExtractedRoutes.push(r);
+      if (deferredProfile) {
+        logDeferredProfile(`cross-file routes: +${crossFileRoutes.length}`);
+      }
+    }
+    if (allExtractedRoutes.length > 0) {
+      const tRoutes = startTimer(deferredProfile);
+      await processRoutesFromExtracted(graph, allExtractedRoutes, model, (current, total) => {
+        const ratio = total > 0 ? current / total : 1;
+        onProgress({
+          phase: 'parsing',
+          percent: 80 + Math.round(ratio * 5),
+          message: 'Resolving routes (all chunks)...',
+          detail: `${current}/${total} routes`,
+          stats: {
+            filesProcessed: filesParsedSoFar,
+            totalFiles: totalParseable,
+            nodesCreated: graph.nodeCount,
+          },
+        });
+      });
+      endTimer(
+        tRoutes,
+        (ms) =>
+          `processRoutesFromExtracted: ${ms.toFixed(0)}ms (${allExtractedRoutes.length} routes)`,
+      );
+    }
+  } catch (error) {
+    parseFailure = error;
+    parsingFailed = true;
+    throw error;
+  } finally {
+    try {
+      await workerPool?.terminate();
+    } catch (drainError) {
+      if (parsingFailed) {
+        throw new AggregateError(
+          [parseFailure, drainError],
+          `Parsing failed (${parseFailure instanceof Error ? parseFailure.message : String(parseFailure)}) and native workers have not drained`,
+          { cause: parseFailure },
+        );
+      }
+      throw drainError;
     }
   }
 
-  if (!hasSynthesized) {
-    const synthesized = synthesizeWildcardImportBindings(graph, ctx);
-    if (isDev && synthesized > 0) {
+  // Fetch calls + ORM queries were already extracted inside each worker
+  // (returned in ParseWorkerResult, aggregated per chunk in applyChunkResults).
+  // With sequential parsing removed there is no post-loop drain to run — only
+  // the TypeEnv finalize + enrichment that the drain's `finally` used to host.
+  // Finalize the accumulator and propagate any fixpoint-inferred exports before
+  // `crossFile` disposes it downstream. Wrapped in try/catch so a cleanup
+  // failure never masks a real parse error; disposal stays with `crossFile`.
+  try {
+    bindingAccumulator.finalize();
+    const enriched = enrichExportedTypeMap(bindingAccumulator, graph, exportedTypeMap);
+    if (isDev && enriched > 0) {
       logger.info(
-        `🔗 Synthesized ${synthesized} additional wildcard import bindings (Go/Ruby/C++/Swift/Python)`,
+        `🔗 Worker TypeEnv enrichment: ${enriched} fixpoint-inferred exports added to ExportedTypeMap`,
+      );
+    }
+  } catch (enrichErr) {
+    if (isDev) {
+      logger.warn(
+        { err: (enrichErr as Error).message },
+        'Post-parse finalize/enrich failed during cleanup:',
       );
     }
   }
@@ -585,41 +1483,520 @@ export async function runChunkedParseAndResolve(
   // crossFile receives a fully-populated map and never needs to mutate it for
   // initial-graph enrichment.
   if (exportedTypeMap.size === 0 && graph.nodeCount > 0) {
-    const graphExports = buildExportedTypeMapFromGraph(graph, ctx.model.symbols);
+    const graphExports = buildExportedTypeMapFromGraph(graph, model.symbols);
     for (const [fp, exports] of graphExports) exportedTypeMap.set(fp, exports);
   }
 
-  allPathObjects.length = 0;
-  // Safe to reset importCtx caches here: `importCtx` (ImportResolutionContext)
-  // is a scratch workspace used only during import path resolution. The
-  // `resolutionContext` (`ctx`) returned below is a distinct object — it owns
-  // the fully-populated, post-parse `importMap` / `namedImportMap` /
-  // `packageMap` / `moduleAliasMap` / `model`, and never references
-  // `importCtx`. Cross-file re-resolution in cross-file-impl.ts consumes only
-  // `ctx` (via `processCalls`), so clearing the suffix index / resolveCache /
-  // normalizedFileList here cannot lose import matches downstream.
-  importCtx.resolveCache.clear();
-  importCtx.index = EMPTY_INDEX;
-  importCtx.normalizedFileList = [];
+  const routeFilePaths = new Set(allPaths);
+  const routeResolutionConfigs = new Map<SupportedLanguages, unknown>();
+  const resolutionFilePaths = new Set<string>();
+  for (const facts of [
+    allRouteFacts,
+    allFetchWrapperDefs,
+    allFetchWrapperCalls,
+    allFetchWrapperReexports,
+  ] as const)
+    for (const { filePath } of facts) resolutionFilePaths.add(filePath);
+  for (const filePath of resolutionFilePaths) {
+    const language = getLanguageFromFilename(filePath);
+    if (language === null || routeResolutionConfigs.has(language)) continue;
+    const resolver = SCOPE_RESOLVERS.get(language);
+    routeResolutionConfigs.set(
+      language,
+      capturedResolutionConfigs?.has(language)
+        ? capturedResolutionConfigs.get(language)
+        : resolver?.loadResolutionConfig === undefined
+          ? undefined
+          : await resolver.loadResolutionConfig(repoPath),
+    );
+  }
+  let routeResolutionFiles = allParsedFiles;
+  const resolveRouteModuleTargets = (
+    fromFile: string,
+    moduleSpecifier: string,
+    parsedImport?: ParsedImport,
+  ): readonly string[] => {
+    const language = getLanguageFromFilename(fromFile);
+    if (language === null) return [];
+    const target = SCOPE_RESOLVERS.get(language)?.resolveImportTarget(
+      moduleSpecifier,
+      fromFile,
+      routeFilePaths,
+      routeResolutionConfigs.get(language),
+      { parsedFiles: routeResolutionFiles, ...(parsedImport ? { parsedImport } : {}) },
+    );
+    if (typeof target === 'string') return [target];
+    return target ?? [];
+  };
+  const resolveRouteImportTargets = (
+    parsedImport: ParsedImport,
+    fromFile: string,
+  ): readonly string[] =>
+    resolveRouteModuleTargets(fromFile, parsedImport.targetRaw ?? '', parsedImport);
 
+  const resolvedFetchWrappers = resolveFetchWrapperTargets(
+    allFetchWrapperDefs,
+    allFetchWrapperCalls,
+    resolveRouteModuleTargets,
+    allFetchWrapperReexports,
+  );
+  allFetchWrapperDefs = resolvedFetchWrappers.definitions;
+  allFetchWrapperCalls = resolvedFetchWrappers.calls;
+
+  // User route configuration is applied here, on the main thread: workers only
+  // emit configuration-free candidates, so a config change never stales the
+  // parse cache.
+  const routeHookConfig = options?.routeHookConfig;
+
+  // A resolver's identity defines a fact family, including providers sharing
+  // one language implementation. Shared ingestion never inspects the payload.
+  const routeFactGroups = new Map<
+    NonNullable<LanguageProvider['resolveRouteFacts']>,
+    typeof allRouteFacts
+  >();
+  for (const file of allRouteFacts) {
+    const resolve = getProviderForFile(file.filePath)?.resolveRouteFacts;
+    if (!resolve) continue;
+    const group = routeFactGroups.get(resolve) ?? [];
+    group.push(file);
+    routeFactGroups.set(resolve, group);
+  }
+  const resolvedRoutesByFile = new Map<string, ExtractedDecoratorRoute[]>();
+  for (const [resolve, files] of routeFactGroups) {
+    for (const route of resolve(files, {
+      resolveImportTargets: resolveRouteModuleTargets,
+      routeHookConfig,
+    })) {
+      const routes = resolvedRoutesByFile.get(route.filePath) ?? [];
+      routes.push(route);
+      resolvedRoutesByFile.set(route.filePath, routes);
+    }
+  }
+  // Preserve the capture slot across sub-batch, chunk and cache boundaries.
+  // Insert before path expansion can change the decorator array's positions.
+  const routesAtPosition = new Map<number, ExtractedDecoratorRoute[]>();
+  for (const file of allRouteFacts) {
+    const routes = resolvedRoutesByFile.get(file.filePath);
+    if (!routes) continue;
+    const slot = routesAtPosition.get(file.routePosition) ?? [];
+    for (const route of routes) slot.push(route);
+    routesAtPosition.set(file.routePosition, slot);
+    resolvedRoutesByFile.delete(file.filePath);
+  }
+  const withResolvedRoutes: ExtractedDecoratorRoute[] = [];
+  for (let index = 0; index <= allDecoratorRoutes.length; index++) {
+    for (const route of routesAtPosition.get(index) ?? []) withResolvedRoutes.push(route);
+    if (index < allDecoratorRoutes.length) withResolvedRoutes.push(allDecoratorRoutes[index]);
+  }
+  allDecoratorRoutes.length = 0;
+  for (const route of withResolvedRoutes) allDecoratorRoutes.push(route);
+
+  // FastAPI router-prefix resolution (cross-file).
+  //
+  // #2391: resolve non-literal FastAPI decorator route paths (imported/composed
+  // string constants) BEFORE the include_router/APIRouter prefix pass below, so a
+  // resolved path is then prefix-joined like any literal path. Each such route
+  // carries `routePathExpr`/`routePathOperands` and an empty `routePath`; we fold
+  // the operands against the repo-wide, file-path-keyed constant map. On failure
+  // we DROP the route (KTD5 skip floor) rather than emit a phantom `POST /`.
+  //
+  // Built (and prepared) UNCONDITIONALLY when anything was harvested, because
+  // the map is also handed to downstream phases on `ParseOutput.moduleConstants`
+  // — `springDestinations` folds broker-address constants against exactly the
+  // same table. Preparation runs exactly once, here, on one map, before either
+  // consumer folds. Deferring it into each consumer instead would need
+  // `prepareRouteConstants` to be safe to call twice — it materializes deferred
+  // wildcard bindings IN PLACE — or would leave whichever consumer ran first
+  // folding against unprepared constants. Neither is worth the coupling; the
+  // cost here is one pass over the harvested constants of a repo that has some.
+  const repoConstants = new Map<string, ModuleConstants>();
+  for (const { filePath, constants } of allModuleConstants) {
+    repoConstants.set(filePath, constants);
+  }
+  if (repoConstants.size > 0) {
+    // Let each language prepare only its own constants slice before folding.
+    // This is where deferred wildcard bindings can be materialized once per
+    // provider without naming a language in the shared parse phase.
+    prepareRouteConstantsByProvider(repoConstants, getProviderForFile);
+  }
+  if (allDecoratorRoutes.some((dr) => dr.routePathExpr !== undefined)) {
+    const resolvedRoutes: ExtractedDecoratorRoute[] = [];
+    let skipped = 0;
+    for (const dr of allDecoratorRoutes) {
+      if (dr.routePathExpr === undefined) {
+        resolvedRoutes.push(dr);
+        continue;
+      }
+      // Provider-driven fold (#2980): languages with qualified-ref semantics
+      // (Java `ApiPaths.X` / `com.example.ApiPaths.X`) fold through their
+      // provider hook; everything else uses the shared language-agnostic
+      // operand fold. No language names in the shared layer.
+      const fold = getProviderForFile(dr.filePath)?.foldRoutePathOperands;
+      const value = dr.routePathOperands
+        ? fold
+          ? fold(dr.filePath, dr.routePathOperands, repoConstants)
+          : resolveOperands(dr.filePath, dr.routePathOperands, repoConstants)
+        : null;
+      if (value === null) {
+        skipped++;
+        continue;
+      }
+      resolvedRoutes.push({ ...dr, routePath: value });
+    }
+    allDecoratorRoutes.length = 0;
+    for (const dr of resolvedRoutes) allDecoratorRoutes.push(dr);
+    if (isDev && skipped > 0) {
+      logger.info(`  🧩 Resolved composed route constants; ${skipped} unresolved route(s) skipped`);
+    }
+  }
+
+  // Workers emit two kinds of records per Python file:
+  //   • `routerIncludes` — every `app.include_router(<routerExpr>, prefix='/x')`
+  //     site, where `routerExpr` is either `<module>.router` (Shape A) or a
+  //     bare local name (Shape B).
+  //   • `routerImports`  — every `from <module> import router [as <alias>]`,
+  //     mapping a local name to a module key (the basename of the source
+  //     module). These let us resolve Shape-B router includes back to the
+  //     module that defines the router.
+  //
+  // We build `module-basename → Set<prefix>` and then walk
+  // `allDecoratorRoutes`: any decorator route emitted from a `router.<verb>`
+  // decorator inherits its file-basename's prefix. When a router is mounted
+  // under multiple prefixes we duplicate the route entry, mirroring FastAPI's
+  // runtime behaviour.
+  if (
+    (allRouterIncludes.length > 0 || allRouterConstructorPrefixes.length > 0) &&
+    allDecoratorRoutes.length > 0
+  ) {
+    // Group `routerImports` by file so we can resolve Shape-B locals against
+    // imports declared in the SAME file as the include_router call. We carry
+    // both the short module key (file basename) and, when available, the long
+    // key (`<dir>/<basename>`) so cross-package same-name modules don't blur
+    // their prefixes together. `routerModuleAliases` lifts the same long-key
+    // information for Shape-A includes whose receiving module was imported
+    // via `from <pkg> import <module>`.
+    interface LocalImport {
+      moduleKey: string;
+      moduleKeyLong: string | undefined;
+    }
+    const importsByFile = new Map<string, Map<string, LocalImport>>();
+    for (const imp of allRouterImports) {
+      let m = importsByFile.get(imp.filePath);
+      if (!m) {
+        m = new Map();
+        importsByFile.set(imp.filePath, m);
+      }
+      m.set(imp.localName, {
+        moduleKey: imp.moduleKey,
+        moduleKeyLong: imp.moduleKeyLong,
+      });
+    }
+    // Module-alias map keyed by file: `localName` (the imported module
+    // identifier in this file) → long key. Shape-A receivers like
+    // `users.router` are matched against this map; the long key, when
+    // present, scopes the prefix to the precise source file.
+    const moduleAliasesByFile = new Map<string, Map<string, string>>();
+    for (const alias of allRouterModuleAliases) {
+      let m = moduleAliasesByFile.get(alias.filePath);
+      if (!m) {
+        m = new Map();
+        moduleAliasesByFile.set(alias.filePath, m);
+      }
+      m.set(alias.localName, alias.moduleKeyLong);
+    }
+
+    // Exact-file matches handle import-resolved mounts (including nested
+    // routers). These long/short maps preserve the older fallback for mounts
+    // whose import cannot be resolved to one file.
+    const prefixesByLongKey = new Map<string, Set<string>>();
+    const prefixesByShortKey = new Map<string, Set<string>>();
+    // Constructor prefixes are `router`-only (the apply gate below and the
+    // group-layer tree-sitter both pin to the literal name `router`), so a
+    // flat file-key → prefix map suffices — mirrors the group layer's shape.
+    const constructorPrefixesByLongKey = new Map<string, string>();
+    const constructorPrefixesByShortKey = new Map<string, string>();
+    const { prefixesByFile, resolvedIncludes } = resolveFastAPIRouterPrefixes(
+      allPaths,
+      allRouterIncludes,
+      allRouterImports,
+      allRouterModuleAliases,
+      allRouterConstructorPrefixes,
+    );
+
+    const recordPrefix = (target: Map<string, Set<string>>, key: string, prefix: string): void => {
+      let set = target.get(key);
+      if (!set) {
+        set = new Set();
+        target.set(key, set);
+      }
+      set.add(prefix);
+    };
+
+    for (const inc of allRouterIncludes) {
+      // Unprefixed includes only exist as propagation edges; recording `''`
+      // here would shadow a real short-key prefix for the same module.
+      if (resolvedIncludes.has(inc) || !inc.prefix) continue;
+      // Shape A: `<module>.router`. The worker emits `routerExpr` already
+      // including `.router`, so split it back. We only know a short module
+      // key here — the call site doesn't carry the dotted package path. If
+      // the same file imports `<module>` via `from <pkg> import <module>`
+      // (recorded in `allRouterModuleAliases`) we promote to a long key.
+      const dotIdx = inc.routerExpr.indexOf('.router');
+      if (dotIdx > 0) {
+        const moduleShort = inc.routerExpr.slice(0, dotIdx);
+        const aliasLong = moduleAliasesByFile.get(inc.filePath)?.get(moduleShort);
+        if (aliasLong) {
+          recordPrefix(prefixesByLongKey, aliasLong, inc.prefix);
+        } else {
+          recordPrefix(prefixesByShortKey, moduleShort, inc.prefix);
+        }
+        continue;
+      }
+
+      // Shape B: bare local name. Resolve through this file's imports. The
+      // import line gives us a long key whenever the module path was multi-
+      // segment, so cross-package collisions are eliminated for Shape B.
+      const localImp = importsByFile.get(inc.filePath)?.get(inc.routerExpr);
+      if (!localImp) continue;
+      if (localImp.moduleKeyLong) {
+        recordPrefix(prefixesByLongKey, localImp.moduleKeyLong, inc.prefix);
+      } else {
+        recordPrefix(prefixesByShortKey, localImp.moduleKey, inc.prefix);
+      }
+    }
+
+    if (
+      prefixesByFile.size > 0 ||
+      prefixesByLongKey.size > 0 ||
+      prefixesByShortKey.size > 0 ||
+      allRouterConstructorPrefixes.length > 0
+    ) {
+      const fileLongKey = (rel: string): string => {
+        // Strip `.py`, then take the last two path segments. `api/users.py`
+        // → `api/users`. Files at the repo root return the empty string,
+        // which can never match a long-key entry (those always include a
+        // parent directory) and so fall through to the short-key lookup.
+        const noExt = rel.endsWith('.py') ? rel.slice(0, -3) : rel;
+        const lastSlash = noExt.lastIndexOf('/');
+        if (lastSlash < 0) return '';
+        const beforeLast = noExt.slice(0, lastSlash);
+        const stem = noExt.slice(lastSlash + 1);
+        const prevSlash = beforeLast.lastIndexOf('/');
+        const parent = prevSlash >= 0 ? beforeLast.slice(prevSlash + 1) : beforeLast;
+        return `${parent}/${stem}`;
+      };
+
+      const fileShortKey = (rel: string): string => {
+        const slash = rel.lastIndexOf('/');
+        const file = slash >= 0 ? rel.slice(slash + 1) : rel;
+        return file.endsWith('.py') ? file.slice(0, -3) : file;
+      };
+
+      for (const ctor of allRouterConstructorPrefixes) {
+        const longKey = fileLongKey(ctor.filePath);
+        if (longKey) {
+          constructorPrefixesByLongKey.set(longKey, ctor.prefix);
+        } else {
+          constructorPrefixesByShortKey.set(fileShortKey(ctor.filePath), ctor.prefix);
+        }
+      }
+
+      const expanded: ExtractedDecoratorRoute[] = [];
+      for (const dr of allDecoratorRoutes) {
+        if (dr.decoratorReceiver !== 'router' || !dr.filePath.endsWith('.py')) {
+          expanded.push(dr);
+          continue;
+        }
+        // Exact file matches plus the legacy long/short fallback for mounts
+        // whose import could not be resolved.
+        const longKey = fileLongKey(dr.filePath);
+        const longPrefixes = longKey ? prefixesByLongKey.get(longKey) : undefined;
+        const shortPrefixes = longPrefixes
+          ? undefined
+          : prefixesByShortKey.get(fileShortKey(dr.filePath));
+        const prefixes = mergeMountPrefixes(
+          prefixesByFile.get(dr.filePath.replace(/\\/g, '/')),
+          longPrefixes ?? shortPrefixes,
+        );
+        // Constructor prefixes are keyed like include_router prefixes:
+        // long-key entries are precise, while short-key entries are only
+        // valid for repo-root/single-segment files where `fileLongKey`
+        // returns ''. Do not fall back from a missing long-key match to the
+        // short key or a root `users.py` prefix can leak onto
+        // `admin/users.py`.
+        const constructorPrefix = longKey
+          ? constructorPrefixesByLongKey.get(longKey)
+          : constructorPrefixesByShortKey.get(fileShortKey(dr.filePath));
+        const routePath = constructorPrefix
+          ? normalizeExtractedRoutePath(dr.routePath, constructorPrefix)
+          : dr.routePath;
+        if (!prefixes || prefixes.size === 0) {
+          expanded.push(routePath === dr.routePath ? dr : { ...dr, routePath });
+          continue;
+        }
+        for (const prefix of prefixes) {
+          expanded.push({ ...dr, routePath, prefix });
+        }
+      }
+      allDecoratorRoutes.length = 0;
+      for (const dr of expanded) allDecoratorRoutes.push(dr);
+    }
+  }
+
+  // Cross-file Spring interface-inheritance pass (#2288): a concrete
+  // `@RestController` inherits the `@*Mapping`s declared on the interfaces it
+  // implements. The per-file `SharedSpringType` views collected by the Java
+  // provider's `extractRouteInheritanceTypes` hook are resolved here, project-
+  // wide, into decorator routes attributed to the implementing controller (the
+  // interface's own per-file routes were suppressed at extraction). Mirrors the
+  // group layer via the shared `resolveInheritedSpringRoutes` so both agree.
+  if (allSpringTypes.length > 0) {
+    for (const inherited of resolveInheritedSpringRoutes(allSpringTypes)) {
+      allDecoratorRoutes.push({
+        filePath: inherited.filePath,
+        routePath: inherited.path,
+        httpMethod: inherited.method,
+        decoratorName: 'inherited-mapping',
+        lineNumber: 0,
+        handlerName: inherited.methodName,
+      });
+    }
+  }
+
+  logHeapProbe(
+    'parse-impl-return',
+    `exportedTypeMap=${exportedTypeMap.size} parsedFiles=${allParsedFiles.length} nodes=${graph.nodeCount}`,
+  );
+  // Route files whose handlers resolve through imports: data route tables, and
+  // routes of a language that resolves its own handlers (`resolveRouteHandler`).
+  // Both need the file's parsed imports and its language's resolution config.
+  const dataRouteFilePaths = new Set(
+    allDecoratorRoutes
+      .filter(
+        (route) =>
+          route.source === DATA_ROUTE_TABLE_SOURCE ||
+          getProviderForFile(route.filePath)?.resolveRouteHandler !== undefined,
+      )
+      .map((route) => route.filePath),
+  );
+  for (const filePath of dataRouteFilePaths) {
+    const language = getLanguageFromFilename(filePath);
+    if (language === null || routeResolutionConfigs.has(language)) continue;
+    const resolver = SCOPE_RESOLVERS.get(language);
+    routeResolutionConfigs.set(
+      language,
+      capturedResolutionConfigs?.has(language)
+        ? capturedResolutionConfigs.get(language)
+        : await resolver?.loadResolutionConfig?.(repoPath),
+    );
+  }
+  const resolveRouteImportTarget = (
+    parsedImport: ParsedImport,
+    fromFile: string,
+  ): string | null => {
+    const targets = resolveRouteImportTargets(parsedImport, fromFile);
+    return targets.length === 1 ? targets[0] : null;
+  };
+  if (parsedFileStorePath !== undefined && dataRouteFilePaths.size > 0) {
+    const byPath = await loadParsedFilesForPaths(parsedFileStorePath, dataRouteFilePaths);
+    for (const parsed of allParsedFiles) {
+      if (dataRouteFilePaths.has(parsed.filePath)) byPath.set(parsed.filePath, parsed);
+    }
+    routeResolutionFiles = [...byPath.values()];
+    const directTargets = new Set<string>();
+    for (const parsed of routeResolutionFiles) {
+      for (const parsedImport of parsed.parsedImports) {
+        const target = resolveRouteImportTarget(parsedImport, parsed.filePath);
+        if (target !== null) directTargets.add(target);
+      }
+    }
+    const importedFiles = await loadParsedFilesForPaths(parsedFileStorePath, directTargets);
+    for (const parsed of importedFiles.values()) byPath.set(parsed.filePath, parsed);
+    routeResolutionFiles = [...byPath.values()];
+  }
+  // Part 2 (#2138): resolve each route's handler to a real symbol UID now that
+  // the model is fully populated and decorator-route prefixes are finalized.
+  const routeSourceTexts = new Map<string, string | undefined>();
+  const routeSourceTextFor = (filePath: string): string | undefined => {
+    if (!routeSourceTexts.has(filePath)) {
+      try {
+        routeSourceTexts.set(filePath, fs.readFileSync(path.join(repoPath, filePath), 'utf-8'));
+      } catch {
+        routeSourceTexts.set(filePath, undefined);
+      }
+    }
+    return routeSourceTexts.get(filePath);
+  };
+  routeResolutionFiles = routeResolutionFiles.map((parsed) => {
+    if (!dataRouteFilePaths.has(parsed.filePath)) return parsed;
+    const language = getLanguageFromFilename(parsed.filePath);
+    const resolveBinding =
+      language === null ? undefined : SCOPE_RESOLVERS.get(language)?.resolveImportBinding;
+    if (!resolveBinding) return parsed;
+    return {
+      ...parsed,
+      parsedImports: parsed.parsedImports.map((parsedImport) =>
+        resolveBinding(
+          parsedImport,
+          () => resolveRouteImportTargets(parsedImport, parsed.filePath),
+          routeSourceTextFor,
+        ),
+      ),
+    };
+  });
+  const selectedRoutes = new Set<ExtractedRoute | ExtractedDecoratorRoute>();
+  const routeHandlerSymbols = resolveRouteHandlerSymbols(
+    model,
+    allExtractedRoutes,
+    allDecoratorRoutes,
+    {
+      files: routeResolutionFiles,
+      resolveImportTarget: resolveRouteImportTarget,
+      resolveImportTargets: resolveRouteImportTargets,
+      providerRouteHandler: (filePath) => getProviderForFile(filePath)?.resolveRouteHandler,
+      routeHookConfig,
+      isExportedSymbol: (nodeId: string) => graph.getNode(nodeId)?.properties.isExported === true,
+      nodeStartLine: (id) => {
+        const n = graph.getNode(id);
+        return typeof n?.properties.startLine === 'number' ? n.properties.startLine : undefined;
+      },
+    },
+    selectedRoutes,
+  );
   return {
     exportedTypeMap,
     allFetchCalls,
+    allFetchWrapperDefs,
+    allFetchWrapperCalls,
     allExtractedRoutes,
     allDecoratorRoutes,
+    selectedRoutes,
     allToolDefs,
     allORMQueries,
     bindingAccumulator,
-    resolutionContext: ctx,
-    // Whether a worker pool was actually live for this run. False means the
-    // sequential fallback handled every chunk (either due to `skipWorkers`,
-    // the file-count/byte thresholds, or a pool-creation failure).
+    routeHandlerSymbols,
+    model,
+    // Whether a worker pool was actually constructed for this run. False means
+    // no pool was needed: a warm all-cache-hit run replays cached worker output
+    // without spawning workers, or there were no parseable files.
     usedWorkerPool: workerPool !== undefined,
-    // Surface the persistent scope cache so downstream phases
-    // (scope-resolution) can skip re-parsing files that the
-    // sequential path already parsed. Survives chunk boundaries; the
-    // chunk-local `astCache` above is intentionally NOT exposed
-    // because parse-impl clears it between chunks.
-    scopeTreeCache,
+    // Exact number of files sent through workers on parse-cache misses. A
+    // changed file can invalidate its whole content-addressed chunk, so this
+    // is intentionally measured at dispatch time rather than inferred from
+    // the git/hash diff.
+    reparsedFileCount,
+    parseCacheHitFileCount,
+    // Per-file ParsedFile artifacts produced by workers' calls to
+    // `extractParsedFile`. Consumed by scope-resolution as a re-extraction
+    // cache: when the file's ParsedFile is here, scope-resolution skips its own
+    // `extractParsedFile` call.
+    parsedFiles: allParsedFiles,
+    contentLanguageByPath,
+    // Repo-wide, file-path-keyed constants, already through each provider's
+    // `prepareRouteConstants` hook. Empty when no provider harvests constants
+    // for the languages in this repo.
+    moduleConstants: repoConstants,
+    scopeExtractionFailures: [...scopeExtractionFailures].sort(),
+    unavailableScopeLanguageFiles,
   };
 }

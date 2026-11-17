@@ -8,29 +8,52 @@
  *
  * The import matches arrive pre-decomposed by `emitTsScopeCaptures`
  * (one imported name per match, with synthesized
- * `@import.kind/source/name/alias` markers — see `import-decomposer.ts`).
+ * `@import.kind/source/name/alias/type-only` markers — see
+ * `import-decomposer.ts`).
  * The type-binding matches arrive straight from the raw query captures —
  * each `@type-binding.*` anchor carries `@type-binding.name` +
  * `@type-binding.type`.
  */
 
-import type { CaptureMatch, ParsedImport, ParsedTypeBinding, TypeRef } from 'gitnexus-shared';
+import type {
+  CaptureMatch,
+  ParsedImport,
+  ParsedTypeBinding,
+  ScopeId,
+  TypeRef,
+} from 'gitnexus-shared';
+import { canonicalTypeScriptName } from './identifiers.js';
+
+/** Shared empty result for the non-type-only path — see `typeOnly` below. */
+const NO_TYPE_ONLY: { typeOnly?: true } = Object.freeze({});
 
 // ─── interpretImport ──────────────────────────────────────────────────────
 
 export function interpretTsImport(captures: CaptureMatch): ParsedImport | null {
   // Markers attached by `splitImportStatement` (import-decomposer.ts):
-  //   @import.kind   : one of the kinds documented there
-  //   @import.name   : imported name from the source module
-  //   @import.alias  : local alias name (for default / aliased / namespace forms)
-  //   @import.source : module path (always present except dynamic-unresolved)
+  //   @import.kind      : one of the kinds documented there
+  //   @import.name      : imported name from the source module
+  //   @import.alias     : local alias name (for default / aliased / namespace forms)
+  //   @import.source    : module path (always present except dynamic-unresolved)
+  //   @import.type-only : presence-only — this specifier is erased by `tsc`
   const kindCap = captures['@import.kind'];
   const nameCap = captures['@import.name'];
   const aliasCap = captures['@import.alias'];
   const sourceCap = captures['@import.source'];
+  const owner = captures['@import.lookup-scope'];
+  const lexicalOwner = owner ? { declaredAtScope: owner.text as ScopeId } : {};
 
   const kind = kindCap?.text;
   if (kind === undefined) return null;
+
+  // Spread rather than `typeOnly: <boolean>` so a value import keeps the exact
+  // object shape it had before this marker existed — every `ParsedImport`
+  // equality assertion in the suite compares whole objects.
+  // `NO_TYPE_ONLY` is shared rather than a fresh `{}` per import: the spread
+  // reads it and never retains it, and the ~99% of imports that are not
+  // type-only would otherwise each allocate an object to contribute nothing.
+  const typeOnly: { typeOnly?: true } =
+    captures['@import.type-only'] !== undefined ? { typeOnly: true } : NO_TYPE_ONLY;
 
   switch (kind) {
     case 'default': {
@@ -41,20 +64,26 @@ export function interpretTsImport(captures: CaptureMatch): ParsedImport | null {
       if (sourceCap === undefined || aliasCap === undefined) return null;
       return {
         kind: 'alias',
+        ...lexicalOwner,
         localName: aliasCap.text,
         importedName: 'default',
         alias: aliasCap.text,
         targetRaw: sourceCap.text,
+        ...typeOnly,
       };
     }
     case 'named': {
+      // Module keys use their semantic identifier spelling; local bindings keep
+      // their written spelling to match ordinary scope captures and graph IDs.
       // `import { X } from './m'` (plus type-only forms).
       if (sourceCap === undefined || nameCap === undefined) return null;
       return {
         kind: 'named',
+        ...lexicalOwner,
         localName: nameCap.text,
-        importedName: nameCap.text,
+        importedName: canonicalTypeScriptName(nameCap.text),
         targetRaw: sourceCap.text,
+        ...typeOnly,
       };
     }
     case 'named-alias': {
@@ -64,10 +93,12 @@ export function interpretTsImport(captures: CaptureMatch): ParsedImport | null {
       }
       return {
         kind: 'alias',
+        ...lexicalOwner,
         localName: aliasCap.text,
-        importedName: nameCap.text,
+        importedName: canonicalTypeScriptName(nameCap.text),
         alias: aliasCap.text,
         targetRaw: sourceCap.text,
+        ...typeOnly,
       };
     }
     case 'namespace': {
@@ -75,19 +106,24 @@ export function interpretTsImport(captures: CaptureMatch): ParsedImport | null {
       if (sourceCap === undefined || aliasCap === undefined) return null;
       return {
         kind: 'namespace',
+        ...lexicalOwner,
         localName: aliasCap.text,
         importedName: sourceCap.text,
         targetRaw: sourceCap.text,
+        ...typeOnly,
       };
     }
     case 'reexport': {
+      // Re-export names are public module keys, not local lexical bindings.
+      // Decode them just like the names requested from the source module.
       // `export { X } from './m'`.
       if (sourceCap === undefined || nameCap === undefined) return null;
       return {
         kind: 'reexport',
-        localName: nameCap.text,
-        importedName: nameCap.text,
+        localName: canonicalTypeScriptName(nameCap.text),
+        importedName: canonicalTypeScriptName(nameCap.text),
         targetRaw: sourceCap.text,
+        ...typeOnly,
       };
     }
     case 'reexport-alias': {
@@ -97,10 +133,11 @@ export function interpretTsImport(captures: CaptureMatch): ParsedImport | null {
       }
       return {
         kind: 'reexport',
-        localName: aliasCap.text,
-        importedName: nameCap.text,
-        alias: aliasCap.text,
+        localName: canonicalTypeScriptName(aliasCap.text),
+        importedName: canonicalTypeScriptName(nameCap.text),
+        alias: canonicalTypeScriptName(aliasCap.text),
         targetRaw: sourceCap.text,
+        ...typeOnly,
       };
     }
     case 'reexport-wildcard': {
@@ -119,6 +156,7 @@ export function interpretTsImport(captures: CaptureMatch): ParsedImport | null {
         localName: aliasCap.text,
         importedName: sourceCap.text,
         targetRaw: sourceCap.text,
+        ...typeOnly,
       };
     }
     case 'dynamic': {
@@ -309,4 +347,27 @@ function stripQualifier(text: string): string {
   const lastDot = text.lastIndexOf('.');
   if (lastDot === -1) return text;
   return text.slice(lastDot + 1);
+}
+
+/**
+ * Would this interpreter reduce `text` to the type it CONTAINS rather than to
+ * the type it names? True for the array suffix (`Repo[]`) and for every
+ * transparent wrapper on {@link stripGeneric}'s list (`Array<Repo>`,
+ * `Promise<Repo>`, `Set<Repo>`, …).
+ *
+ * Exported for the ONE caller that must decline exactly what this returns true
+ * for: the JavaScript provider's JSDoc `@type` FIELD binding (#2833). Element
+ * reduction is right where it was built — a chain step, a `for…of` variable, an
+ * awaited value — and wrong for a field, whose declared type IS the container:
+ * a field annotated `{Repo[]}` reduced to `Repo` makes `this.repos.find(…)`,
+ * an Array method call, resolve to a repository class's own `find`. A wrong
+ * edge, which #2833 treats as strictly worse than a missing one.
+ *
+ * A predicate rather than a copied name list on purpose: the list lives in
+ * `stripGeneric` and a second copy would drift out of sync silently, exactly
+ * the failure mode `python/interpret.ts` records for its own reduction.
+ */
+export function reducesToContainedType(text: string): boolean {
+  const trimmed = stripReadonly(text.trim());
+  return stripArraySuffix(trimmed) !== trimmed || stripGeneric(trimmed) !== trimmed;
 }

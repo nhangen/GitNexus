@@ -16,10 +16,12 @@ flowchart TD
   D --> E1[TopicExtractor]
   D --> E2[HttpRouteExtractor]
   D --> E3[GrpcExtractor]
+  D --> E4[GraphqlExtractor]
 
   E1 --> F[ExtractedContract array<br/>per repo]
   E2 --> F
   E3 --> F
+  E4 --> F
 
   B --> M[ManifestExtractor]
   M --> G[Manifest contracts<br/>+ cross-links]
@@ -59,13 +61,26 @@ flowchart TD
 
 **Strategy A** (graph-assisted) uses Cypher over edges already produced
 by the main ingestion pipeline:
+
 - HTTP: `HANDLES_ROUTE` / `FETCHES` edges from `(File)-[]->(Route)`
 - topic: none (pipeline doesn't yet produce topic nodes — Strategy B only)
 - gRPC: none (Strategy B + proto map only)
 
-**Strategy B** (source-scan) is 100% tree-sitter based after this PR.
+**Strategy B** (source-scan) uses tree-sitter for language source and the
+official GraphQL parser for `.graphql` / `.gql` operation documents.
 Each `*-patterns/<lang>.ts` plugin owns its grammar + S-expression
 queries; the top-level orchestrator imports neither.
+
+GraphQL detection is opt-in with `detect.graphql: true`. The initial slice
+recognizes imported NestJS `Query`, `Mutation`, and `Subscription` decorators on
+top-level imported `Resolver` classes, plus named operation documents. Generated
+object documents, static `gql` templates, and `TypedDocumentString` values are
+verified against the operation and its resolved root fragments. Providers and
+consumers must resolve to one exact, real graph symbol; anonymous operations,
+dynamic decorator names, ambiguous generated symbols, malformed documents,
+symlink escapes, and bounded-parser overflows are skipped rather than linked
+approximately. `matching.exclude_links_paths` also suppresses configured GraphQL
+root fields from exact cross-linking while retaining their registry entries.
 
 ## Plugin architecture
 
@@ -112,11 +127,26 @@ flowchart TD
   EMIT --> BRIDGE[(bridge.lbug<br/>#795)]
 ```
 
-Label-scoped queries in `resolveSymbol` keep accidental cross-matches
-out:
-- `topic` → `(n:Function|Method|Class|Interface)`
-- `grpc` method → `(n:Function|Method)`, service → `(n:Class|Interface)`
-- `lib` → `(n:Package|Module)`
+Label-scoped queries in `resolveSymbol` keep accidental cross-matches out.
+They use the `MATCH (n) WHERE labels(n) IN [...]` allowlist form, NOT the
+`MATCH (n:A|B)` disjunction — LadybugDB's parser rejects a disjunction that
+names a reserved keyword (e.g. `Macro`, `Union`), which is what broke the
+`custom` branch in #2325:
+
+- `topic` → `labels(n) IN ['Function','Method','Class','Interface']`
+- `grpc`/`thrift` method → `labels(n) IN ['Function','Method']`, service → `labels(n) IN ['Class','Interface']`
+- `lib` → `labels(n) IN ['Module']`
+
+Manifest contracts also go through the exact and wildcard passes. A
+consumer created from a link only matches providers in the repo that link
+names (#1188), so a route another repo happens to share does not pick up
+an extra cross-link. `meta.providerRepo` carries the declared repo through
+matching, and sync drops it before writing the registry.
+
+This applies to every link type, so a `topic` link matches only the
+publisher it names. Two things still match across the whole group:
+consumers the extractors find in source, and the provider contract a link
+creates, which any source consumer of the same contract can match.
 
 ## Cross-impact query (PR #606)
 
@@ -137,3 +167,28 @@ The bridge stores every extracted contract keyed by `symbolUid`.
 Manifest-sourced contracts use the synthetic uid form so both sides
 of the `(local impact) ↔ (bridge query)` join derive the same uid
 without coordinating through any shared state.
+
+## Cross-repo trace (`cross-trace.ts`)
+
+A second consumer of the bridge. Where cross-impact fans a blast radius
+_outward_ from one symbol, cross-trace stitches a directed **path** between
+two symbols that live in different repos:
+
+```mermaid
+flowchart TD
+  FT[from / to resolved<br/>across all members] --> SR{same repo?}
+  SR -- yes --> LT[single-repo trace<br/>no crossing]
+  SR -- no --> SEGA[trace: from → consumer symbol<br/>in home repo]
+  SEGA --> XB[Bridge pair query<br/>consumer.symbolUid → provider.symbolUid<br/>one ContractLink boundary]
+  XB --> SEGB[trace: provider symbol → to<br/>in target repo]
+  SEGB --> STITCH[stitched hops + CONTRACT_LINK edge<br/>+ optional REACHING_DEF data-flow]
+```
+
+It reuses the same `symbolUid` join as cross-impact, but issues its own
+_pair_ query (`listCrossingsBetween`) because a path needs BOTH endpoints of
+a crossing — the uid-filtered neighbor join (`resolveBridgeNeighbors`, shared
+with impact) returns only the far side. The crossing is clamped to one
+boundary (`MAX_SUPPORTED_CROSS_DEPTH`). With `pdg: true` the boundary-adjacent
+segments are enriched with intra-procedural REACHING_DEF data-flow (never
+across the boundary). Full cross-program data flow across the boundary is a
+deferred follow-up.

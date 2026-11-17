@@ -1,0 +1,461 @@
+import type { ParsedFile, SymbolDefinition, TypeRef } from 'gitnexus-shared';
+import {
+  findClassBindingInScope,
+  findEnclosingClassDef,
+} from '../../scope-resolution/scope/walkers.js';
+import { SupportedLanguages } from 'gitnexus-shared';
+import {
+  populateClassOwnedMembers,
+  tagNamespacePrefixes,
+} from '../../scope-resolution/scope/walkers.js';
+import type { ScopeResolver } from '../../scope-resolution/contract/scope-resolver.js';
+import { extractElementTypeFromString } from '../../type-extractors/shared.js';
+import { cppProvider } from '../c-cpp.js';
+import { cppArityCompatibility } from './arity.js';
+import { CPP_CONVERSION_ONLY_ARG_TYPE_PREFIXES, cppConversionRank } from './conversion-rank.js';
+import { cppMergeBindings } from './merge-bindings.js';
+import { resolveCppImportTarget } from './import-target.js';
+import { cIncludeLookupFromConfig } from '../c/import-target.js';
+import {
+  CPP_HEADER_EXTENSIONS,
+  cFamilyImportFiles,
+  loadCFamilyResolutionConfig,
+} from '../c/resolution-config.js';
+import {
+  expandCppWildcardNames,
+  isFileLocal,
+  clearFileLocalNames,
+  populateCppAnonymousNamespaceScopes,
+  populateCppNonGloballyVisible,
+  isCppDefGloballyVisible,
+} from './file-local-linkage.js';
+import {
+  populateCppDependentBases,
+  clearCppDependentBases,
+  isCppDependentBaseMember,
+} from './two-phase-lookup.js';
+import { populateCppAssociatedNamespaces, clearCppAdlState, pickCppAdlCandidates } from './adl.js';
+import {
+  findCallableBindingsAndAdlBlocker,
+  populateCppIncludedOverloads,
+} from './callable-bindings.js';
+import { applyCppCaptureSideChannel } from './capture-side-channel.js';
+import {
+  clearCppInlineNamespaces,
+  populateCppInlineNamespaceScopes,
+  resolveCppQualifiedNamespaceMember,
+  splitCppQualifiedCallee,
+} from './inline-namespaces.js';
+import { populateCppRangeBindings } from './range-bindings.js';
+import { cppConstraintCompatibility } from './constraint-filter.js';
+import {
+  clearCppUserDefinedConversions,
+  populateCppUserDefinedConversions,
+} from './user-defined-conversions.js';
+import {
+  buildCppMemberLookupMro,
+  clearCppMemberLookupState,
+  resolveCppReceiverMember,
+} from './member-lookup.js';
+import { stripCppSpecifiers } from './interpret.js';
+import { perFileSet } from '../../utils/per-file-set.js';
+import {
+  clearCppUsingDeclarations,
+  populateCppIncludedUsingClaims,
+  populateCppUsingBindings,
+  cppQualifiedTypeLookupSpelling,
+} from './using-bindings.js';
+
+/** A pointee worth binding: a bare identifier, not `T**`, `T[]`, `A::B` or a
+ *  template spelling. Hoisted — a literal here would mint a fresh RegExp on
+ *  every subscript the resolver folds. */
+const CPP_SIMPLE_POINTEE_RE = /^[A-Za-z_]\w*$/;
+
+/**
+ * Per-pass memo of the augmented `#include`-resolution file set
+ * (`allFilePaths` ∪ header paths), keyed on the two stable source sets.
+ * `resolveImportTarget` is called once per C++ `#include`; the old code rebuilt
+ * a fresh ~F-entry `Set` on every call AND defeated the shared
+ * `resolveCImportTarget` suffix-index memo (in `c/import-target.ts`) by handing
+ * it a new set identity each time. Both inputs are stable per pass, so the
+ * union is built once and reused. Reclaimed with the pass.
+ *
+ * Two inputs, so two levels of `perFileSet` composed rather than a second
+ * primitive: the outer memo's value is the inner memo, and a function is an
+ * object, which is all `T extends object` asks for.
+ *
+ * (Twin of the C resolver's `augmentedFilePathsFor`.) The two memos stay
+ * SEPARATE deliberately. C++ delegates to `resolveCImportTarget`, whose
+ * `suffixIndex` memo is keyed on the augmented set, so a single memo shared
+ * with C would hand each language the other's index. Sharing a builder must
+ * not share its memo.
+ */
+const augmentedFilePathsFor = perFileSet((allFilePaths: ReadonlySet<string>) =>
+  perFileSet((headerPaths: ReadonlySet<string>): ReadonlySet<string> => {
+    const set = new Set(allFilePaths);
+    for (const h of headerPaths) set.add(h);
+    return set;
+  }),
+);
+
+/**
+ * C++ `ScopeResolver` registered in `SCOPE_RESOLVERS` and consumed by
+ * the generic `runScopeResolution` orchestrator (RFC #909 Ring 3).
+ *
+ * C++ extends C's scope resolution with:
+ *   - Namespaces (`namespace foo { ... }`)
+ *   - Classes with methods and multiple inheritance
+ *   - `using namespace` (wildcard import from namespace)
+ *   - `using X::name` (named import from namespace)
+ *   - Anonymous namespace (file-local linkage, like C `static`)
+ *   - Default parameters (requiredParameterCount < parameterCount)
+ *   - Overloading (arity-based disambiguation)
+ *   - Templates (V1: generic-ignored, `List<User>` ≡ `List`)
+ *   - Leftmost-base MRO for multiple inheritance
+ */
+export const cppScopeResolver: ScopeResolver = {
+  language: SupportedLanguages.CPlusPlus,
+  languageProvider: cppProvider,
+  importEdgeReason: 'cpp-scope: include',
+
+  loadResolutionConfig: (repoPath: string) => {
+    // Clear stale per-pipeline state from any previous invocation.
+    clearFileLocalNames();
+    clearCppDependentBases();
+    clearCppAdlState();
+    clearCppInlineNamespaces();
+    clearCppUserDefinedConversions();
+    clearCppMemberLookupState();
+    clearCppUsingDeclarations();
+    return loadCFamilyResolutionConfig(repoPath, CPP_HEADER_EXTENSIONS);
+  },
+
+  resolveImportTarget: (targetRaw, fromFile, allFilePaths, resolutionConfig, context) => {
+    // Same adapter as C, with this file's own augmented-set memo. C++
+    // `#include` then goes through `resolveCppImportTarget`, whose suffix
+    // index is also private to C++.
+    const { files, config } = cFamilyImportFiles(
+      allFilePaths,
+      resolutionConfig,
+      augmentedFilePathsFor(allFilePaths),
+    );
+    const parsed = context?.parsedImport;
+    const isSystem = parsed?.kind === 'wildcard' && parsed.isSystem === true;
+    return resolveCppImportTarget(
+      targetRaw,
+      fromFile,
+      files,
+      cIncludeLookupFromConfig(config, isSystem),
+    );
+  },
+
+  expandsWildcardTo: (targetModuleScope, parsedFiles) =>
+    expandCppWildcardNames(targetModuleScope, parsedFiles),
+
+  mergeBindings: (existing, incoming, scopeId) => cppMergeBindings(existing, incoming, scopeId),
+
+  // Adapter: cppArityCompatibility predates ScopeResolver and uses
+  // (def, callsite). ScopeResolver contract is (callsite, def).
+  arityCompatibility: (callsite, def) => cppArityCompatibility(def, callsite),
+
+  // SFINAE / `requires`-clause aware overload filter (issue #1579).
+  // Drops candidates whose template constraints (`enable_if_t<P, T>`,
+  // C++20 `requires P`) provably fail at the call site. Three-valued —
+  // `'unknown'` keeps the candidate, preserving "degrade not lie".
+  constraintCompatibility: cppConstraintCompatibility,
+
+  buildMro: buildCppMemberLookupMro,
+
+  // Worker-boundary restore (see `ScopeResolver.applyCaptureSideChannel`).
+  // `emitCppScopeCaptures` records per-file ADL call-site arg shapes
+  // (`markCppAdlSiteArgs`/`markCppAdlSiteNoAdl`), inline-/anonymous-namespace
+  // ranges (`markCppInlineNamespaceRange`/`markCppAnonymousNamespaceRange`),
+  // dependent-base names (`markCppDependentBase`/`markCppDependentPackBase`),
+  // and file-local linkage (`markFileLocal`) into module-level maps as a SIDE
+  // EFFECT — none of it is serialized onto the returned ParsedFile's scopes/defs.
+  // On the worker path those marks are populated in the worker process and lost
+  // across the MessageChannel / disk store; the main thread reuses the
+  // serialized ParsedFile and skips `extractParsedFile`, so `populateOwners` +
+  // the ADL / two-phase-lookup passes would see empty maps and emit zero edges.
+  // The worker stashed a plain-data snapshot on `parsed.captureSideChannel` via
+  // `cppProvider.collectCaptureSideChannel`; this restores it into the module
+  // maps WITHOUT any tree-sitter re-parse (the #1983 fix — the old re-parse
+  // replay re-OOM'd huge `.h`/`.cpp` repos). The freshly-extracted leg never
+  // calls this — its marks were just populated in this process.
+  applyCaptureSideChannel: applyCppCaptureSideChannel,
+
+  populateOwners: (parsed: ParsedFile) => {
+    populateClassOwnedMembers(parsed);
+    // #1982: tag namespace-nested defs with their enclosing-namespace prefix so
+    // resolveDefGraphId can map them to the namespace-qualified structure-phase
+    // node (`NS.A.Inner`) instead of collapsing same-tail nested bases via the
+    // simpleKey fallback. Does NOT change qualifiedName (resolution unaffected).
+    tagNamespacePrefixes(parsed);
+    // Resolve inline- and anonymous-namespace ranges (recorded at capture
+    // time) to ScopeIds BEFORE `populateCppNonGloballyVisible` runs, so
+    // both exemptions see the populated Sets.
+    populateCppInlineNamespaceScopes(parsed);
+    populateCppAnonymousNamespaceScopes(parsed);
+    // Track namespace-nested and class-nested defs so the global free-call
+    // fallback and wildcard expansion can suppress them as unqualified
+    // cross-file callables.
+    populateCppNonGloballyVisible(parsed);
+    // Build the class-def → enclosing-namespace-qualified-name map used
+    // by ADL (U2 of plan 2026-05-13-001) to identify each argument type's
+    // associated namespace for Koenig lookup.
+    populateCppAssociatedNamespaces(parsed);
+    // Build conservative one-step user-defined conversion facts for
+    // overload ranking (#1631): implicit converting constructors only,
+    // with no chaining or conversion-operator handling.
+    populateCppUserDefinedConversions(parsed);
+  },
+
+  // Resolve recorded template-class → dependent-base simple names to
+  // class nodeIds for two-phase template lookup (U3 of plan
+  // 2026-05-13-001). Runs AFTER all files have had `populateOwners`
+  // applied so that cross-file base classes (e.g. Base in base.h,
+  // Derived in derived.h) are reachable in the workspace index.
+  populateWorkspaceOwners: (parsedFiles: readonly ParsedFile[]) => {
+    populateCppDependentBases(parsedFiles);
+  },
+
+  populateWorkspaceReferences: (parsedFiles, context) => {
+    const allFilePaths = new Set(parsedFiles.map((parsed) => parsed.filePath));
+    populateCppIncludedUsingClaims(parsedFiles, (parsed, imported) =>
+      cppScopeResolver.resolveImportTarget(
+        imported.targetRaw,
+        parsed.filePath,
+        allFilePaths,
+        context.resolutionConfig,
+        { parsedFiles, parsedImport: imported },
+      ),
+    );
+  },
+
+  populateNamespaceSiblings: (parsedFiles, indexes) => {
+    // Name-keyed return facts cannot choose between free overloads whose
+    // return types differ. Keep their declaration identities, drop the guess.
+    for (const parsed of parsedFiles) {
+      for (const scope of parsed.scopes) {
+        if (scope.kind !== 'Module' && scope.kind !== 'Namespace') continue;
+        const returns = new Map<string, Set<string | undefined>>();
+        for (const definition of scope.ownedDefs) {
+          if (definition.type !== 'Function' || definition.qualifiedName === undefined) continue;
+          const name = definition.qualifiedName.slice(
+            definition.qualifiedName.lastIndexOf('.') + 1,
+          );
+          const types = returns.get(name) ?? new Set<string | undefined>();
+          types.add(definition.returnType);
+          returns.set(name, types);
+        }
+        for (const [name, types] of returns)
+          if (types.size > 1 && scope.typeBindings.get(name)?.source === 'return-annotation')
+            (scope.typeBindings as Map<string, TypeRef>).delete(name);
+      }
+    }
+    populateCppUsingBindings(parsedFiles, indexes);
+    populateCppIncludedOverloads(indexes);
+  },
+
+  // Simple `isSuperReceiver` returns false for C++. Real super
+  // classification is caller-context-dependent and lives in
+  // `isSuperReceiverInContext` below — without scope context the
+  // previous regex `/^[A-Z]\w*::/` misclassified namespace-qualified
+  // calls (e.g., `Singleton::getInstance()`) as super calls and routed
+  // them through the wrong resolution branch.
+  isSuperReceiver: () => false,
+
+  isSuperReceiverInContext: (text, callerScope, scopes) => {
+    // The receiver text comes from the LHS of `::` in `qualified_identifier`
+    // (e.g., for `Base<T>::method()`, text is `Base<T>`). Strip template
+    // arguments (V1: name-only matching, generics ignored) and any leading
+    // namespace qualifier so the lookup matches the bare class def's
+    // simple name. `Base<T>::method()` → `Base`; `outer::v1::Base<T>` →
+    // `Base`. This handles the Phase 5 cross-unit composition where
+    // qualified base-method calls appear inside template bodies.
+    let lhs = text;
+    const sepIdx = lhs.indexOf('::');
+    if (sepIdx > 0) lhs = lhs.slice(0, sepIdx).trim();
+    // Strip trailing template-argument list (greedy: drop everything from
+    // the first `<` onward — V1 ignores generics).
+    const lt = lhs.indexOf('<');
+    if (lt > 0) lhs = lhs.slice(0, lt).trim();
+    // Strip nested namespace prefix from the receiver text itself (the
+    // `outer::v1::Base` shape that appears in derived-list `base_class_clause`).
+    const lastDoubleColon = lhs.lastIndexOf('::');
+    if (lastDoubleColon >= 0) lhs = lhs.slice(lastDoubleColon + 2).trim();
+    if (lhs.length === 0) return false;
+
+    // Resolve the LHS in the caller's scope chain. Only class-like
+    // resolutions can be super receivers; Namespace and unresolved
+    // names are not super calls.
+    const lhsDef = findClassBindingInScope(callerScope, lhs, scopes);
+    if (lhsDef === undefined) return false;
+
+    // The caller must have an enclosing class — super calls only make
+    // sense inside a class body. Free functions can use `ClassName::`
+    // for namespace-qualified calls but those are not super.
+    const enclosing = findEnclosingClassDef(callerScope, scopes);
+    if (enclosing === undefined) return false;
+
+    // `lhsDef` must be in the caller's MRO (i.e., the caller's enclosing
+    // class derives from it). The class itself counts as its own MRO
+    // root — `Self::method()` is a qualified self-call, not a super
+    // call, so exclude the caller's own class.
+    if (lhsDef.nodeId === enclosing.nodeId) return false;
+    const mro = scopes.methodDispatch.mroFor(enclosing.nodeId);
+    return mro.includes(lhsDef.nodeId);
+  },
+
+  // Subscript route only — C++ collection views are method calls.
+  //
+  // Two container spellings reach a subscript. A POINTER is one of them: `p[i]`
+  // on a `User*` is pointer arithmetic yielding a `User`, so the trailing `*` is
+  // peeled here rather than by `stripTypePreservingDecoration` (C++ declares
+  // none) — and peeling it at a bare class lookup instead would be wrong, since
+  // that is the route by which `p->m()` must keep seeing `User`'s own members.
+  // The other is a template container (`std::vector<User>`), left to the shared
+  // extractor.
+  //
+  // Fed the annotation AS WRITTEN, since `normalizeCppTypeName` strips both the
+  // star and the array brackets at capture. `undefined` = "not a container", so
+  // an `operator[]`-bearing class does not fold `grid[0]` onto `Grid`.
+  elementTypeOf: (containerType, via) => {
+    if (via.kind !== 'index') return undefined;
+    const t = stripCppSpecifiers(containerType);
+    if (t.endsWith('*')) {
+      const pointee = t.slice(0, -1).trim();
+      return CPP_SIMPLE_POINTEE_RE.test(pointee) ? pointee : undefined;
+    }
+    return extractElementTypeFromString(t);
+  },
+
+  // C++ is statically typed — disable field fallback heuristic
+  fieldFallbackOnMethodLookup: false,
+  // C++ needs return type propagation across #include boundaries
+  propagatesReturnTypesAcrossImports: true,
+  // C++ #include brings in all symbols — enable global free call fallback
+  allowGlobalFreeCallFallback: true,
+  // C++ standard-conversion-sequence ranking for overload resolution (#1578).
+  // Disambiguates `f(int)` vs `f(double)` called with `f(2.5)` by scoring
+  // each candidate's conversion cost; exact match wins over standard conversion.
+  conversionRankFn: cppConversionRank,
+  conversionOnlyArgTypePrefixes: CPP_CONVERSION_ONLY_ARG_TYPE_PREFIXES,
+  // Range-for element type inference: for (auto& user : users) → bind user to User
+  populateRangeBindings: populateCppRangeBindings,
+  // Return bindings stay with their declaring class or namespace. An absent
+  // method fact must not borrow a same-name free function's return type.
+  // Enable receiver-bound explicit-`this` fallback only for C++.
+  resolveThisViaEnclosingClass: true,
+  // `rp::C x`, `void f(a::Config c)`: the capture keeps the qualifier, and
+  // neither `#include` (no namespace handle) nor the index (`rp::C` keyed as
+  // `C`) lets the shared receiver lookups read it. Resolve it the way a
+  // qualified base class already resolves — qualifier matched against the
+  // candidate's namespace, refuse on a tie — rather than by its tail, which
+  // binds the nearer same-named class the qualifier was written to exclude.
+  resolveQualifiedTypeSpellings: true,
+  qualifiedTypeLookupSpelling: cppQualifiedTypeLookupSpelling,
+  resolveReceiverMember: resolveCppReceiverMember,
+  // The `isFileLocalDef` hook on the global free-call fallback names
+  // file-local linkage historically, but semantically gates "logically
+  // invisible cross-file" defs. C++ extends this to also reject class-
+  // owned methods/fields and namespace-nested symbols — an unqualified
+  // call from a free function MUST NOT resolve to `User::save` or
+  // `ns::foo` (Cppreference, "Unqualified name lookup"). Without this
+  // gate, the global fallback walks every callable in the workspace
+  // registry and matches any class method or namespace function by
+  // simple name.
+  isFileLocalDef: (def: SymbolDefinition) => {
+    const simple = def.qualifiedName?.split('.').pop() ?? def.qualifiedName ?? '';
+    if (isFileLocal(def.filePath, simple)) return true;
+    // Class-owned (Method/Field) — `populateClassOwnedMembers` already
+    // stamps `ownerId`; cheap fast-path before consulting the scope map.
+    if (def.ownerId !== undefined) return true;
+    // Namespace-nested defs — require qualification cross-file. Scope-
+    // walked at `populateOwners` time into a per-file nodeId set.
+    if (!isCppDefGloballyVisible(def.filePath, def.nodeId)) return true;
+    return false;
+  },
+
+  // Keep declaration/definition identity narrower than the global free-call
+  // visibility gate above: namespace and class ownership do not imply
+  // internal linkage, while a namespace-scope `static` function does.
+  hasFileLocalCallableLinkage: (def: SymbolDefinition) => {
+    // Class members have EXTERNAL linkage even when declared `static` —
+    // inside a class, `static` means "no instance", not internal linkage.
+    // The name-keyed set below is populated from every `static` declaration,
+    // so without this gate a header-declared static member refused its
+    // cross-file definition join (#2522 review, M2).
+    if (def.type === 'Method' || def.type === 'Constructor') return false;
+    const simple = def.qualifiedName?.split('.').pop() ?? def.qualifiedName ?? '';
+    return isFileLocal(def.filePath, simple);
+  },
+
+  // C++ two-phase template lookup: inside a class template body,
+  // unqualified calls MUST NOT bind to members of a dependent base
+  // class. The standard requires `this->name()` or `Base<T>::name()`
+  // forms to make the lookup dependent. Without this gate the global
+  // free-call fallback walks the workspace registry and silently binds
+  // unqualified calls to dependent-base members, producing CALLS edges
+  // the compiler would reject. See plan 2026-05-13-001 U3.
+  isCallableVisibleFromCaller: ({ candidate, callerScope, scopes }) => {
+    if (callerScope === undefined || scopes === undefined) return true;
+    // Reject when the candidate is a member of a dependent base of the
+    // caller's enclosing template class. Otherwise allow.
+    return !isCppDependentBaseMember(callerScope, candidate, scopes);
+  },
+
+  // C++ argument-dependent / Koenig lookup (U2 of plan 2026-05-13-001).
+  // Contributes candidates from associated namespaces of class-typed
+  // arguments; caller merges with ordinary unqualified lookup candidates.
+  // Current boundary: class-typed value/pointer/reference args and template
+  // specializations with explicit type arguments contribute associated
+  // namespaces. Function-pointer args and full conversion-ranking remain
+  // excluded.
+  resolveAdlCandidates: pickCppAdlCandidates,
+  resolveOrdinaryCallables: findCallableBindingsAndAdlBlocker,
+
+  // C++ qualified namespace-member resolution (U5 of plan 2026-05-13-001).
+  // Handles `outer::foo()` where `outer` is a namespace (not a class).
+  // Walks each parsed file's namespace scopes by simple name, then
+  // descends transitively through inline-namespace children when
+  // searching for the called member. Returns undefined for non-namespace
+  // receivers so receiver-bound-calls Case 2 still gets a chance.
+  resolveQualifiedReceiverMember: (
+    receiverName,
+    memberName,
+    callerScope,
+    scopes,
+    parsedFiles,
+    callsite,
+  ) =>
+    resolveCppQualifiedNamespaceMember(
+      receiverName,
+      memberName,
+      parsedFiles,
+      scopes,
+      callsite,
+      callerScope,
+    ),
+  // `auto x = rp::make(); x.m()` / `rp::make().m()`: map the callee text back
+  // onto the receiver/member pair the call capture used, so the hook above
+  // answers the factory's definition the way it answered the call.
+  splitQualifiedCallee: (callee, callerScope, scopes, position) => {
+    // The namespace-member resolver does not bind aliases. Decline instead
+    // of treating an alias as an unrelated namespace with the same name.
+    if (
+      callerScope !== undefined &&
+      cppQualifiedTypeLookupSpelling(
+        {
+          rawName: callee,
+          declaredAtScope: callerScope,
+          source: 'assignment-inferred',
+          lookupPosition: position,
+        },
+        scopes,
+      ) !== undefined
+    )
+      return undefined;
+    return splitCppQualifiedCallee(callee, callerScope, scopes, position);
+  },
+};

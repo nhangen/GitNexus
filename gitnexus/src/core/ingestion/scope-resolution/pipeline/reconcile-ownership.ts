@@ -18,8 +18,8 @@
  * undefined `ownerId` is reachable via either:
  *   - `model.methods.lookupAllByOwner(ownerId, simpleName)` — if the
  *     def is a Method / Function / Constructor, OR
- *   - `model.fields.lookupFieldByOwner(ownerId, simpleName)` — if the
- *     def is a Property / Variable.
+ *   - `model.fields.lookupAllByOwner(ownerId, simpleName)` — if the
+ *     def is a Property / Variable / Const / Static.
  *
  * This invariant is the foundation of Contract Invariant I9
  * (`contract/scope-resolver.ts`): scope-resolution passes MUST read
@@ -45,11 +45,29 @@ import type { ParsedFile } from 'gitnexus-shared';
 import type { MutableSemanticModel, SemanticModel } from '../../model/semantic-model.js';
 import { simpleQualifiedName } from '../graph-bridge/ids.js';
 
+const NESTED_TYPE_KINDS = new Set<string>([
+  'Class',
+  'Interface',
+  'Enum',
+  'Struct',
+  'Union',
+  'Trait',
+  'TypeAlias',
+  'Typedef',
+  'Record',
+  'Delegate',
+  'Annotation',
+  'Template',
+  'Namespace',
+]);
+
 export interface ReconcileStats {
   /** Method/Function/Constructor defs registered into MethodRegistry. */
   readonly methodsRegistered: number;
   /** Property/Variable defs registered into FieldRegistry. */
   readonly fieldsRegistered: number;
+  /** Class-like nested type defs registered into TypeRegistry by owner. */
+  readonly nestedTypesRegistered: number;
   /** Defs already present (idempotent skip). */
   readonly skippedAlreadyPresent: number;
 }
@@ -60,36 +78,160 @@ export function reconcileOwnership(
 ): ReconcileStats {
   let methodsRegistered = 0;
   let fieldsRegistered = 0;
+  let nestedTypesRegistered = 0;
   let skippedAlreadyPresent = 0;
+  const fieldNodeIds = registeredNodeIds((owner, name) =>
+    model.fields.lookupAllByOwner(owner, name),
+  );
+  const nestedTypeNodeIds = registeredNodeIds((owner, name) =>
+    model.types.lookupAllByOwner(owner, name),
+  );
 
   for (const parsed of parsedFiles) {
     for (const def of parsed.localDefs) {
       const ownerId = (def as { ownerId?: string }).ownerId;
-      if (ownerId === undefined) continue;
       const simple = simpleQualifiedName(def);
       if (simple === undefined) continue;
 
       if (def.type === 'Method' || def.type === 'Function' || def.type === 'Constructor') {
+        if (ownerId === undefined) {
+          if (def.isDeleted !== true) continue;
+          const existingDef = model.symbols
+            .lookupExactAll(def.filePath, simple)
+            .find((candidate) => callableSignatureMatches(candidate, def));
+          if (existingDef !== undefined) {
+            existingDef.isDeleted = true;
+            skippedAlreadyPresent++;
+            continue;
+          }
+          model.symbols.add(def.filePath, simple, def.nodeId, def.type, {
+            parameterCount: def.parameterCount,
+            requiredParameterCount: def.requiredParameterCount,
+            parameterTypes: def.parameterTypes,
+            parameterTypeClasses: def.parameterTypeClasses,
+            returnType: def.returnType,
+            qualifiedName: def.qualifiedName,
+            isDeleted: true,
+          });
+          continue;
+        }
+        // Only owned callables reach this scan, so the bucket holds one owner's
+        // overloads; it also matches a deleted def by signature, not node id.
         const existing = model.methods.lookupAllByOwner(ownerId, simple);
-        if (existing.some((e) => e.nodeId === def.nodeId)) {
+        const existingDef = existing.find(
+          (candidate) =>
+            candidate.nodeId === def.nodeId ||
+            (def.isDeleted === true && callableSignatureMatches(candidate, def)),
+        );
+        if (existingDef !== undefined) {
+          if (def.isDeleted === true) {
+            existingDef.isDeleted = true;
+          }
           skippedAlreadyPresent++;
           continue;
         }
         model.methods.register(ownerId, simple, def);
         methodsRegistered++;
-      } else if (def.type === 'Property' || def.type === 'Variable') {
-        const existing = model.fields.lookupFieldByOwner(ownerId, simple);
-        if (existing !== undefined && existing.nodeId === def.nodeId) {
+      } else if (
+        def.type === 'Property' ||
+        def.type === 'Variable' ||
+        def.type === 'Const' ||
+        def.type === 'Static'
+      ) {
+        // File-scoped values remain in the symbol/scope indexes. Owner-keyed
+        // registries serve member lookup only; `undefined` is not an owner.
+        if (ownerId === undefined) continue;
+        if (fieldNodeIds.has(ownerId, simple, def.nodeId)) {
           skippedAlreadyPresent++;
           continue;
         }
         model.fields.register(ownerId, simple, def);
+        fieldNodeIds.add(ownerId, simple, def.nodeId);
         fieldsRegistered++;
+      } else if (NESTED_TYPE_KINDS.has(def.type)) {
+        if (ownerId === undefined) continue;
+        if (nestedTypeNodeIds.has(ownerId, simple, def.nodeId)) {
+          skippedAlreadyPresent++;
+          continue;
+        }
+        model.types.registerByOwner(ownerId, simple, def);
+        nestedTypeNodeIds.add(ownerId, simple, def.nodeId);
+        nestedTypesRegistered++;
       }
     }
   }
 
-  return { methodsRegistered, fieldsRegistered, skippedAlreadyPresent };
+  return { methodsRegistered, fieldsRegistered, nestedTypesRegistered, skippedAlreadyPresent };
+}
+
+/**
+ * A bucket up to this long is scanned for the duplicate check; a longer one
+ * gets a node-id set. Most `(owner, name)` keys hold one def (a class's
+ * fields), and a set per key cost more time and memory there than the scan
+ * it replaced.
+ */
+const SCAN_LIMIT = 8;
+
+/**
+ * Answers "is this node id already registered under `(owner, name)`?" for one
+ * owner-keyed registry, without rescanning a long bucket for every def.
+ *
+ * Owned members with the same name share a bucket. Large generated classes
+ * can still have many declarations under one key, so duplicate detection
+ * must not scan that bucket for every def. Ownerless fields/types are skipped
+ * before this helper; file-scoped lookup uses the symbol/scope indexes.
+ *
+ * A short bucket is scanned in the registry, as before. Once a key's bucket is
+ * longer than `SCAN_LIMIT` its node ids are read into a set, and the caller
+ * keeps that set current through `add` after each registration; nothing else
+ * writes these registries while the pass runs. Sets are keyed by owner, then
+ * name, like the registries themselves.
+ */
+function registeredNodeIds(
+  lookupAll: (owner: string | undefined, name: string) => readonly { readonly nodeId: string }[],
+): {
+  has(owner: string | undefined, name: string, nodeId: string): boolean;
+  add(owner: string | undefined, name: string, nodeId: string): void;
+} {
+  const byOwner = new Map<string | undefined, Map<string, Set<string>>>();
+  return {
+    has(owner, name, nodeId) {
+      const ids = byOwner.get(owner)?.get(name);
+      if (ids !== undefined) return ids.has(nodeId);
+      const bucket = lookupAll(owner, name);
+      if (bucket.length <= SCAN_LIMIT) return bucket.some((def) => def.nodeId === nodeId);
+      const promoted = new Set<string>();
+      for (const def of bucket) promoted.add(def.nodeId);
+      let byName = byOwner.get(owner);
+      if (byName === undefined) {
+        byName = new Map();
+        byOwner.set(owner, byName);
+      }
+      byName.set(name, promoted);
+      return promoted.has(nodeId);
+    },
+    add(owner, name, nodeId) {
+      byOwner.get(owner)?.get(name)?.add(nodeId);
+    },
+  };
+}
+
+function callableSignatureMatches(
+  left: ParsedFile['localDefs'][number],
+  right: ParsedFile['localDefs'][number],
+): boolean {
+  if (left.filePath !== right.filePath) return false;
+  if (left.parameterCount !== right.parameterCount) return false;
+  if (left.requiredParameterCount !== right.requiredParameterCount) return false;
+  const leftTypes = left.parameterTypes;
+  const rightTypes = right.parameterTypes;
+  if (leftTypes === undefined || rightTypes === undefined) {
+    return leftTypes === rightTypes;
+  }
+  return (
+    leftTypes.length === rightTypes.length &&
+    leftTypes.every((parameterType, index) => parameterType === rightTypes[index])
+  );
 }
 
 /**
@@ -131,12 +273,26 @@ export function validateOwnershipParity(
           );
           mismatches++;
         }
-      } else if (def.type === 'Property' || def.type === 'Variable') {
-        const found = model.fields.lookupFieldByOwner(ownerId, simple);
-        if (found === undefined || found.nodeId !== def.nodeId) {
+      } else if (
+        def.type === 'Property' ||
+        def.type === 'Variable' ||
+        def.type === 'Const' ||
+        def.type === 'Static'
+      ) {
+        const found = model.fields.lookupAllByOwner(ownerId, simple);
+        if (!found.some((d) => d.nodeId === def.nodeId)) {
           onWarn(
             `semantic-model parity: ${def.type} ${def.nodeId} (${parsed.filePath}) ` +
               `owned by ${ownerId} as "${simple}" not in FieldRegistry`,
+          );
+          mismatches++;
+        }
+      } else if (NESTED_TYPE_KINDS.has(def.type)) {
+        const found = model.types.lookupAllByOwner(ownerId, simple);
+        if (!found.some((d) => d.nodeId === def.nodeId)) {
+          onWarn(
+            `semantic-model parity: ${def.type} ${def.nodeId} (${parsed.filePath}) ` +
+              `owned by ${ownerId} as "${simple}" not in TypeRegistry owner index`,
           );
           mismatches++;
         }

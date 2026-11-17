@@ -18,15 +18,35 @@ export type { NodeTableName, RelType } from './lbug/schema-constants.js';
 
 // Language support
 export { SupportedLanguages } from './languages.js';
-export { getLanguageFromFilename, getSyntaxLanguageFromFilename } from './language-detection.js';
+export {
+  getLanguageFromFilename,
+  getSyntaxLanguageFromFilename,
+  isBladeTemplateFilename,
+  isNotebookFilename,
+} from './language-detection.js';
 export type { MroStrategy } from './mro-strategy.js';
+
+// Impact risk scoring
+export { scoreImpactRisk, unusedAxesForImpactWalk } from './impact-risk.js';
+export type {
+  ImpactRisk,
+  ImpactRiskAxis,
+  ImpactRiskInput,
+  ImpactRiskResult,
+  UnusedImpactRiskAxis,
+  UnusedImpactRiskReason,
+} from './impact-risk.js';
 
 // Pipeline progress
 export type { PipelinePhase, PipelineProgress } from './pipeline.js';
 
 // ─── Scope-based resolution — RFC #909 (Ring 1 #910) ────────────────────────
 // Data model (RFC §2)
-export type { SymbolDefinition } from './scope-resolution/symbol-definition.js';
+export type {
+  ParameterTypeClass,
+  SymbolDefinition,
+  TypeParameter,
+} from './scope-resolution/symbol-definition.js';
 export type {
   ScopeId,
   DefId,
@@ -79,7 +99,29 @@ export type { ResolveTypeRefContext } from './scope-resolution/resolve-type-ref.
 
 // ScopeExtractor output contracts (RFC §3.2 Phase 1; Ring 2 PKG #919)
 export type { ParsedFile } from './scope-resolution/parsed-file.js';
-export type { ReferenceSite, ReferenceKind, CallForm } from './scope-resolution/reference-site.js';
+export type { CallResultAssignmentSite } from './scope-resolution/call-result-assignment-site.js';
+export type {
+  ReferenceSite,
+  ReferenceKind,
+  CallForm,
+  MixedChainStep,
+} from './scope-resolution/reference-site.js';
+export type {
+  CallableFlowOperand,
+  CallableFlowExpectedSignature,
+  CallableFlowPassingMode,
+  CallableFlowInvocationKind,
+  CallableFlowSeedSite,
+  CallableFlowCopySite,
+  CallableFlowAliasSite,
+  CallableFlowAddressSite,
+  CallableFlowStoreSite,
+  CallableFlowLoadSite,
+  CallableFlowFormalSite,
+  CallableFlowArgumentSite,
+  CallableFlowInvokeSite,
+  CallableFlowSite,
+} from './scope-resolution/callable-flow-site.js';
 
 // Method-dispatch materialized view over HeritageMap (RFC §3.1; Ring 2 SHARED #914)
 export { buildMethodDispatchIndex } from './scope-resolution/method-dispatch-index.js';
@@ -89,7 +131,20 @@ export type {
 } from './scope-resolution/method-dispatch-index.js';
 
 // SCC-aware cross-file finalize (RFC §3.2 Phase 2; Ring 2 SHARED #915)
-export { finalize } from './scope-resolution/finalize-algorithm.js';
+export {
+  finalize,
+  importNameFiltersAllow,
+  indexExportsByName,
+  indexTopLevelExportsByName,
+} from './scope-resolution/finalize-algorithm.js';
+export type { ImportMembership, ImportVisibility } from './scope-resolution/import-visibility.js';
+export type { ImportEntry, ImportGroup } from './scope-resolution/import-groups.js';
+export { createGroupedImportVisibility } from './scope-resolution/import-groups.js';
+export {
+  createEagerImportVisibility,
+  importTargetDirectory,
+  isSelectableImport,
+} from './scope-resolution/import-visibility.js';
 export type {
   FinalizeInput,
   FinalizeFile,
@@ -97,6 +152,7 @@ export type {
   FinalizeOutput,
   FinalizedScc,
   FinalizeStats,
+  AmbiguousWildcardExport,
 } from './scope-resolution/finalize-algorithm.js';
 
 // Scope-aware registries + 7-step lookup (RFC §4; Ring 2 SHARED #917)
@@ -112,6 +168,8 @@ export type {
   FieldRegistry,
   FieldLookupOptions,
 } from './scope-resolution/registries/field-registry.js';
+export { buildMacroRegistry } from './scope-resolution/registries/macro-registry.js';
+export type { MacroRegistry } from './scope-resolution/registries/macro-registry.js';
 export { lookupCore } from './scope-resolution/registries/lookup-core.js';
 export type { CoreLookupParams } from './scope-resolution/registries/lookup-core.js';
 export { lookupQualified } from './scope-resolution/registries/lookup-qualified.js';
@@ -123,12 +181,19 @@ export {
   CONFIDENCE_EPSILON,
 } from './scope-resolution/registries/tie-breaks.js';
 export type { TieBreakKey } from './scope-resolution/registries/tie-breaks.js';
-export { CLASS_KINDS, METHOD_KINDS, FIELD_KINDS } from './scope-resolution/registries/context.js';
+export {
+  CLASS_KINDS,
+  METHOD_KINDS,
+  FIELD_KINDS,
+  MACRO_KINDS,
+} from './scope-resolution/registries/context.js';
 export type {
   RegistryContext,
   RegistryProviders,
+  OwnedMembersByOwnerLookup,
   OwnerScopedContributor,
   ArityVerdict,
+  ConstraintContext,
 } from './scope-resolution/registries/context.js';
 
 // Scope tree spine + position lookup (RFC §2.2 + §3.1; Ring 2 SHARED #912)
@@ -156,6 +221,7 @@ export {
   ResilientFetchExhaustedError,
   RETRY_AFTER_CAP_MS,
   parseRetryAfter,
+  isTerminalNetworkError,
 } from './integrations/resilient-fetch.js';
 export type { ResilientFetchOptions } from './integrations/resilient-fetch.js';
 
@@ -171,12 +237,27 @@ export {
 } from './integrations/understand-quickly.js';
 export type { UqDispatchPayload } from './integrations/understand-quickly.js';
 
-// Shadow-mode diff + aggregation (RFC §6.3; Ring 2 SHARED #918)
-export { diffResolutions } from './scope-resolution/shadow/diff.js';
 export type {
-  ShadowAgreement,
-  ShadowCallsite,
-  ShadowDiff,
-} from './scope-resolution/shadow/diff.js';
-export { aggregateDiffs } from './scope-resolution/shadow/aggregate.js';
-export type { LanguageParityRow, ShadowParityReport } from './scope-resolution/shadow/aggregate.js';
+  SourcePosition,
+  LookupPurpose,
+  NameClaim,
+  ScopeLookupPolicy,
+  NameLookupOptions,
+} from './scope-resolution/types.js';
+export {
+  lookupLexicalName,
+  nameClaimsFor,
+  selectClaimsAtScope,
+  rangesOverlap,
+} from './scope-resolution/name-claims.js';
+export type {
+  NameClaimResult,
+  NameClaimSources,
+  ScopeClaimSelection,
+} from './scope-resolution/name-claims.js';
+
+export * from './rename/types.js';
+export * from './rename/results.js';
+export * from './rename/edits.js';
+export * from './rename/positions.js';
+export * from './rename/family.js';

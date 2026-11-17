@@ -4,7 +4,7 @@
  *
  * The provider is a thin wiring object — Python's specific bits
  * (super recognizer, LEGB merge precedence, Python's relative-import
- * resolver, the simplified MRO walk) plug into `runScopeResolution`.
+ * resolver, C3 method resolution) plug into `runScopeResolution`.
  *
  * Migration reference: when bringing up the next language
  * (TypeScript / Java / Kotlin / Ruby), copy this file's structure —
@@ -12,38 +12,115 @@
  * the 2 booleans, and register in `scope-resolution/pipeline/registry.ts`.
  */
 
-import type { ParsedFile } from 'gitnexus-shared';
+import type { ParsedFile, ReferenceSite, SymbolDefinition, TypeRef } from 'gitnexus-shared';
 import { SupportedLanguages } from 'gitnexus-shared';
-import { buildMro, defaultLinearize } from '../../scope-resolution/passes/mro.js';
+import { buildMro, c3LinearizeStrategy } from '../../scope-resolution/passes/mro.js';
 import { populateClassOwnedMembers } from '../../scope-resolution/scope/walkers.js';
-import type { ScopeResolver } from '../../scope-resolution/contract/scope-resolver.js';
+import type {
+  ArityVerdict,
+  ScopeResolver,
+} from '../../scope-resolution/contract/scope-resolver.js';
+import { indexOnlyElementType } from '../../type-extractors/shared.js';
 import { pythonProvider } from '../python.js';
+import { expandPythonWildcardNames, pythonModuleExports } from './expand-wildcards.js';
 import {
+  isPythonImportedModule,
+  pythonNamespaceReceiverPaths,
+  pythonNamespaceBindingIdentity,
   pythonArityCompatibility,
   pythonMergeBindings,
   resolvePythonImportTarget,
   type PythonResolveContext,
 } from './index.js';
+import {
+  pythonSubtypeCallPositionalCount,
+  pythonSubtypePositionalCapacity,
+} from './subtype-dispatch.js';
+import { applyPythonCaptureSideChannel } from './module-accessors.js';
+import { createPythonReceiverNamespaceResolver } from './module-accessor-resolution.js';
+
+/**
+ * Python subtype dispatch is deliberately limited to instance receiver facts.
+ * Private names are class-mangled and cannot be matched by their source
+ * spelling across an eventual subtype. Argument-shape proof is candidate-level
+ * because it needs both the call-site and target-method capture facts.
+ */
+export function pythonMissingReceiverSubtypeDecision(
+  typeRef: TypeRef,
+  context: {
+    readonly receiverBindingIsStatic: boolean | undefined;
+    readonly memberName: string;
+    readonly callArity: number | undefined;
+  },
+): boolean | 'suppress' {
+  if (typeRef.source !== 'self' || context.receiverBindingIsStatic !== false) return false;
+  const isPrivateName = context.memberName.startsWith('__') && !context.memberName.endsWith('__');
+  if (isPrivateName) return 'suppress';
+  return true;
+}
+
+/** Additive compatibility proof for Python's missing-member subtype candidates. */
+export function pythonMissingReceiverSubtypeCandidateCompatibility(
+  callerFilePath: string,
+  callsite: Pick<ReferenceSite, 'atRange'>,
+  candidate: SymbolDefinition,
+): ArityVerdict {
+  const positionalCount = pythonSubtypeCallPositionalCount(callerFilePath, callsite.atRange);
+  if (positionalCount === undefined) return 'unknown';
+
+  const capacity = pythonSubtypePositionalCapacity(candidate);
+  const minimum = candidate.requiredParameterCount;
+  const maximum = candidate.parameterCount;
+  if (capacity === undefined || minimum === undefined || maximum === undefined) return 'unknown';
+  if (positionalCount < minimum || positionalCount > maximum) return 'incompatible';
+  return positionalCount <= capacity ? 'compatible' : 'incompatible';
+}
 
 const pythonScopeResolver: ScopeResolver = {
+  // A free call naming a class constructs it: `Service(db).do_work()` (#2708).
+  constructionSyntax: { bare: true },
   language: SupportedLanguages.Python,
+  // Imported names on a package's __init__.py are addressable as module members.
+  namespaceExportsIncludeImportedNames: true,
+  importsBindAtLexicalScope: true,
+  moduleExports: pythonModuleExports,
+  filterWildcardNames: (scope, names, files) => expandPythonWildcardNames(scope, files, names),
+  namespaceBindingIdentity: pythonNamespaceBindingIdentity,
+  namespaceSkipsEnclosingClasses: true,
+  createReceiverNamespaceResolver: createPythonReceiverNamespaceResolver,
+  ownedMembersBindAtModuleScope: false,
+  suppressReceiverLookup: (typeRef) => typeRef.source === 'decorator-unknown',
   languageProvider: pythonProvider,
   importEdgeReason: 'python-scope: import',
 
-  resolveImportTarget: (targetRaw, fromFile, allFilePaths) => {
-    // Copy the orchestrator's `ReadonlySet` into a `Set` because the
-    // legacy Python resolver chain (`resolvePythonImportInternal` →
-    // `resolveAbsoluteFromFiles` / `hasRepoCandidate`) is typed to
-    // receive a mutable `Set<string>`. The copy is O(N) but called
-    // once per import — trivial compared to the parser work.
-    const ws: PythonResolveContext = { fromFile, allFilePaths: new Set(allFilePaths) };
+  resolveImportTarget: (targetRaw, fromFile, allFilePaths, _resolutionConfig, context) => {
+    // Pass the orchestrator's stable run-level `ReadonlySet` straight through
+    // (no per-import copy). The Python resolver chain only reads the set, and
+    // `getPythonFileIndex` memoizes its index on the set's identity via a
+    // WeakMap — so the index is built once per run and reused across every
+    // import. Copying here (the previous `new Set(allFilePaths)`) handed a
+    // fresh identity to every import, defeating that cache (PR #1918 review P1).
+    const ws: PythonResolveContext = {
+      fromFile,
+      allFilePaths,
+      parsedFiles: context?.parsedFiles,
+    };
     // `WorkspaceIndex` is an opaque `unknown` placeholder in the
     // shared contract, so `ws` passes structurally without a cast.
     return resolvePythonImportTarget(
-      { kind: 'named', localName: '_', importedName: '_', targetRaw },
+      context?.parsedImport ?? { kind: 'namespace', localName: '_', importedName: '_', targetRaw },
       ws,
     );
   },
+
+  isNamespaceImport: (parsedImport, targetFile, fromFile) =>
+    isPythonImportedModule(parsedImport, targetFile, fromFile),
+
+  // `import a.b.c` binds only `a`, yet makes `a`, `a.b` and `a.b.c` all
+  // callable — each naming a different file. Without this the absolute-import
+  // style is invisible to the call graph, and the root key points at the leaf
+  // module instead of the package (#2826).
+  namespaceReceiverPaths: pythonNamespaceReceiverPaths,
 
   // Python LEGB precedence: local > import/namespace/reexport > wildcard.
   // The per-scope id is unused by pythonMergeBindings (tier ordering
@@ -58,11 +135,38 @@ const pythonScopeResolver: ScopeResolver = {
   arityCompatibility: (callsite, def) => pythonArityCompatibility(def, callsite),
 
   buildMro: (graph, parsedFiles, nodeLookup) =>
-    buildMro(graph, parsedFiles, nodeLookup, defaultLinearize),
+    buildMro(graph, parsedFiles, nodeLookup, c3LinearizeStrategy),
 
   populateOwners: (parsed: ParsedFile) => populateClassOwnedMembers(parsed),
 
+  applyCaptureSideChannel: applyPythonCaptureSideChannel,
+
   isSuperReceiver: (text) => /^super\s*\(/.test(text),
+
+  // A mixin may call a method supplied only by its eventual concrete class.
+  // Resolve the callable that DEFINED the binding, rather than the innermost
+  // caller, so a class receiver inherited by a closure cannot masquerade as
+  // instance dispatch. The helper also suppresses Python shapes whose exact
+  // target cannot be represented by the existing call-site facts.
+  resolveMissingReceiverMembersFromSubtypes: pythonMissingReceiverSubtypeDecision,
+  missingReceiverSubtypeCandidateCompatibility: (callsite, candidate, context) =>
+    pythonMissingReceiverSubtypeCandidateCompatibility(context.callerFilePath, callsite, candidate),
+
+  // Python permits both @staticmethod and @classmethod access through an
+  // instance. The graph's generic `isStatic` bit therefore does not mean
+  // "unreachable by instance dispatch" for this provider.
+  isStaticOnly: () => false,
+
+  // Subscript route only — Python spells collection views as method calls
+  // (`.values()`), which the compound resolver's call branch already handles.
+  //
+  // The hook receives the annotation AS WRITTEN (`List[User]`, `Dict[str, User]`),
+  // not the name `interpret.ts`'s `stripGeneric` reduced it to, so `undefined`
+  // here means "this spelling is not a container" — which is what stops
+  // `cfg['k'].run()` on a `__getitem__`-bearing class from folding onto the
+  // class itself. Answering the route at all is what keeps `repos[0].save()`
+  // resolving.
+  elementTypeOf: indexOnlyElementType,
 
   // Python is dynamically typed — field-fallback heuristic on, return-
   // type propagation across imports on. Both default to true; listed

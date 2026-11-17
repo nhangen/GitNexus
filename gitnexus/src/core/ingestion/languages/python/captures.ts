@@ -8,96 +8,269 @@
  *   1. **Per-name import statements** — `import a, b` and
  *      `from m import x, y` decompose to one match per imported name
  *      (see `import-decomposer.ts`).
- *   2. **Receiver type bindings** — each `function_definition` inside a
- *      class body emits a `@type-binding.self` (or `@type-binding.cls`
- *      for `@classmethod`) capture so Pass-4 attaches the implicit
- *      receiver (see `receiver-binding.ts`).
+ *   2. **Receiver type bindings** — methods emit an implicit `self` / `cls`
+ *      binding, and `__init__` assignments from annotated parameters emit
+ *      class-scoped instance-field bindings (see `receiver-binding.ts`).
  *
- * Pure given the input source text. No I/O, no globals consulted.
+ * No I/O. A `.ipynb` path also depends on `filePath` and `sourceMeta`, not only the source text.
  */
 
-import type { Capture, CaptureMatch } from 'gitnexus-shared';
-import { findNodeAtRange, nodeToCapture, syntheticCapture } from '../../utils/ast-helpers.js';
+import type { Capture, CaptureMatch, Range } from 'gitnexus-shared';
+import {
+  nodeToCapture,
+  syntheticCapture,
+  walkNamedTree,
+  type SyntaxNode,
+} from '../../utils/ast-helpers.js';
 import { splitImportStatement } from './import-decomposer.js';
 import { getPythonParser, getPythonScopeQuery } from './query.js';
-import { synthesizeReceiverTypeBinding } from './receiver-binding.js';
+import {
+  extractNotebookPython,
+  isNotebookPath,
+  mapExtractLine,
+  type NotebookLineSegment,
+} from '../../ipynb-extractor.js';
+import {
+  synthesizeConstructorFieldTypeBindings,
+  synthesizeReceiverTypeBinding,
+} from './receiver-binding.js';
+import { synthesizeDependsReferences } from './depends-references.js';
 import { computePythonArityMetadata } from './arity-metadata.js';
 import { recordCacheHit, recordCacheMiss } from './cache-stats.js';
 import { getTreeSitterBufferSize } from '../../constants.js';
 import { parseSourceSafe } from '../../../tree-sitter/safe-parse.js';
-import { pythonFunctionDefinitionLabel } from './simple-hooks.js';
+import { isPythonGlobalDeclaration, pythonFunctionDefinitionLabel } from './simple-hooks.js';
+import { synthesizeCallableFlowCaptures } from '../../utils/callable-flow-captures.js';
+import { synthesizeReceiverChainCapture } from '../../utils/receiver-chain-captures.js';
+import { applyPythonLexicalBindings } from './lexical-bindings.js';
+import { isPythonTypeAnnotation, pythonAttributeAccessKinds } from './attribute-references.js';
+import {
+  beginPythonSubtypeDispatchCapture,
+  recordPythonSimplePositionalCall,
+  recordPythonSubtypeMethodShape,
+} from './subtype-dispatch.js';
+import {
+  beginPythonModuleAccessorCapture,
+  recordPythonLiteralAll,
+  recordPythonModuleAccessor,
+  synthesizePythonCallResultAssignment,
+} from './module-accessors.js';
+import { synthesizePythonInstanceFieldCaptures } from './instance-fields.js';
+
+const PYTHON_CALLABLE_CAPTURE_OPTIONS = {
+  functionNodeTypes: new Set(['function_definition', 'lambda']),
+  callNodeTypes: new Set(['call']),
+  parameterListNodeTypes: new Set(['parameters', 'argument_list']),
+  parameterNodeTypes: new Set([
+    'identifier',
+    'default_parameter',
+    'typed_parameter',
+    'typed_default_parameter',
+    'list_splat_pattern',
+    'dictionary_splat_pattern',
+  ]),
+  bindingNodeTypes: new Set(['assignment', 'named_expression']),
+  assignmentNodeTypes: new Set(['assignment', 'named_expression']),
+  identifierNodeTypes: new Set(['identifier']),
+  functionScopedValueBindings: true,
+  // `a if c else b` is a FIELDLESS `conditional_expression` (positional
+  // value, condition, value), so the shared condition/consequence/alternative
+  // rule never sees its branches and only the last operand flowed (#3354).
+  // `a or b` is a fielded `boolean_operator` the shared rule already handles.
+  valueAlternatives: (node: SyntaxNode) => {
+    if (node.type !== 'conditional_expression') return undefined;
+    const named = node.namedChildren.filter(
+      (child): child is SyntaxNode => child !== null && child.type !== 'comment',
+    );
+    const [value, , alternative] = named;
+    return named.length === 3 && value !== undefined && alternative !== undefined
+      ? [value, alternative]
+      : undefined;
+  },
+} as const;
 
 export function emitPythonScopeCaptures(
   sourceText: string,
-  _filePath: string,
+  filePath: string,
   cachedTree?: unknown,
+  sourceMeta?: {
+    sourceKind?: 'full-file' | 'pre-extracted-script';
+    notebookSegments?: readonly NotebookLineSegment[];
+  },
 ): readonly CaptureMatch[] {
-  // Skip the parse when the caller (parse phase's ASTCache) already
-  // produced a Tree for this source. Cache miss = re-parse, same as
-  // before. The cachedTree parameter is typed as `unknown` at the
+  beginPythonSubtypeDispatchCapture(filePath);
+  beginPythonModuleAccessorCapture(filePath);
+  let parseText = sourceText;
+  let tree = cachedTree as ReturnType<ReturnType<typeof getPythonParser>['parse']> | undefined;
+  let notebookSegments: readonly NotebookLineSegment[] | undefined;
+  if (isNotebookPath(filePath)) {
+    const resolved = resolveNotebookCaptureSource(sourceText, tree, sourceMeta);
+    if (resolved === null) return [];
+    parseText = resolved.parseText;
+    tree = resolved.tree;
+    notebookSegments = resolved.notebookSegments;
+  }
+  const subtypeLineMapper =
+    notebookSegments === undefined
+      ? undefined
+      : (line: number): number => mapExtractLine(line - 1, notebookSegments) + 1;
+  // Skip the parse when the caller (the scope-resolution orchestrator's
+  // `treeCache`) already produced a Tree for this source — empty under
+  // worker-pool runs, so cache miss = re-parse. The cachedTree parameter
+  // is typed as `unknown` at the
   // contract layer (see `LanguageProvider.emitScopeCaptures`); cast
   // here at the use site.
-  let tree = cachedTree as ReturnType<ReturnType<typeof getPythonParser>['parse']> | undefined;
   if (tree === undefined) {
     try {
-      tree = parseSourceSafe(getPythonParser(), sourceText, undefined, {
-        bufferSize: getTreeSitterBufferSize(sourceText),
+      tree = parseSourceSafe(getPythonParser(), parseText, undefined, {
+        bufferSize: getTreeSitterBufferSize(parseText),
       });
     } catch (err) {
-      throw scopeExtractionError('parse', _filePath, err);
+      throw scopeExtractionError('parse', filePath, err);
     }
     recordCacheMiss();
   } else {
     recordCacheHit();
   }
+  if (parseText.includes('__all__')) recordPythonLiteralAll(filePath, tree.rootNode);
 
   let rawMatches: ReturnType<ReturnType<typeof getPythonScopeQuery>['matches']>;
   try {
     rawMatches = getPythonScopeQuery().matches(tree.rootNode);
   } catch (err) {
-    throw scopeExtractionError('scope query', _filePath, err);
+    throw scopeExtractionError('scope query', filePath, err);
   }
 
   const out: CaptureMatch[] = [];
+  const dependsCalleeSites = new Set<string>();
 
   for (const m of rawMatches) {
     // Group captures by their tag name. Tree-sitter strips the leading
     // `@`; we put it back so the central extractor's prefix lookups
     // (`@scope.`, `@declaration.`, …) work.
     const grouped: Record<string, Capture> = {};
+    // Parallel tag -> captured SyntaxNode map. The tree-sitter query already
+    // hands us each matched node as `c.node`, so anchor nodes can be used
+    // directly (or via a bounded LOCAL walk) instead of re-deriving them with
+    // `findNodeAtRange(tree.rootNode, ...)`, which scanned all of root's named
+    // children on every match -> O(matches x rootChildren). That was the #1848
+    // hotpath in Go (fixed in eaf0a305); the same shape lived here in Python.
+    const nodeMap: Record<string, SyntaxNode> = {};
     for (const c of m.captures) {
       const tag = '@' + c.name;
       grouped[tag] = nodeToCapture(tag, c.node);
+      nodeMap[tag] = c.node;
     }
     if (Object.keys(grouped).length === 0) continue;
 
+    const bareRead = nodeMap['@reference.read.identifier'];
+    if (bareRead !== undefined && isPythonTypeAnnotation(bareRead)) continue;
+
+    const attribute = nodeMap['@reference.read.member'];
+    if (attribute !== undefined) {
+      const kinds = pythonAttributeAccessKinds(attribute);
+      for (const kind of kinds) {
+        const reference = { ...grouped };
+        delete reference['@reference.read.member'];
+        const tag = `@reference.${kind}.member`;
+        reference[tag] = nodeToCapture(tag, attribute);
+        synthesizeReceiverChainCapture(reference, nodeMap['@reference.receiver']);
+        out.push(reference);
+      }
+      continue;
+    }
+
+    recordPythonSubtypeCallShape(grouped, nodeMap, filePath, subtypeLineMapper);
+
+    const assignedNode = nodeMap['@declaration.variable'];
+    if (assignedNode !== undefined) {
+      const assignment = synthesizePythonCallResultAssignment(
+        assignedNode,
+        filePath,
+        subtypeLineMapper,
+      );
+      if (assignment !== undefined) out.push(assignment);
+    }
+
+    const declarationNode = nodeMap['@declaration.function'] ?? nodeMap['@declaration.class'];
+    const declarationName = grouped['@declaration.name']?.text;
+    if (
+      declarationNode !== undefined &&
+      declarationName !== undefined &&
+      isPythonGlobalDeclaration(declarationNode, declarationName)
+    ) {
+      grouped['@declaration.global'] = syntheticCapture(
+        '@declaration.global',
+        declarationNode,
+        declarationName,
+      );
+    }
+
     if (grouped['@import.statement'] !== undefined) {
-      // Decompose multi-name imports. Both `import_statement` and
-      // `import_from_statement` share the matched range, so we try the
-      // `from` form first and fall back to plain.
-      const stmtCapture = grouped['@import.statement'];
-      const stmtNode =
-        findNodeAtRange(tree.rootNode, stmtCapture.range, 'import_from_statement') ??
-        findNodeAtRange(tree.rootNode, stmtCapture.range, 'import_statement');
-      if (stmtNode !== null) {
+      // `@import.statement` is captured directly ON the `import_statement` /
+      // `import_from_statement` node (query: `(import_statement) @import.statement`
+      // and `(import_from_statement) @import.statement`), so the captured node IS
+      // the one the old findNodeAtRange re-derived. `splitImportStatement`
+      // dispatches on those two types; a captured node of any other type would
+      // have made the old range+type lookup return null -> the defensive raw
+      // fallback, which the type guard below reproduces exactly.
+      const stmtNode = nodeMap['@import.statement']!;
+      if (stmtNode.type === 'import_from_statement' || stmtNode.type === 'import_statement') {
         for (const piece of splitImportStatement(stmtNode)) out.push(piece);
       } else {
         // Defensive fallback: emit the raw match.
+        // Structural receiver chain for a call whose receiver is itself an
+        // expression, so resolution can type it by folding over structure
+        // instead of re-parsing the receiver's source text. Self-gating: a
+        // non-call match, an absent receiver, or a chain with no nameable base
+        // all leave `grouped` untouched.
+        synthesizeReceiverChainCapture(grouped, nodeMap['@reference.receiver']);
         out.push(grouped);
       }
       continue;
     }
 
-    if (grouped['@scope.function'] !== undefined) {
-      out.push(grouped);
-      const fnNode = findNodeAtRange(
-        tree.rootNode,
-        grouped['@scope.function']!.range,
-        'function_definition',
+    if (grouped['@scope.class'] !== undefined) {
+      out.push(
+        grouped,
+        ...synthesizePythonInstanceFieldCaptures(nodeMap['@scope.class']!, filePath),
       );
+      continue;
+    }
+
+    if (grouped['@scope.function'] !== undefined) {
+      // Structural receiver chain for a call whose receiver is itself an
+      // expression, so resolution can type it by folding over structure
+      // instead of re-parsing the receiver's source text. Self-gating: a
+      // non-call match, an absent receiver, or a chain with no nameable base
+      // all leave `grouped` untouched.
+      synthesizeReceiverChainCapture(grouped, nodeMap['@reference.receiver']);
+      out.push(grouped);
+      // `@scope.function` is captured directly on the `function_definition`
+      // node (query: `(function_definition) @scope.function`), so it IS the
+      // node the old findNodeAtRange re-derived at that range.
+      const scopeNode = nodeMap['@scope.function']!;
+      const fnNode = scopeNode.type === 'function_definition' ? scopeNode : null;
       if (fnNode !== null) {
+        recordPythonModuleAccessor(filePath, fnNode, subtypeLineMapper);
+        const parameterNames = computePythonArityMetadata(fnNode).parameterNames;
+        if (parameterNames.length > 0) {
+          grouped['@scope.lexical-names'] = syntheticCapture(
+            '@scope.lexical-names',
+            fnNode,
+            JSON.stringify(parameterNames),
+          );
+        }
         const synth = synthesizeReceiverTypeBinding(fnNode);
         if (synth !== null) out.push(synth);
+        out.push(...synthesizeConstructorFieldTypeBindings(fnNode));
+        for (const depRef of synthesizeDependsReferences(fnNode)) {
+          out.push(depRef);
+          const callee = depRef['@reference.call.free'];
+          if (callee) {
+            dependsCalleeSites.add(`${callee.range.startLine}:${callee.range.startCol}`);
+          }
+        }
       }
       continue;
     }
@@ -108,11 +281,16 @@ export function emitPythonScopeCaptures(
       // The anchor range is the function_definition itself — we resolve
       // the node and pipe it through the arity helper.
       const anchorCap = grouped['@declaration.function']!;
-      const fnNode = findNodeAtRange(tree.rootNode, anchorCap.range, 'function_definition');
+      // `@declaration.function` is captured directly on the `function_definition`
+      // node (query: `(function_definition name: (identifier) @declaration.name)
+      // @declaration.function`), so use the captured node, not a root re-walk.
+      const anchorNode = nodeMap['@declaration.function']!;
+      const fnNode = anchorNode.type === 'function_definition' ? anchorNode : null;
       if (fnNode !== null) {
         if (pythonFunctionDefinitionLabel(fnNode, 'Function') === 'Method') {
           delete grouped['@declaration.function'];
           grouped['@declaration.method'] = { ...anchorCap, name: '@declaration.method' };
+          recordPythonSubtypeMethodShape(filePath, fnNode, subtypeLineMapper);
         }
         const arity = computePythonArityMetadata(fnNode);
         if (arity.parameterCount !== undefined) {
@@ -140,14 +318,234 @@ export function emitPythonScopeCaptures(
           );
         }
       }
+      // Structural receiver chain for a call whose receiver is itself an
+      // expression, so resolution can type it by folding over structure
+      // instead of re-parsing the receiver's source text. Self-gating: a
+      // non-call match, an absent receiver, or a chain with no nameable base
+      // all leave `grouped` untouched.
+      synthesizeReceiverChainCapture(grouped, nodeMap['@reference.receiver']);
       out.push(grouped);
       continue;
     }
 
+    // Structural receiver chain for a call whose receiver is itself an
+    // expression, so resolution can type it by folding over structure
+    // instead of re-parsing the receiver's source text. Self-gating: a
+    // non-call match, an absent receiver, or a chain with no nameable base
+    // all leave `grouped` untouched.
+    synthesizeReceiverChainCapture(grouped, nodeMap['@reference.receiver']);
     out.push(grouped);
   }
 
+  out.push(...synthesizePythonInheritanceReferences(tree.rootNode));
+  out.push(...synthesizeCallableFlowCaptures(tree.rootNode, PYTHON_CALLABLE_CAPTURE_OPTIONS));
+
+  const references =
+    dependsCalleeSites.size === 0
+      ? out
+      : out.filter((match) => {
+          const value = match['@reference.read.identifier'] ?? match['@reference.value-ref'];
+          return (
+            value === undefined ||
+            !dependsCalleeSites.has(`${value.range.startLine}:${value.range.startCol}`)
+          );
+        });
+  const lexicalCaptures = applyPythonLexicalBindings(
+    references,
+    tree.rootNode,
+    filePath,
+    notebookSegments === undefined ? undefined : (range) => remapRange(range, notebookSegments),
+  );
+  if (notebookSegments !== undefined) {
+    return lexicalCaptures.map((match) => remapCaptureMatch(match, notebookSegments));
+  }
+  return lexicalCaptures;
+}
+
+function resolveNotebookCaptureSource(
+  sourceText: string,
+  cachedTree: ReturnType<ReturnType<typeof getPythonParser>['parse']> | undefined,
+  sourceMeta?: {
+    sourceKind?: 'full-file' | 'pre-extracted-script';
+    notebookSegments?: readonly NotebookLineSegment[];
+  },
+): {
+  parseText: string;
+  tree: ReturnType<ReturnType<typeof getPythonParser>['parse']> | undefined;
+  notebookSegments?: readonly NotebookLineSegment[];
+} | null {
+  if (sourceMeta?.notebookSegments) {
+    return {
+      parseText: sourceText,
+      tree: cachedTree,
+      notebookSegments: sourceMeta.notebookSegments,
+    };
+  }
+  const extracted = extractNotebookPython(sourceText);
+  if (extracted === null) {
+    if (sourceMeta?.sourceKind === 'pre-extracted-script') {
+      return { parseText: sourceText, tree: cachedTree };
+    }
+    return null;
+  }
+  return {
+    parseText: extracted.pythonSource,
+    tree: sourceMeta?.sourceKind === 'pre-extracted-script' ? cachedTree : undefined,
+    notebookSegments: extracted.segments,
+  };
+}
+
+function remapRange(range: Range, segments: readonly NotebookLineSegment[]): Range {
+  return {
+    ...range,
+    startLine: mapExtractLine(range.startLine - 1, segments) + 1,
+    endLine: mapExtractLine(range.endLine - 1, segments) + 1,
+  };
+}
+
+function remapCaptureMatch(
+  match: CaptureMatch,
+  segments: readonly NotebookLineSegment[],
+): CaptureMatch {
+  const next: Record<string, Capture> = {};
+  for (const [key, cap] of Object.entries(match)) {
+    next[key] = { ...cap, range: remapRange(cap.range, segments) };
+  }
+  return next;
+}
+
+/**
+ * Record fixed positional argument counts only for Python's conservative
+ * missing-member subtype fallback. Ordinary reference arity stays unchanged:
+ * count-only metadata cannot model Python keyword binding or definition order.
+ */
+function recordPythonSubtypeCallShape(
+  grouped: Record<string, Capture>,
+  nodeMap: Readonly<Record<string, SyntaxNode>>,
+  filePath: string,
+  mapLine?: (line: number) => number,
+): void {
+  const callTag = (['@reference.call.free', '@reference.call.member'] as const).find(
+    (tag) => grouped[tag] !== undefined,
+  );
+  if (callTag === undefined) return;
+
+  // Decorator references use the same call tags but are anchored on a
+  // `decorator`, not a `call`, so they intentionally retain their old shape.
+  const callNode = nodeMap[callTag];
+  if (callNode === undefined || callNode.type !== 'call') return;
+
+  const argumentList = callNode.childForFieldName('arguments');
+  if (argumentList === null || argumentList.type !== 'argument_list') return;
+
+  const args = argumentList.namedChildren.filter(
+    (child): child is SyntaxNode => child !== null && child.type !== 'comment',
+  );
+  if (
+    args.some(
+      (arg) =>
+        arg.type === 'list_splat' ||
+        arg.type === 'dictionary_splat' ||
+        arg.type === 'keyword_argument',
+    )
+  ) {
+    return;
+  }
+
+  recordPythonSimplePositionalCall(filePath, callNode, args.length, mapLine);
+}
+
+/**
+ * Synthesize `@reference.inherits` captures from Python class superclass
+ * lists so the registry-primary scope-resolution path emits EXTENDS edges
+ * (mirrors C#'s `synthesizeCsharpInheritanceReferences` / C++'s
+ * `emitCppInheritanceCaptures` / TypeScript's `synthesizeTsInheritanceReferences`).
+ * Without this, Python inheritance edges came only from the legacy
+ * heritage-capture leg (removed in #942), which is dropped for registry-primary
+ * languages in the worker pipeline (issue #1951).
+ *
+ * Scope matches the legacy Python heritage leg (config-driven since #1940):
+ * every direct base in the `superclasses` `argument_list`, resolved to its bare
+ * simple name. Three base shapes that the previous synth DROPPED — and so
+ * silently omitted in production while the legacy heritage leg captured them
+ * — are now handled (#1951):
+ *
+ *   - `class C(pkg.Base)`     → `attribute`  (trailing `.attribute` id → `Base`)
+ *   - `class C(pkg.sub.Base)` → nested `attribute` (recurse → `Base`)
+ *   - `class C(Generic[T])`   → `subscript`  (`.value` id → `Generic`)
+ *
+ * The bare-name text MUST agree with `normalizeSupertypeName` (the legacy leg's
+ * reduction in heritage-extractors/supertype-alternation.ts) so both legs emit
+ * the same edge under the CI scope-parity gate: `pkg.Base` → `Base`,
+ * `Generic[T]` → `Generic`, `pkg.Container[str]` → `Container`. Verified by a
+ * real tree-sitter-python parse. The simple `identifier` base keeps its exact
+ * prior capture (the base node itself).
+ *
+ * Tuple/multi bases (`class C(A, pkg.B, Gen[T])`) already iterate here — each
+ * `argument_list` named child is one base. Python has no interfaces, so every
+ * base resolves to a Class and the central `preEmitInheritanceEdges` pass emits
+ * EXTENDS; the EXTENDS-vs-IMPLEMENTS split is decided downstream from the
+ * resolved target's symbol kind, so all bases are emitted with the same
+ * `inherits` kind here.
+ */
+function synthesizePythonInheritanceReferences(root: SyntaxNode): CaptureMatch[] {
+  const out: CaptureMatch[] = [];
+  walkNamedTree(root, (node) => {
+    if (node.type !== 'class_definition') return;
+    const superclasses = node.childForFieldName('superclasses');
+    if (superclasses === null || superclasses.type !== 'argument_list') return;
+    for (let i = 0; i < superclasses.namedChildCount; i++) {
+      const base = superclasses.namedChild(i);
+      if (base === null) continue;
+      const nameNode = pythonBaseLookupNameNode(base);
+      if (nameNode === null) continue;
+      out.push({
+        '@reference.inherits': nodeToCapture('@reference.inherits', base),
+        '@reference.name': nodeToCapture('@reference.name', nameNode),
+      });
+    }
+  });
   return out;
+}
+
+/**
+ * Reduce a Python superclass base node to the bare simple-identifier node whose
+ * `.text` is the lookup name `findClassBindingInScope` resolves. Mirrors the
+ * TypeScript `terminalTsTypeNameNode` / C++ `extractBaseLookupName` reference
+ * patterns, and its returned node's `.text` is contractually equal to
+ * `normalizeSupertypeName(base)` for every shape (real-parse verified):
+ *
+ *   - `identifier`  (`Base`)            → the node itself
+ *   - `attribute`   (`pkg.Base`,
+ *                    `pkg.sub.Base`)    → trailing `attribute:` identifier → `Base`
+ *   - `subscript`   (`Generic[T]`,
+ *                    `pkg.Container[T]`)→ `value:` (recurse, strips `[...]` and
+ *                                          any qualifier) → `Generic` / `Container`
+ *
+ * Returns null for any other shape (no leaf identifier reachable), so it never
+ * emits a spurious edge.
+ */
+function pythonBaseLookupNameNode(base: SyntaxNode): SyntaxNode | null {
+  switch (base.type) {
+    case 'identifier':
+      return base;
+    case 'attribute': {
+      // `pkg.Base` / `pkg.sub.Base`: the `attribute:` field is the trailing
+      // simple-identifier segment (`Base`); recurse so chained dotted paths
+      // still resolve to the final identifier.
+      const attr = base.childForFieldName('attribute');
+      return attr === null ? null : pythonBaseLookupNameNode(attr);
+    }
+    case 'subscript': {
+      // `Generic[T]` / `pkg.Container[str]`: the `value:` field is the
+      // subscripted base (identifier or attribute); recurse to strip the
+      // `[...]` slice and any qualifier, reaching the bare base name.
+      const value = base.childForFieldName('value');
+      return value === null ? null : pythonBaseLookupNameNode(value);
+    }
+    default:
+      return null;
+  }
 }
 
 function scopeExtractionError(stage: string, filePath: string, err: unknown): Error {

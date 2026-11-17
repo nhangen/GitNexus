@@ -6,8 +6,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node ${CLAUDE_PLUGIN_ROOT}/hooks/gitnexus-hook.js",
-            "timeout": 10,
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/gitnexus-hook.js\"",
+            "timeout": 150,
             "statusMessage": "Enriching with GitNexus graph context..."
           }
         ]
@@ -19,8 +19,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node ${CLAUDE_PLUGIN_ROOT}/hooks/gitnexus-hook.js",
-            "timeout": 10,
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/gitnexus-hook.js\"",
+            "timeout": 150,
             "statusMessage": "Checking GitNexus index freshness..."
           }
         ]

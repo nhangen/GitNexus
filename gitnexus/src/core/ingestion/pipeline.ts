@@ -16,6 +16,12 @@
  */
 
 import { createKnowledgeGraph } from '../graph/graph.js';
+import { createRelationshipIntegrityCollector } from '../graph/relationship-integrity.js';
+import { getProviderForFile } from './languages/index.js';
+import type { KnowledgeGraph } from '../graph/types.js';
+import type { RouteHookConfig } from './language-provider.js';
+import { GLOBAL_NAME_FALLBACK_REASON } from '../graph/edge-reasons.js';
+import { GraphEmitSink, type GraphEmitManifest } from '../lbug/graph-emit-sink.js';
 import { type PipelineProgress } from 'gitnexus-shared';
 import { PipelineResult } from '../../types/pipeline.js';
 import {
@@ -31,30 +37,289 @@ import {
   ormPhase,
   crossFilePhase,
   scopeResolutionPhase,
+  springConfigPhase,
+  springAutoConfigurationPhase,
+  springAopPhase,
+  springDestinationsPhase,
+  springAopInheritancePhase,
+  pruneLocalSymbolsPhase,
+  taintSummariesPhase,
+  callSummariesPhase,
   mroPhase,
+  diPhase,
   communitiesPhase,
   processesPhase,
+  PhaseRegistry,
+  type ScopeResolutionOutput,
   type PipelinePhase,
+  type PipelineContext,
   type CommunitiesOutput,
   type ProcessesOutput,
 } from './pipeline-phases/index.js';
 
 export interface PipelineOptions {
-  /** Skip MRO, community detection, and process extraction for faster test runs. */
+  /** Cooperative cancellation checked between parser dispatch and graph phases. */
+  signal?: AbortSignal;
+  /**
+   * Skip MRO, community detection, and process extraction for faster test runs.
+   * The `pruneLocalSymbols` phase still runs — it is graph construction (it cleans
+   * up inert local symbols), not graph analysis — so set `keepLocalValueSymbols`
+   * to retain those nodes under `skipGraphPhases`.
+   */
   skipGraphPhases?: boolean;
-  /** Force sequential parsing (no worker pool). Useful for testing the sequential path. */
+  /**
+   * Skip only Leiden community detection and process/flow extraction (#3016).
+   * MRO/DI still run. Used on warm incremental analyze so persisted
+   * Community/Process rows can be kept instead of wipe+rewrite.
+   */
+  skipDerivedGraphPhases?: boolean;
+  /**
+   * Explicit local Spring Boot Actuator snapshot input. Accepts a directory
+   * containing endpoint-named JSON files or a JSON bundle keyed by endpoint.
+   * Undefined keeps runtime enrichment completely disabled.
+   */
+  springActuatorPath?: string;
+  /** Repo-relative Actuator inputs retained only for a cleanup scan. */
+  springActuatorScanExclusions?: readonly string[];
+  /**
+   * Explicit local AsyncAPI 3.x document input, read by the `springDestinations`
+   * phase. Accepts a directory of documents or a single document; the path is
+   * resolved against the repository root, so a committed `docs/asyncapi` and an
+   * absolute cache populated out of band are equally natural. Undefined keeps
+   * specification reading completely disabled.
+   *
+   * There is deliberately no glob-based auto-discovery to go with it. Scanning
+   * a repository for anything that parses as a document would make every
+   * existing index grow destination nodes on its next run without an operator
+   * having decided anything — the same reason new contract extractors ship
+   * opt-in rather than on.
+   */
+  asyncApiSpecPath?: string;
+  /** Per-advice Spring AOP candidate inspection cap. `0` disables this cap. */
+  springAopMaxCandidateInspectionsPerAdvice?: number;
+  /** Aggregate Spring AOP candidate inspection cap for one analysis. `0` disables this cap. */
+  springAopMaxCandidateInspections?: number;
+  /** Per-advice Spring AOP `ADVISED_BY` edge cap. `0` disables this cap. */
+  springAopMaxAdvisedEdgesPerAdvice?: number;
+  /** Aggregate Spring AOP advice-edge cap for one analysis. `0` disables this cap. */
+  springAopMaxAdvisedEdges?: number;
+  /**
+   * Build the control-flow-graph / PDG substrate (#2081 M1, opt-in via `--pdg`).
+   * Off by default: workers skip all CFG work and emit no `cfgSideChannel`, and
+   * scope-resolution emits no BasicBlock nodes or CFG edges — so the default
+   * graph is byte-identical to a pre-#2081 run. Folded into the parse-cache key
+   * so a pdg-off warm cache is not reused on a `--pdg` run.
+   */
+  pdg?: boolean;
+  /**
+   * Per-function source-line cap for worker-side CFG construction.
+   * `undefined` ⇒ the worker applies `DEFAULT_PDG_MAX_FUNCTION_LINES`; `0` ⇒ no
+   * cap (unlimited). Bounds the cost of a pathological mega-function; over-cap
+   * functions are skipped (no CFG emitted for them). No CLI flag in M1 —
+   * programmatic / server analyze-worker path only.
+   */
+  pdgMaxFunctionLines?: number;
+  /**
+   * Per-function CFG edge cap for the scope-resolution emit step.
+   * `undefined` ⇒ `DEFAULT_MAX_CFG_EDGES_PER_FUNCTION`; `0` ⇒ no cap (unlimited).
+   * Over-cap functions stop at the cap and log a structured drop warning (no
+   * silent truncation). No CLI flag in M1 — programmatic / server path only.
+   */
+  pdgMaxEdgesPerFunction?: number;
+  /**
+   * Per-function REACHING_DEF edge cap for the scope-resolution emit step
+   * (#2082 M2). `undefined` ⇒ `DEFAULT_PDG_MAX_REACHING_DEF_EDGES_PER_FUNCTION`
+   * (4000); `0` ⇒ no cap (unlimited). Emit-time-only — NOT folded into the
+   * parse-cache chunk key (the worker never sees it); recorded in
+   * `RepoMeta.pdg` so a cap change forces a full writeback. No CLI flag —
+   * programmatic / server path only, like the M1 caps.
+   */
+  pdgMaxReachingDefEdgesPerFunction?: number;
+  /**
+   * Per-function CDG (control-dependence) edge cap for the scope-resolution
+   * emit step (#2085 M5). `undefined` ⇒ `DEFAULT_PDG_MAX_CDG_EDGES_PER_FUNCTION`
+   * (5000); `0` ⇒ no cap (unlimited). Emit-time-only — NOT folded into the
+   * parse-cache chunk key; recorded resolved in `RepoMeta.pdg` so introducing
+   * CDG (an absent stamp key) forces a full writeback for pre-CDG `--pdg`
+   * indexes. No CLI flag — programmatic / server path only.
+   */
+  pdgMaxCdgEdgesPerFunction?: number;
+  /**
+   * Per-function taint findings cap for the scope-resolution taint pass
+   * (#2083 M3). `undefined` ⇒ `DEFAULT_PDG_MAX_TAINT_FINDINGS_PER_FUNCTION`
+   * (200); `0` ⇒ no cap (unlimited). Emit-time-only — NOT folded into the
+   * parse-cache chunk key; recorded resolved in `RepoMeta.pdg` so a cap
+   * change forces a full writeback. No CLI flag or rc key (KTD8) —
+   * programmatic / server path only, like the other pdg caps.
+   */
+  pdgMaxTaintFindingsPerFunction?: number;
+  /**
+   * Per-finding taint hop cap (#2083 M3, KTD6 — bounds the persisted
+   * hop-encoded `reason`). `undefined` ⇒ `DEFAULT_PDG_MAX_TAINT_HOPS` (32);
+   * `0` ⇒ no cap (unlimited). Same emit-time-only / RepoMeta-stamped /
+   * no-CLI-flag discipline as `pdgMaxTaintFindingsPerFunction`.
+   */
+  pdgMaxTaintHops?: number;
+  /**
+   * Per-run cross-function findings cap (#2084 M4 review P1-3). `undefined` ⇒
+   * `DEFAULT_PDG_MAX_INTERPROC_FINDINGS` (2000); `0` ⇒ no cap. Consumed by the
+   * `taintSummaries` phase; RepoMeta-stamped, no CLI flag (KTD8) — same
+   * discipline as the per-function taint caps.
+   */
+  pdgMaxInterprocFindings?: number;
+  /** Per-finding cross-function hop cap (#2084 review P1-3). `undefined` ⇒
+   *  `DEFAULT_MAX_INTERPROC_HOPS` (32); `0` ⇒ no cap. */
+  pdgMaxInterprocHops?: number;
+  /** Per-run `TAINT_PATH` edge cap (#2084 review P1-3). `undefined` ⇒
+   *  `DEFAULT_PDG_MAX_INTERPROC_EDGES` (1000); `0` ⇒ no cap. */
+  pdgMaxInterprocEdges?: number;
+  /** Per-run `CALL_SUMMARY` edge cap (PDG FU-C, U-C3). `undefined` ⇒
+   *  `DEFAULT_PDG_MAX_CALL_SUMMARY_EDGES` (0 = unlimited); `0` ⇒ no cap.
+   *  Programmatic only, no CLI flag (KTD8) — same discipline as the other
+   *  pdg caps. */
+  pdgMaxCallSummaryEdges?: number;
+  /**
+   * Streaming/chunked PDG graph emit (#2202). When true, the BasicBlock +
+   * intra-file PDG-edge layer (CFG / REACHING_DEF / CDG / POST_DOMINATE /
+   * TAINTED / SANITIZES) is streamed to CSV-on-disk during the scope-resolution
+   * emit loop instead of being materialized in the in-memory graph, bounding
+   * peak RSS to O(chunk) rather than O(graph) at full-kernel scale. Already
+   * gated by the caller to full-rebuild runs only (the incremental writeback
+   * reads BasicBlocks back from the in-memory graph). Memory-only — produces a
+   * byte-identical persisted graph and is NOT part of `RepoMeta.pdg`, so
+   * toggling it never trips `pdgModeMismatch`. Default/false ⇒ today's
+   * whole-graph emit.
+   */
+  streamPdgEmit?: boolean;
+  /**
+   * Streamed structural graph emit (#2680). When true, relationships that no
+   * mid-pipeline phase reads back (CALLS, IMPORTS, ACCESSES, CONTAINS, ...) are
+   * streamed to CSV-on-disk from the parse boundary onward instead of being
+   * retained in the in-memory graph — measured ~2.9x reduction of graph heap.
+   *
+   * NOT free: the `communities`, `processes`, `taintSummaries` and
+   * `callSummaries` phases all consume the whole CALLS graph and are disabled
+   * under this flag. The caller (`run-analyze`) gates it to full rebuilds.
+   * Requires `graphEmitCsvDir`.
+   */
+  streamGraphEmit?: boolean;
+  /** Directory for the streamed structural CSVs. Required when
+   *  `streamGraphEmit` is on; supplied by the caller, which owns storage-path
+   *  resolution (and its native-safe relocation). */
+  graphEmitCsvDir?: string;
+  /** Streamed PDG-emit write buffer (rows) when `streamPdgEmit` is on (#2202).
+   *  `undefined` ⇒ `DEFAULT_PDG_EMIT_CHUNK_ROWS`. Memory-only; does not affect
+   *  emitted bytes. */
+  pdgEmitChunkSize?: number;
+  /**
+   * Request parsing with the worker pool disabled. The sequential parser was
+   * removed — the worker pool is the sole parse path — so setting this now
+   * makes the parse phase throw a `WorkerPoolDisabledError` (equivalent to
+   * `--workers 0`). Retained so callers get an actionable error rather than a
+   * silently-different result.
+   */
   skipWorkers?: boolean;
   /**
-   * @internal Test-only override for worker-pool gating thresholds.
-   * When unset, production defaults apply (15 files OR 512 KB total bytes).
-   * Setting either field lowers the corresponding threshold so small test
-   * fixtures can still exercise the worker-pool path. Do not use from
-   * production call sites.
+   * @internal Test-only override for the worker script URL the pool
+   * spawns. When unset, parse-impl resolves `parse-worker.js` from the
+   * adjacent `workers/` directory (or the compiled `dist/` fallback
+   * under vitest). Integration tests use this to inject a custom
+   * worker script that deterministically triggers worker-pool
+   * resilience paths (e.g., crash-on-poison-file). Do not use from production
+   * call sites.
    */
-  workerThresholdsForTest?: {
-    minFiles?: number;
-    minBytes?: number;
-  };
+  workerUrlForTest?: URL;
+  /** Worker entry selected while capturing parser identity, reused by the pool. */
+  parseWorkerUrl?: URL;
+  /** Run-owned transient ParsedFiles, also used when persistent caches are disabled. */
+  parsedFileStorePath?: string;
+  /**
+   * Incremental-indexing parse cache. When provided:
+   *   - Each file's path, content and parser identity select a complete pair
+   *     of cached facts and scopes, independently of chunk membership.
+   *   - Only misses go to the existing batched worker pool. Workers encode
+   *     file-local output into bounded packs staged for publication.
+   * The caller (`run-analyze.ts`) is responsible for loading the cache
+   * before the pipeline runs and persisting it after. Cache survives
+   * `--force` because keys are content-addressed.
+   * See `gitnexus/src/storage/parse-cache.ts`.
+   */
+  parseCache?: import('../../storage/parse-cache.js').ParseCache;
+  /**
+   * Worker pool size override, threaded from the CLI `--workers` flag
+   * via `AnalyzeOptions`. When set, parse-impl passes this directly to
+   * `createWorkerPool` so the pool sizing bypasses the env-var fallback
+   * in `resolveAutoPoolSize`. The env-var channel
+   * (`GITNEXUS_WORKER_POOL_SIZE`) remains as a back-compat fallback when
+   * this field is undefined. Must be a positive integer — `0` hard-errors
+   * (sequential parsing was removed; equivalent to `skipWorkers`), expressed
+   * in the same units as `--workers <N>` so long-running hosts (eval-server,
+   * MCP daemon) can size per-call without leaking `process.env` state across
+   * analyze invocations.
+   */
+  workerPoolSize?: number;
+  /** Admitted ceiling, separate from an explicit worker count so tiny repos retain auto-sizing. */
+  workerResources?: Readonly<{ workers: number; workerHeapMb: number }>;
+  /**
+   * Process-detection budget (#3313). Explicit `maxProcesses` replaces the
+   * dynamic `symbols / 10` formula; the other three replace compiled defaults.
+   * Unset fields keep shipped behavior. `0` is rejected upstream — not unlimited.
+   */
+  maxProcesses?: number;
+  maxProcessBranching?: number;
+  maxProcessTraceDepth?: number;
+  maxEntryPointCandidates?: number;
+  /**
+   * Number of chunks whose file contents may be read into memory in
+   * parallel while the worker pool is busy dispatching the current
+   * chunk. Pre-fetching overlaps disk I/O for chunk N+1..N+K with the
+   * worker compute on chunk N — modest but real wall-clock win on
+   * repos large enough to chunk. Worker dispatch itself remains serial
+   * because `WorkerPool.dispatch` is not reentrant (concurrent calls
+   * would race on the shared per-slot busy/in-flight state).
+   *
+   * `1` matches today's pure-serial behavior; `2` is the documented
+   * default (`GITNEXUS_PARSE_CHUNK_CONCURRENCY`). Falls back to the
+   * env var when undefined; defaults to 2 when neither is set.
+   */
+  parseChunkConcurrency?: number;
+  /**
+   * Byte budget per parse chunk (in bytes). When set, parse-impl uses
+   * this instead of the `GITNEXUS_CHUNK_BYTE_BUDGET` env var or the
+   * built-in 2 MB default. Smaller values produce more chunks (finer
+   * cache-hit granularity, more worker dispatches); larger values
+   * batch more files per dispatch.
+   *
+   * Threading the value through options instead of the env var lets
+   * tests vary the chunk layout per-call without `vi.resetModules` and
+   * lets long-running hosts (eval-server, MCP daemon) size per-call
+   * without leaking `process.env` state across invocations.
+   */
+  chunkByteBudget?: number;
+  /**
+   * Keep inert block-local value symbols (Const/Variable/Static) that the
+   * `pruneLocalSymbols` phase would otherwise drop. Mirrors the
+   * `GITNEXUS_KEEP_LOCAL_VALUE_SYMBOLS` env var, but threaded per-call so
+   * long-running hosts (eval-server, MCP daemon) can opt out without leaking
+   * `process.env` state across invocations. When undefined, the env var decides.
+   */
+  keepLocalValueSymbols?: boolean;
+  /**
+   * Extra fetch-wrapper function names to treat as HTTP consumers, threaded
+   * from `.gitnexusrc` `fetchWrappers` via `AnalyzeOptions` (#1589/#1852
+   * residual). The routes phase unions these with the auto-detected `fetch()`
+   * wrappers when scanning for `route_map` consumers, so a wrapper named outside
+   * the built-in convention (or built on axios / a custom client) is still
+   * traced. Empty/undefined leaves behavior unchanged.
+   */
+  fetchWrappers?: readonly string[];
+  /**
+   * Declared router-framework aliases and handler-wrapper callees, threaded
+   * from `.gitnexusrc` / `GITNEXUS_RC`. Applied on the main thread by the
+   * provider route hooks — never sent to parse workers, so they never enter a
+   * parse-cache key. Empty/undefined leaves route extraction unchanged.
+   */
+  routeHookConfig?: RouteHookConfig;
 }
 
 // ── Phase registry ─────────────────────────────────────────────────────────
@@ -64,63 +329,166 @@ export interface PipelineOptions {
  *
  * Phase dependency graph:
  *
- *   scan → structure → [markdown, cobol] → parse → [routes, tools, orm]
- *     → crossFile → mro → communities → processes
+ *   scan → structure → [springConfig, markdown, cobol] → parse → [routes, tools, orm]
+ *     → crossFile → scopeResolution → [springAutoConfiguration, springAop,
+ *       springDestinations] → pruneLocalSymbols
+ *     → mro → springAopInheritance → di → communities → processes
  *
  * To add a new phase: create a file in pipeline-phases/, export the phase
- * object, and add it to the appropriate position in this array.
+ * object, and `.register()` it at the appropriate position below. Opt-in
+ * phases pass an `enabledWhen` predicate (issue #2080 phase-registry seam) —
+ * the legacy `if (!skipGraphPhases)` guard is now expressed that way on the
+ * three graph phases, with no change in behaviour.
+ *
+ * Exported for the parity test (`pipeline-phase-registry.test.ts`), which
+ * asserts the produced list is byte-identical to the legacy array for every
+ * options combination.
  */
-function buildPhaseList(options?: PipelineOptions): PipelinePhase[] {
-  const phases: PipelinePhase[] = [
-    scanPhase,
-    structurePhase,
-    markdownPhase,
-    cobolPhase,
-    parsePhase,
-    routesPhase,
-    toolsPhase,
-    ormPhase,
-    crossFilePhase,
-    scopeResolutionPhase,
-  ];
-
-  if (!options?.skipGraphPhases) {
-    phases.push(mroPhase, communitiesPhase, processesPhase);
-  }
-
-  return phases;
+export function buildPhaseList(options?: PipelineOptions): PipelinePhase[] {
+  return (
+    new PhaseRegistry<PipelineOptions>()
+      .register(scanPhase)
+      .register(structurePhase)
+      .register(springConfigPhase)
+      .register(markdownPhase)
+      .register(cobolPhase)
+      .register(parsePhase)
+      .register(routesPhase)
+      .register(toolsPhase)
+      .register(ormPhase)
+      .register(crossFilePhase)
+      .register(scopeResolutionPhase)
+      .register(springAutoConfigurationPhase)
+      .register(springAopPhase)
+      // Async messaging overlay. Must follow scopeResolution twice over: the
+      // owner Method/Function nodes have to exist, and each provider's
+      // `applyCaptureSideChannel` has to have restored the messaging facts onto
+      // the main thread. It also reads the Property nodes springConfig emits.
+      .register(springDestinationsPhase)
+      .register(pruneLocalSymbolsPhase)
+      // M4 (#2084): interprocedural taint fixpoint — the first real opt-in
+      // pdg-gated phase. Off ⇒ absent ⇒ byte-identical graph. No always-on
+      // phase depends on it (a filtered-out dep would throw in getPhaseOutput).
+      .register(taintSummariesPhase, { enabledWhen: (o) => o.pdg === true })
+      .register(callSummariesPhase, { enabledWhen: (o) => o.pdg === true })
+      .register(mroPhase, { enabledWhen: (o) => !o.skipGraphPhases })
+      .register(springAopInheritancePhase, { enabledWhen: (o) => !o.skipGraphPhases })
+      .register(diPhase, { enabledWhen: (o) => !o.skipGraphPhases })
+      .register(communitiesPhase, {
+        enabledWhen: (o) => !o.skipGraphPhases && o.skipDerivedGraphPhases !== true,
+      })
+      .register(processesPhase, {
+        enabledWhen: (o) => !o.skipGraphPhases && o.skipDerivedGraphPhases !== true,
+      })
+      // Normalize a missing options object once here so phase predicates above
+      // take a required PipelineOptions and need no `?.` guard (#2080 review S1).
+      .build(options ?? {})
+  );
 }
 
 // ── Pipeline orchestrator ─────────────────────────────────────────────────
+
+// The graph keeps this lookup callback alive. Give it its own closure scope so
+// retaining a graph cannot also retain the pipeline's phase results and context.
+const createPipelineGraph = (repoPath: string) => {
+  const integrity = createRelationshipIntegrityCollector(
+    repoPath,
+    (id) => graph.getNode(id),
+    (filePath, text) => getProviderForFile(filePath)?.referenceSourceText?.(text, filePath),
+  );
+  const graph: ReturnType<typeof createKnowledgeGraph> = createKnowledgeGraph(integrity.inspect);
+  return { graph, integrity };
+};
 
 export const runPipelineFromRepo = async (
   repoPath: string,
   onProgress: (progress: PipelineProgress) => void,
   options?: PipelineOptions,
 ): Promise<PipelineResult> => {
-  const graph = createKnowledgeGraph();
+  options?.signal?.throwIfAborted();
+  const { graph, integrity } = createPipelineGraph(repoPath);
   const pipelineStart = Date.now();
 
-  const phases = buildPhaseList(options);
+  // Streamed structural emit (#2680). The sink is a write-routing façade over
+  // `graph`; it streams nothing until `beginStreaming()` fires at the parse
+  // boundary.
+  //
+  // A missing `graphEmitCsvDir` is a caller bug, not a reason to quietly skip
+  // streaming: this is on by default, so a programmatic host that builds its own
+  // `PipelineOptions` (eval-server, the MCP daemon, a test) would otherwise ask
+  // for streaming, silently not get it, and still see a successful run. Fail
+  // loudly instead — the whole point of the surrounding work is that a degraded
+  // outcome must never look like a clean one.
+  let graphEmitSink: GraphEmitSink | undefined;
+  if (options?.streamGraphEmit === true) {
+    if (options.graphEmitCsvDir === undefined) {
+      throw new Error(
+        'streamGraphEmit was requested but graphEmitCsvDir is missing. The caller owns ' +
+          'storage-path resolution (see resolveNativeSafeStorageDir in run-analyze.ts); ' +
+          'pass the directory, or leave streamGraphEmit unset to run without streaming.',
+      );
+    }
+    graphEmitSink = new GraphEmitSink(graph, options.graphEmitCsvDir);
+  }
 
-  const results = await runPipeline(phases, {
+  const phases = buildPhaseList(options);
+  const ctx: PipelineContext = {
     repoPath,
-    graph,
+    graph: graphEmitSink ?? graph,
     onProgress,
     options,
     pipelineStart,
-  });
+    graphEmit: graphEmitSink,
+    recordSourceHash: integrity.recordSourceHash,
+  };
+
+  let graphEmitManifest: GraphEmitManifest | undefined;
+  let results;
+  try {
+    results = await runPipeline(phases, ctx);
+    options?.signal?.throwIfAborted();
+    graphEmitManifest = graphEmitSink?.finalize();
+  } finally {
+    // Release per-pair fds when the pipeline threw before finalize ran.
+    graphEmitSink?.close();
+  }
+
+  // Resolved-call index for the name-fallback census: read through the SINK,
+  // whose field-wise scan includes every streamed edge, not through `graph`,
+  // which under streaming holds none of them.
+  const resolvedCalleeNamesByCaller = collectResolvedCalleeNames(graphEmitSink ?? graph, graph);
 
   // Extract final results for the PipelineResult contract
-  const { totalFiles, usedWorkerPool } = getPhaseOutput<{
+  const {
+    totalFiles,
+    usedWorkerPool,
+    reparsedFileCount,
+    parseCacheHitFileCount,
+    unavailableScopeLanguageFiles,
+  } = getPhaseOutput<{
     totalFiles: number;
     usedWorkerPool: boolean;
+    reparsedFileCount: number;
+    parseCacheHitFileCount: number;
+    unavailableScopeLanguageFiles: number;
   }>(results, 'parse');
 
   let communityResult: CommunitiesOutput['communityResult'] | undefined;
   let processResult: ProcessesOutput['processResult'] | undefined;
+  const scopeResolutionOutput = getPhaseOutput<ScopeResolutionOutput>(results, 'scopeResolution');
+  const scopeExtractionFailures = scopeResolutionOutput.scopeExtractionFailures;
+  const resolutionOutcomes = scopeResolutionOutput.resolutionOutcomes;
+  const undecidedSatisfaction = scopeResolutionOutput.undecidedSatisfaction;
+  // Streamed PDG-emit manifest (#2202): present only when streaming was on.
+  const pdgEmitManifest = scopeResolutionOutput.pdgEmitManifest;
+  const propertyInference = scopeResolutionOutput.propertyInference;
 
-  if (!options?.skipGraphPhases) {
+  // Presence check, not `!skipGraphPhases`: phases can now be filtered out by
+  // any `enabledWhen` predicate (`skipGraphPhases` drops communities/processes),
+  // and `getPhaseOutput` THROWS on a phase that was never resolved. Keying
+  // off the options flag alone made every filtered-out combination crash here
+  // rather than return undefined results.
+  if (results.has('communities') && results.has('processes')) {
     communityResult = getPhaseOutput<CommunitiesOutput>(results, 'communities').communityResult;
     processResult = getPhaseOutput<ProcessesOutput>(results, 'processes').processResult;
   }
@@ -139,12 +507,91 @@ export const runPipelineFromRepo = async (
     },
   });
 
-  return {
+  integrity.logSummary();
+  const result: PipelineResult = {
+    // The RAW graph, deliberately — NOT `graphEmitSink`. Phases above received
+    // the sink so their reads are complete, but `loadGraphToLbug` feeds this to
+    // `streamAllCSVsToDisk`, and the sink's complete iterator would then emit
+    // every streamed edge a SECOND time on top of the per-pair CSVs the sink
+    // already wrote and the manifest already COPYs. Returning the sink here
+    // silently doubles every streamed relationship in the persisted graph.
     graph,
     repoPath,
     totalFileCount: totalFiles,
+    graphEmitManifest,
     communityResult,
     processResult,
+    resolutionOutcomes,
+    resolvedCalleeNamesByCaller,
+    undecidedSatisfaction,
     usedWorkerPool,
+    reparsedFileCount,
+    parseCacheHitFileCount,
+    scopeExtractionFailures,
+    unavailableScopeLanguageFiles,
+    pdgEmitManifest,
+    propertyInference,
+    relationshipIntegrity: integrity.snapshot(),
   };
+
+  // #3016: hand back a way to run the derived phases `skipDerivedGraphPhases`
+  // held back. Which phases those are is answered by re-asking the registry
+  // with only that flag cleared — the one form of the question that stays
+  // correct when a different predicate (`skipGraphPhases`) also disables them,
+  // since then they are absent for a reason a deferred run cannot fix and the
+  // filter yields nothing. The sink guard mirrors the `graph` note above: a
+  // streaming run is a full rebuild, which never sets the skip flag, so an
+  // active sink here means the two got combined by mistake — and deferred
+  // phases writing into a finalized sink would emit past its manifest.
+  const deferredDerivedPhases =
+    options?.skipDerivedGraphPhases === true && graphEmitSink === undefined
+      ? buildPhaseList({ ...options, skipDerivedGraphPhases: false }).filter(
+          (p) => (p.name === 'communities' || p.name === 'processes') && !results.has(p.name),
+        )
+      : [];
+
+  if (deferredDerivedPhases.length > 0) {
+    result.runDeferredDerivedPhases = async () => {
+      const derived = await runPipeline(deferredDerivedPhases, ctx, results);
+      // Presence-checked for the same reason as the block above: a phase the
+      // registry filtered out is absent, and `getPhaseOutput` throws on absent.
+      if (derived.has('communities')) {
+        result.communityResult = getPhaseOutput<CommunitiesOutput>(
+          derived,
+          'communities',
+        ).communityResult;
+      }
+      if (derived.has('processes')) {
+        result.processResult = getPhaseOutput<ProcessesOutput>(derived, 'processes').processResult;
+      }
+    };
+  }
+
+  return result;
 };
+
+/**
+ * Caller node id → the simple names of every callee it has a CALLS edge to.
+ *
+ * `edges` may be the streaming sink or the raw graph; `nodes` is always the raw
+ * graph, which holds every node in both modes (only relationships stream). One
+ * O(E) field-wise pass, allocation-free per edge except for the per-caller set.
+ */
+export function collectResolvedCalleeNames(
+  edges: Pick<KnowledgeGraph, 'forEachRelationshipFields'>,
+  nodes: Pick<KnowledgeGraph, 'getNode'>,
+): ReadonlyMap<string, ReadonlySet<string>> {
+  const out = new Map<string, Set<string>>();
+  edges.forEachRelationshipFields((sourceId, targetId, type, _confidence, reason) => {
+    if (type !== 'CALLS' || reason === GLOBAL_NAME_FALLBACK_REASON) return;
+    const name = nodes.getNode(targetId)?.properties.name;
+    if (typeof name !== 'string' || name === '') return;
+    let names = out.get(sourceId);
+    if (names === undefined) {
+      names = new Set<string>();
+      out.set(sourceId, names);
+    }
+    names.add(name);
+  });
+  return out;
+}

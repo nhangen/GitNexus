@@ -13,10 +13,49 @@ This project uses the [PolyForm Noncommercial License 1.0.0](https://polyformpro
 
 ## Development setup
 
+**Prerequisites:** Node.js — `gitnexus/` requires `^22.18.0 || >=24.11.0` and `gitnexus-web/` requires `^20.19.0 || >=22.12.0` (enforced via the `engines` field in each package). Use `nvm install` to match the local version.
+
 1. Clone the repository.
 2. **CLI / MCP package:** `cd gitnexus && npm install && npm run build`
+   `prepare` / `scripts/build.js` compiles `gitnexus-shared` with
+   `node …/typescript/lib/tsc.js` from this package. Do not `npm install` or
+   `npm ci` inside `gitnexus-shared/` — that is a second TypeScript 7
+   optional-platform install and is not what `setup-gitnexus` does.
 3. **Web UI (if needed):** `cd gitnexus-web && npm install`
+   If you skipped step 2, compile shared with the web compiler first:
+   `cd gitnexus-shared && node ../gitnexus-web/node_modules/typescript/lib/tsc.js`
 4. Run tests as described in [TESTING.md](TESTING.md).
+
+The CLI build imports `gitnexus-shared`, so `gitnexus-shared/dist` must exist
+before `gitnexus` typecheck. That emit uses a parent package's TypeScript 7
+`lib/tsc.js`, matching `setup-gitnexus`, `setup-gitnexus-web`, and Vercel.
+
+### Shared hook runtime
+
+Claude/Codex hooks and the Claude plugin call the package-owned
+`gitnexus-hook` entrypoint (`gitnexus/hooks/claude/gitnexus-hook.cjs`). Hook
+behavior lives in `claude-hook-runtime.cjs` and its sibling helpers. Edit that
+source once; there are no Claude plugin runtime copies or synchronization step.
+
+`gitnexus setup` installs a small launcher that loads the package's entrypoint.
+The Claude plugin loads the same entrypoint from an available installation.
+When none is available, the launcher obtains the pinned npm package and loads
+its hook script, including on versions published before the `gitnexus-hook`
+binary existed. Setup records the package version for cache-cleanup recovery;
+the plugin reads its version from its manifest.
+
+Recovery records the validated package location for later calls and applies a
+retry cooldown after installation failures. The install lock covers recovery;
+the package runtime controls concurrent hook execution. Event and repository
+filtering stay in that runtime.
+
+The bootstrap has one source in `gitnexus-claude-plugin/hooks/gitnexus-hook.js`.
+The normal CLI build packages it for setup automatically. It contains only
+package discovery and startup; keep hook behavior in the package runtime.
+
+### Containerized development (optional)
+
+If you prefer an isolated environment with Claude Code, OpenAI Codex CLI, and Cursor CLI pre-installed, open the repo in VS Code with the [Dev Containers extension](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-containers) and run **Dev Containers: Reopen in Container**. See [`.devcontainer/README.md`](.devcontainer/README.md) for first-time auth flows and Windows WSL2 setup.
 
 ## Branch and pull requests
 
@@ -59,14 +98,57 @@ Commits within a PR may use any style — only the **merged PR title** shows up 
 ## Before you open a PR
 
 - [ ] Tests pass for the packages you touched (`gitnexus` and/or `gitnexus-web`).
-- [ ] Typecheck passes: `npx tsc --noEmit` in `gitnexus/` and `npx tsc -b --noEmit` in `gitnexus-web/`.
+- [ ] Typecheck passes: `npx tsc --noEmit` in `gitnexus/` and `npx tsc -b --noEmit` in `gitnexus-web/`. Those commands use TypeScript 7. The web app tsconfig lists `lib` `DOM`/`DOM.Iterable` and `jsx: react-jsx` so React/JSX typecheck on 7; Vite/`vitest` keep `@vitejs/plugin-react` with the automatic JSX runtime. Build `gitnexus-shared/dist` first with a parent `lib/tsc.js` (a `gitnexus` install/`npm run build` does this). Repo ESLint stays syntax-only on a TypeScript 5.x peer until typescript-eslint supports 7.
 - [ ] No secrets, tokens, or machine-specific paths committed.
 - [ ] Documentation updated if behavior or public CLI/MCP contract changes.
+- [ ] Every new `GITNEXUS_*` environment variable has a row in the **Environment variables** table in [README.md](README.md) — variable, default, effect, and when to tune it.
 - [ ] Pre-commit hook runs clean (`.husky/pre-commit` — formatting via lint-staged + typecheck for staged packages; tests run in CI only).
 
 ## Code review
 
 Maintainers may request changes for correctness, tests, performance, or consistency with existing patterns. Keeping diffs focused makes review faster.
+
+### Parser changes and cache compatibility
+
+Parser compatibility is derived automatically from the parser artifacts and
+effective options. There is no semantic counter to allocate, reconcile with
+the base branch, or regenerate as a checked-in digest. Parallel parser changes
+under the same package version produce different identities from their bytes.
+
+The ownership boundary is declared in
+`gitnexus/src/core/parse-cache-identity.ts`: ingestion, Tree-sitter, `lib`, graph
+helpers, audited support/storage files, the selected worker, shared runtime,
+and parser/native/loader dependencies. CFG extraction and the classified COBOL
+flow helpers have a separate PDG identity. See
+[Architecture](ARCHITECTURE.md#automatic-parse-cache-identity) for the boundary
+and publication safeguards. Raw bytes are covered, so formatting or comments
+inside these roots can conservatively invalidate caches. Repository docs, UI,
+unrelated CLI files, and unrelated dependencies are outside this boundary.
+
+For a parser change:
+
+1. Check that every new import, loader, runtime asset, and effective option is
+   covered. A new boundary needs an explicit ownership/classification decision
+   and coverage-audit update; a new provider inside an owned root is included
+   automatically.
+2. Run `npm run build` from `gitnexus/` before validating changed parser facts.
+   A source edit invalidates source-mode cache identity immediately, but does
+   not compile the selected worker: an old `dist` worker can still emit old
+   facts until rebuilt.
+3. Verify a real cold parse followed by warm reuse of both worker results and
+   durable `ParsedFile` shards, asserting graph facts as well as cache metrics.
+   For extraction-only PDG changes, verify ordinary chunks remain reusable.
+   Run the focused identity and coverage guards from `gitnexus/`:
+   `npm test -- test/unit/parse-cache-identity.test.ts test/unit/parse-cache-input-coverage.test.ts`.
+4. Review benchmark golden/fingerprint changes explicitly. Explain changed
+   output or pack membership and why the new baseline is intended, then run
+   the exact benchmark check. Automatic invalidation does not establish that
+   a semantic or performance change is correct.
+
+Graph DDL still has its own automatic `SCHEMA_FINGERPRINT`, and analyzer
+freshness still has its runner-identity receipt. Intentional wire-format
+versions, including the V8 envelope and receiver-chain codec, retain their
+own compatibility rules. Preserve those checks when changing a format.
 
 ## GitHub Actions — Concurrency Convention
 
@@ -78,6 +160,7 @@ Every workflow under `.github/workflows/` MUST declare a top-level `concurrency:
   - `workflow_run` scope (e.g. `ci-report.yml`): `${{ github.workflow }}-${{ github.event.workflow_run.pull_requests[0].number || format('{0}/{1}', github.event.workflow_run.head_repository.full_name, github.event.workflow_run.head_branch) }}` — the fork fallback must be stable across reruns (never `workflow_run.id`, which is per-run-unique and defeats serialization).
   - Global single-slot (manual dispatch utilities): `${{ github.workflow }}`
   - **Reusable workflows invoked via `workflow_call`:** do NOT use `${{ github.workflow }}` in the group key — in called-workflow context its evaluation is ambiguous and can resolve to the caller's name, which would deadlock against the caller's own group. Use a hardcoded literal prefix and a `github.event_name`-aware expression that falls through to `github.run_id` for reusable invocations (see `ci.yml` for the canonical form). Approved literal prefixes: `CI-` (`ci.yml`) and `docker-build-push-` (`docker.yml`). The `check-workflow-concurrency.py` validation script must be updated whenever a new approved literal prefix is added.
+  - **Shared EC2 resource:** `gitnexus-skill-evolution.yml` and `release-evaluation.yml` use the exact group `gitnexus-evolution-runner` with `cancel-in-progress: false`. They must serialize startup, paid work and hosted shutdown across both workflows. This exception is limited to those two files.
   - **Merge queue (`merge_group`)**: when this event is added, use `${{ github.workflow }}-${{ github.event.merge_group.head_ref }}` with `cancel-in-progress: false` (every queue entry is a distinct ref; never cancel).
 - **`cancel-in-progress` policy:**
 
@@ -138,22 +221,73 @@ Re-invoking `/autofix` after a successful apply is a safe no-op — the workflow
 
 **Sensitive paths.** The apply workflow refuses any patch that touches `.github/` (workflow files, CODEOWNERS, dependabot config). A malicious PR could ship a custom prettier or ESLint config that reformats workflow YAML; if accepted, those edits would be pushed under `contents: write` without human review. Apply formatter changes to files under `.github/` manually in a normal commit so they get the same review every other workflow change gets.
 
+### Native tree-sitter npm packages
+
+The CLI pins and bundles the native `tree-sitter` runtime and its npm grammars.
+Several compatible grammars still declare older runtime peer ranges. Root npm
+`overrides` do not propagate to consumers, and older npm versions validate bundled
+peers against their original ranges even when an override is configured. The
+lockfile therefore pins the same eight audited peers to exactly `0.25.1`.
+`gitnexus/scripts/prepare-tree-sitter-bundle.cjs` runs during `postinstall`
+and `prepack` to keep installed dependency manifests consistent with that lockfile
+and the published bundle. It leaves grammar sources unchanged and replaces the
+incorrect `linux-arm64` prebuilds in five exact npm releases with audited AArch64
+binaries. It validates package versions, peer ranges, dependency layouts, and
+replacement checksums and architecture before writing manifests or binaries.
+The upstream ranges remain in the script only as validation inputs; installed and
+published audited manifests require exactly `0.25.1`. See
+[`gitnexus/prebuilds/bundled/README.md`](gitnexus/prebuilds/bundled/README.md) for
+the affected releases, provenance, and regeneration instructions.
+
+When upgrading these packages, update the exact pins, lockfile, and audited peer
+list together. If regenerating the lockfile restores upstream's older peer ranges,
+restore the same audited `0.25.1` peer pins before committing it. Verify ordinary
+`npm ci` and a subsequent `npm install` complete without peer-resolution warnings.
+Run the parser, extraction, CFG, and worker tests, then use a real
+`npm pack` (including `prepack`) to test a fresh consumer's `npm install`,
+`npm ci`, `npm ls`, and a subsequent dependency install. Check native parser
+loading on the supported Node.js versions and release platforms. A successful
+install in this checkout alone does not verify the published bundle.
+
+### Vendored tree-sitter grammars
+
+`.github/vendored-grammars.json` is the **single source of truth** for the vendored tree-sitter grammar **set** and each grammar's policy `hold` (the ones shipped from `gitnexus/vendor/<name>` rather than installed from npm). It lists each grammar's name, upstream coords (`npm` or `github`), and any `hold`. The monitor resolves upstreams from it; the readiness report keeps its own upstream-drift coords and reads vendored ABIs from `gitnexus/vendor/`. Two workflows read it:
+
+- `grammar-update-monitor.yml` (`.github/scripts/update-vendored-grammars.mjs`) — weekly; opens auto-PRs re-vendoring ABI-compatible upstream updates.
+- `tree-sitter-upgrade-readiness.yml` (`.github/scripts/check-tree-sitter-upgrade-readiness.py`) — daily; renders the tree-sitter compatibility-workarounds report (pack-time peer patches, intentional pins, vendored holds; issue #858), reading each vendored grammar's ABI from `gitnexus/vendor/<name>/src/parser.c`.
+
+Sharing the manifest keeps the two aligned: a consistency-guard test asserts the manifest set equals the `gitnexus/vendor/tree-sitter-*` directories. **When you vendor a new grammar (or remove one), update `.github/vendored-grammars.json` in the same change** — otherwise that guard fails CI and the readiness report regresses to `?` placeholders.
+
 ## AI-assisted contributions
 
 If you use coding agents, follow project context files (e.g. `AGENTS.md`, `CLAUDE.md`) and avoid drive-by refactors unrelated to the issue. Prefer incremental, test-backed changes.
 
 ## Releases
 
-Two publish workflows ship `gitnexus` to npm:
+One workflow ships `gitnexus` to npm — `.github/workflows/publish.yml`. It
+routes between two modes based on the triggering event:
 
-- **Stable** (`.github/workflows/publish.yml`) — triggered by pushing any `v*`
-  tag. Publishes to the `latest` dist-tag with a changelog-backed GitHub
-  release. Maintainers are expected to tag from `main` as a convention; the
-  workflow itself does not enforce branch reachability.
-- **Release Candidate** (`.github/workflows/release-candidate.yml`) — runs on
-  every push to `main` (typically a merged PR) plus manual dispatch. Docs-only
-  changes are skipped via `paths-ignore`. Publishes to the `rc` dist-tag with
-  version `X.Y.Z-rc.N` and a GitHub prerelease, where:
+- **Stable mode** — triggered by pushing any `v<X.Y.Z>` tag (no `-rc.*`
+  suffix; RC tags are excluded at trigger via a negative glob). Publishes to
+  the `latest` dist-tag with a changelog-backed GitHub release. Maintainers
+  are expected to tag from `main` as a convention; the workflow itself does
+  not enforce branch reachability. No Docker build (RC-only). Before cutting a
+  stable release, keep `gitnexus/package.json`,
+  `gitnexus-claude-plugin/.claude-plugin/plugin.json`,
+  `.claude-plugin/marketplace.json`,
+  `gitnexus-claude-plugin/.codex-plugin/plugin.json`,
+  `.agents/plugins/marketplace.json`, and the matching `CHANGELOG.md` entry in
+  lockstep — the always-on `gitnexus` unit suite now fails if those manifest
+  versions drift. Stable publication also requires paired agent evidence for
+  the exact tagged commit: run **Release evaluation** from `main` with
+  `candidate_ref` set to the full commit SHA, confirm the run started and
+  passed, and push the tag within seven days. Without that evidence, npm and
+  Docker publication fail. See `eval/workflow_bench/README.md` § Release
+  evaluation.
+- **Release-candidate mode** — runs on every push to `main` (typically a
+  merged PR) plus manual `workflow_dispatch`. Docs-only changes are skipped
+  via `paths-ignore`. Publishes to the `rc` dist-tag with version
+  `X.Y.Z-rc.N` and a GitHub prerelease, where:
   - `X.Y.Z` is selected automatically. On push (and on dispatch with
     `bump: auto`, the default) the workflow **continues the active rc cycle**:
     if the registry already has `X.Y.Z-rc.*` versions with `X.Y.Z` > current
@@ -161,7 +295,11 @@ Two publish workflows ship `gitnexus` to npm:
     from `latest`. Dispatching with `bump: patch|minor|major` **resets**
     the cycle from `latest`.
   - `N` is auto-incremented against existing `X.Y.Z-rc.*` entries on the
-    registry. First rc for a given base is `rc.1`.
+    registry and `vX.Y.Z-rc.*` Git tags, so delayed npm visibility cannot
+    reuse an allocated version. First rc for a given base is `rc.1`.
+  - The RC is gated by CI, including the fixed-answer tool-accuracy check
+    (`gitnexus/bench/tool-accuracy/`); its report is attached to every
+    release. RCs do not wait for a paid agent evaluation.
   - After the npm publish succeeds, the workflow calls `docker.yml` as a
     reusable workflow to build and push the corresponding RC Docker images
     (e.g. `ghcr.io/abhigyanpatwari/gitnexus:1.7.0-rc.1`, mirrored to
@@ -170,36 +308,64 @@ Two publish workflows ship `gitnexus` to npm:
     caller's ref — see README.md § Docker for the verify command).
 
   Idempotency: the workflow pushes an `rc/<HEAD_SHA>` marker tag and a
-  `v<RC>` release tag **atomically, before** calling `npm publish`. The guard
-  refuses to re-run once the marker exists, so a post-publish failure will
-  not mint a duplicate rc for the same commit. The `v<RC>` tag points at a
-  detached release commit whose `package.json` matches the npm tarball
-  exactly (traceable releases). Recovery after a partial failure:
+  `v<RC>` release tag **atomically, before** calling `npm publish`. The
+  RC guard refuses to re-run once the marker exists, so a post-publish
+  failure will not mint a duplicate rc for the same commit. The `v<RC>`
+  tag points at a detached release commit whose `package.json` matches
+  the npm tarball exactly (traceable releases). The RC tag is excluded
+  from this workflow's `push: tags:` filter, so it does **not** re-trigger
+  publishing — preventing the double-publish failure mode tracked in #1609.
+  Recovery after a partial failure: the workflow's `if: failure()` cleanup
+  step in the `publish` job auto-deletes the v-tag and marker on most
+  post-publish failures, so the typical retry is just:
+
+  ```bash
+  gh workflow run publish.yml --ref main -f force=true
+  # or push a new commit to main, which will cut a fresh RC
+  ```
+
+  If auto-cleanup didn't run (e.g. the cleanup step itself failed, or the
+  failure happened in the route/rc-guard phase before the marker was
+  pushed), manual cleanup is:
 
   ```bash
   git push --delete origin rc/<HEAD_SHA> v<RC>
-  # then redispatch the workflow with force: true
+  # then redispatch with force: true
   ```
+
+  **Release-PR-skip subject pattern.** The rc-guard job recognizes a
+  squash-merged release commit by matching the commit subject against
+  `^chore: release vX.Y.Z` (optionally followed by ` (#NNNN)` for the
+  squash-merge PR-number suffix). Match is case-insensitive — `Chore: Release v1.2.3`
+  works too. PRs that should suppress the RC build must either use this
+  subject shape, or carry the `release` label so the label-based fallback
+  fires. Other release-style subjects (`chore(release): v1.2.3`,
+  `release: v1.2.3`) will NOT trigger the skip — please name the release
+  PR exactly `chore: release vX.Y.Z` to keep the dedup deterministic.
 
   **Docker-only partial failure:** if `publish` succeeds (npm tarball + tags
   are live) but the `docker` job subsequently fails (e.g. GHCR flakiness),
   the npm RC is already published and the `rc/<HEAD_SHA>` marker is in place.
-  Re-running `release-candidate.yml` with `force: true` will abort at the
-  "Version already exists on npm" guard. To recover without cutting a new RC:
+  Recovery without cutting a new RC:
 
   ```bash
-  # 1. Manually trigger only the docker workflow, passing the existing RC tag:
-  gh workflow run docker.yml --ref main -f tag=v<RC_VERSION>
-  # (requires a workflow_dispatch trigger on docker.yml — see note below)
+  # Re-run only the failed docker job from the original workflow run:
+  gh run rerun <run-id> --failed
   ```
 
-  Because `docker.yml` intentionally has no `workflow_dispatch` (images are
-  tag-driven by design), the practical recovery options are:
-  - Wait for the next commit on `main`, which will cut a new RC that includes
-    the Docker build.
-  - Manually run `docker build` + `docker push` locally and sign with Cosign
-    against the same digest.
-  - Delete `rc/<HEAD_SHA>` and `v<RC>` tags, then redispatch with `force: true` to re-run the full RC pipeline (cuts a new RC number).
+  Find the run ID via `gh run list --workflow=publish.yml --branch main`.
+  `docker.yml` intentionally has no `workflow_dispatch` trigger (images are
+  tag-driven by design), so the gh-run-rerun path is the supported recovery.
+
+  **GitHub Release transient failure** (npm publish succeeded, Release step
+  failed): the npm artifact is live but no GitHub Release page exists.
+  Recover by either re-running the failed job (`gh run rerun <run-id> --failed`),
+  or creating the Release manually:
+
+  ```bash
+  gh release create v<RC> --prerelease --generate-notes        # RC
+  gh release create v<X.Y.Z> --notes-file gitnexus/CHANGELOG.md # stable
+  ```
 
 The rc workflow never moves `latest`. To verify after a change, inspect dist-tags:
 

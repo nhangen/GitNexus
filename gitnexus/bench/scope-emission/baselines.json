@@ -1,0 +1,21 @@
+{
+  "_comment": "Baselines for bench/scope-emission/measure.mjs --check (#2699, #3532). Exact scope counts over the fixed synthetic corpus guard function-body suppression and removal of blocks without bindings. Each module has four Block scopes: two const-chosen branches, the lexical for environment, and the catch environment. Lookup-policy and name-claims captures decorate scopes and are excluded from this scope census; bench/scope-capture pins their full content. TypeScript and JavaScript retain separate baselines. emit_ms_budget is unchanged and carries headroom for shared CI runners.",
+  "typescript": {
+    "scopes": {
+      "@scope.block": 800,
+      "@scope.class": 200,
+      "@scope.function": 1400,
+      "@scope.module": 200
+    },
+    "emit_ms_budget": 1500
+  },
+  "javascript": {
+    "scopes": {
+      "@scope.block": 800,
+      "@scope.class": 200,
+      "@scope.function": 1400,
+      "@scope.module": 200
+    },
+    "emit_ms_budget": 1500
+  }
+}

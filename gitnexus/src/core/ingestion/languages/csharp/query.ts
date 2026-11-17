@@ -32,7 +32,8 @@
  */
 
 import Parser from 'tree-sitter';
-import CSharp from 'tree-sitter-c-sharp';
+import { SupportedLanguages } from 'gitnexus-shared';
+import { getLanguageGrammar } from '../../../tree-sitter/parser-loader.js';
 
 const CSHARP_SCOPE_QUERY = `
 ;; Scopes
@@ -40,6 +41,12 @@ const CSHARP_SCOPE_QUERY = `
 
 (namespace_declaration) @scope.namespace
 (file_scoped_namespace_declaration) @scope.namespace
+
+(namespace_declaration
+  name: (_) @declaration.name) @declaration.namespace
+
+(file_scoped_namespace_declaration
+  name: (_) @declaration.name) @declaration.namespace
 
 (class_declaration) @scope.class
 (interface_declaration) @scope.class
@@ -57,24 +64,44 @@ const CSHARP_SCOPE_QUERY = `
 ;; Anonymous methods / lambdas are not scoped — out of scope per plan.
 
 ;; Declarations — types
+;; The parameter list is matched as an UNNAMED optional child, not through a
+;; \`type_parameters:\` field: the C# grammar gives \`interface_declaration\` that
+;; field but \`class_declaration\` / \`struct_declaration\` / \`record_declaration\`
+;; only a bare \`type_parameter_list\` child, so the field form would silently
+;; capture nothing on exactly the three most common declarations. The unnamed
+;; form matches all four.
+;;
+;; A \`where T : IRepo\` constraint is a SEPARATE sibling clause
+;; (\`type_parameter_constraints_clause\`) and is deliberately not read here — the
+;; bound stays absent for C#, which reads as "unknown", the safe direction.
 (class_declaration
-  name: (identifier) @declaration.name) @declaration.class
+  name: (identifier) @declaration.name
+  (type_parameter_list)? @declaration.type-parameters) @declaration.class
 
 (interface_declaration
-  name: (identifier) @declaration.name) @declaration.interface
+  name: (identifier) @declaration.name
+  (type_parameter_list)? @declaration.type-parameters) @declaration.interface
 
 (struct_declaration
-  name: (identifier) @declaration.name) @declaration.struct
+  name: (identifier) @declaration.name
+  (type_parameter_list)? @declaration.type-parameters) @declaration.struct
 
 (record_declaration
-  name: (identifier) @declaration.name) @declaration.record
+  name: (identifier) @declaration.name
+  (type_parameter_list)? @declaration.type-parameters) @declaration.record
 
 (enum_declaration
   name: (identifier) @declaration.name) @declaration.enum
 
 ;; Declarations — methods / constructors / properties
+;;
+;; A generic METHOD's parameters are read for the same reason a generic type's
+;; are (#2912 review): \`void Run<T>(IValidator<T> v)\` writes a receiver whose
+;; argument is a type VARIABLE, and a pass that cannot tell that from a concrete
+;; type prunes every implementor of \`IValidator\` from the call's fan-out.
 (method_declaration
-  name: (identifier) @declaration.name) @declaration.method
+  name: (identifier) @declaration.name
+  (type_parameter_list)? @declaration.type-parameters) @declaration.method
 
 (constructor_declaration
   name: (identifier) @declaration.name) @declaration.constructor
@@ -106,11 +133,12 @@ const CSHARP_SCOPE_QUERY = `
 (indexer_declaration) @declaration.property
 
 ;; Fields — \`int x;\` at class scope. variable_declarator inside
-;; field_declaration carries the name.
+;; field_declaration carries the name. Fields are addressable members, like
+;; properties; local variables remain lexical bindings below.
 (field_declaration
   (variable_declaration
     (variable_declarator
-      name: (identifier) @declaration.name))) @declaration.variable
+      name: (identifier) @declaration.name))) @declaration.property
 
 ;; Local variables — \`int x = 1;\` inside a method body
 (local_declaration_statement
@@ -136,6 +164,10 @@ const CSHARP_SCOPE_QUERY = `
 
 (parameter
   type: (nullable_type) @type-binding.type
+  name: (identifier) @type-binding.name) @type-binding.parameter
+
+(parameter
+  type: (predefined_type) @type-binding.type
   name: (identifier) @type-binding.name) @type-binding.parameter
 
 ;; Type bindings — local variable annotations: \`User u = new User();\`
@@ -286,6 +318,14 @@ const CSHARP_SCOPE_QUERY = `
     type: (qualified_name) @type-binding.type
     (variable_declarator
       name: (identifier) @type-binding.name))) @type-binding.annotation
+
+;; \`private User? _user;\` — same nullable_type shape that parameters and
+;; properties already bind. Preserve this field's written type ownership.
+(field_declaration
+  (variable_declaration
+    type: (nullable_type) @type-binding.type
+    (variable_declarator
+      name: (identifier) @type-binding.name))) @type-binding.annotation @type-binding.nullable-field
 
 ;; Type bindings — property declaration: \`public User Owner { get; set; }\`.
 (property_declaration
@@ -482,6 +522,13 @@ const CSHARP_SCOPE_QUERY = `
 (object_creation_expression
   type: (qualified_name) @reference.call.constructor.qualified) @reference.call.constructor
 
+;; Alias-qualified constructor: \`new MyAlias::Foo()\`, \`new global::Foo()\`. The
+;; top-level type is an alias_qualified_name (a \`global::Ns.Foo\` qualifier nests
+;; under qualified_name instead, covered above). No @reference.name here —
+;; captures.ts derives the simple-name tail via terminalTypeNameNode.
+(object_creation_expression
+  type: (alias_qualified_name) @reference.call.constructor.qualified) @reference.call.constructor
+
 ;; References — field/property writes: \`obj.Name = "x"\` emits a write
 ;; ACCESSES edge from the enclosing method to the field/property on
 ;; obj's class.
@@ -512,15 +559,18 @@ let _query: Parser.Query | null = null;
 
 export function getCsharpParser(): Parser {
   if (_parser === null) {
-    _parser = new Parser();
-    _parser.setLanguage(CSharp as Parameters<Parser['setLanguage']>[0]);
+    const parser = new Parser();
+    // The upstream ESM wrapper uses top-level await. Keep the provider on the
+    // same synchronous native loader as workers and the compiled CLI.
+    parser.setLanguage(getLanguageGrammar(SupportedLanguages.CSharp));
+    _parser = parser;
   }
   return _parser;
 }
 
 export function getCsharpScopeQuery(): Parser.Query {
   if (_query === null) {
-    _query = new Parser.Query(CSharp as Parameters<Parser['setLanguage']>[0], CSHARP_SCOPE_QUERY);
+    _query = new Parser.Query(getLanguageGrammar(SupportedLanguages.CSharp), CSHARP_SCOPE_QUERY);
   }
   return _query;
 }

@@ -1,5 +1,157 @@
 # Migration Guide
 
+## Stable community and process IDs (#3855)
+
+The next analysis after upgrading rebuilds the derived graph with new IDs:
+
+- Communities use `comm_<hash>`, where `hash` is the first 12 hexadecimal SHA-1
+  characters of the smallest member ID.
+- Processes use `proc_<hash>_<name>`, where `hash` covers the entry ID, a NUL
+  separator, and the terminal ID; `name` is the sanitized entry name. The hash
+  is also 12 hexadecimal characters. Colliding IDs receive `_2`, `_3`, etc.
+
+Saved positional IDs (`comm_<n>` or `proc_<n>_<entry>`) no longer resolve after
+that rebuild. Re-resolve communities and processes by label and refresh stored
+IDs. If a `Cluster_<id>` fallback label also changed, locate the community from
+its member symbols. Generated skills with those fallback names also change
+directory names once; skill generation removes stale directories.
+
+IDs remain stable while the community's smallest member or the process's
+endpoints remain unchanged, except for collision suffix allocation. A community
+ID follows its anchor if clustering moves that member; it does not identify an
+unchanging member set. Adding an unrelated component can still cause Leiden to
+repartition existing communities.
+
+Listings still break equal step-count or symbol-count ties by ID. Those ties
+now follow hash order, so a limited listing can show different entries after
+the upgrade. The complete graph retains the other entries.
+
+## Per-file parser cache (#3856)
+
+Parser facts and scopes now use per-file records in compressed packs. The format
+change invalidates old chunk caches, so the first analysis after upgrading parses
+the source again. Later runs reuse compatible files independently of chunk layout.
+No manual cache deletion is needed. Files with incomplete or zero-output parser
+results still require worker dispatch on later runs.
+
+## Resumable analysis and separate vector storage (#3598)
+
+Analysis with embeddings publishes a private `lbug.generation.<id>` graph and
+stores resumable vector artifacts under `embeddings/<identity>/`. Metadata names
+the active graph and sealed vector generation. Once a slot uses this layout,
+plain analysis, watch and hooks continue using it. Pending embedding work resumes
+on the next plain `gitnexus analyze`; `--force` rebuilds the graph while retaining
+compatible vectors for reuse. `--drop-embeddings` explicitly abandons embeddings.
+
+Upgrade every CLI, MCP/serve process and installed hook that accesses the slot.
+Restart long-running clients and rerun `gitnexus setup` with the upgraded binary.
+Older versions do not understand the private graph pointer or separate vectors.
+Do not run an older analyzer against the migrated slot.
+
+Before upgrading, stop readers and writers and back up the complete storage
+slot, including metadata, graph files, `embeddings/`, and any referenced shared
+store. To roll back, stop clients again and restore that complete backup with
+the matching older binaries. Renaming a generation file to `lbug` does not move
+vectors back into it. There is no reverse conversion for separate vector
+artifacts; without a backup, rebuilding with an older version requires generating
+embeddings again and can incur provider charges.
+
+A graph can be ready while embeddings remain pending. Embedding failure after
+graph publication exits nonzero; the graph remains usable and the next analyze
+resumes paid work. HTTP clients should read `embeddingProgress` and capability
+reasons rather than relying on the former terminal SSE `partial` field. After
+three deterministic input rejections, the job publishes healthy nodes and records
+`excludedNodes` with reason `input-rejected`; status reports the omission.
+On Windows, a legacy reader can prevent retirement of `lbug`. Stop that reader
+and rerun analyze; the prepared publication and vector artifacts are retained.
+
+Legacy source receipts now include the file's change time as well as its size
+and modification time. Receipts from earlier previews without that guard are
+retained but cannot certify reuse. Keep them with the original source when
+recovering from a backup or re-exporting a verified source; do not fill in a
+missing guard from the current file, which may have changed since retirement.
+
+`GITNEXUS_LBUG_BUFFER_POOL_SIZE=0` is no longer accepted by analysis: it asks
+the native engine to allocate an unbounded pool. Remove this setting from CLI,
+server and auto-sync environments to use automatic sizing, or set a positive
+byte limit. An explicit `--resource-budget` must also fit the page-size-scaled
+COPY floor; increase the budget if admission rejects it.
+
+Automatic analysis now admits all phase reservations within 75% of effective
+process/container RAM. Earlier versions could expand the reported total above
+RAM to preserve independently chosen heap and worker limits. Explicit heap,
+worker and pool overrides that do not fit now fail before work starts. Reduce
+those overrides, reduce concurrent analyses, use an HTTP embedding provider, or
+increase available RAM. `--memory-budget` remains a main-heap limit;
+`--resource-budget` sets the process-family ceiling and cannot exceed RAM.
+Node's process heap flag also overrides parser-worker limits. Admission now
+reserves at least the main-heap allocation for each worker, even when
+`GITNEXUS_WORKER_HEAP_MB` requests less. Automatic concurrency can decrease;
+explicit worker counts must fit those inherited limits.
+
+If a superseded or unverifiable `analysis-publication.json` blocks recovery,
+stop every reader and writer and back up the complete storage slot first.
+Move only that receipt into the backup, outside the slot, then run
+`gitnexus analyze --force`. Keep the staged graphs and embedding artifacts until
+the replacement graph and vectors are verified. A valid receipt should normally
+be recovered by plain analysis; discarding it abandons its prepared graph work.
+For an interrupted in-place write, keep clients stopped until the forced rebuild
+completes; removing the receipt does not make the old graph healthy.
+
+## LadybugDB 0.22.0 storage and extensions
+
+LadybugDB 0.22.0 reads indexes written by 0.21.1, but a write/checkpoint upgrades
+their storage format from version 47 to 49. No manual data conversion is needed.
+Use the packaged FTS and VECTOR binaries shipped with the new core; older
+extension binaries can load successfully and then crash when building an index.
+
+Before upgrading, stop index writers and readers and retain a backup of the
+complete index storage directory if rollback is required. Include shared stores
+when worktrees or sibling clones share an index. Keep clients sharing a writable
+index on compatible engine versions.
+
+After an index is written by 0.22.0, downgrading the dependency alone is not
+enough: 0.21.1 refuses storage version 49. Restore the backup, or rebuild with the
+older engine using `gitnexus analyze --force`. A rebuild under an engine that
+cannot read the upgraded index cannot recover its cached embeddings; use the
+backup to preserve them, or regenerate them with `--embeddings`.
+
+## Automatic parser cache identities
+
+Parser caches now use artifact-derived base and PDG identities instead of
+manually assigned semantic version numbers. The worker-result cache and
+durable `ParsedFile` store both validate the base identity, and their physical
+chunk keys include it. PDG-enabled chunks also include the PDG identity and
+resolved function-line cap. CFG-only changes therefore leave ordinary parse
+chunks eligible for reuse.
+
+### Do I need to migrate?
+
+**No.** Run `npx gitnexus analyze` as usual. Legacy numeric caches and indexes
+without the parser receipt miss once; successful analysis writes the new
+identities. Plan for a cold parse on the first run after upgrading. Missing,
+malformed, or foreign identities are also misses, including in shared stores.
+Plain analysis continues to preserve existing embeddings.
+
+`--force` rebuilds the graph and may reuse compatible parser output.
+`--no-parse-cache` forces a cold parse and publishes a fresh cache generation
+after successful analysis. If parser identity cannot be verified, analysis
+uses a bounded transient store without persistent cache reads or writes.
+Failed staging or build verification leaves the previously published cache
+pair intact. Cache-write failures after graph publication are reported as
+warnings and do not roll back the successful graph.
+
+### What changes for contributors?
+
+There is no semantic counter or generated digest file to update. Check input
+coverage and cold/warm behavior instead; see
+[Contributing](CONTRIBUTING.md#parser-changes-and-cache-compatibility).
+When running from source, edits invalidate identity immediately but do not
+rebuild compiled workers: run `npm run build` in `gitnexus/` before expecting
+new parser facts.
+Graph DDL fingerprints, analyzer freshness receipts, and intentional
+wire-format versions remain separate safeguards.
+
 ## `impact` tool may now return `{ status: 'ambiguous' }` (PR #888, issue #470)
 
 Before this change the `impact` MCP tool silently picked the first match
@@ -17,13 +169,20 @@ and the caller supplied none of `target_uid` / `file_path` / `kind`,
   "message": "Found N symbols matching '<target>'. Use target_uid, file_path, or kind to disambiguate.",
   "target": { "name": "<target>" },
   "direction": "upstream",
-  "impactedCount": 0,
+  "impactedCount": null,
   "risk": "UNKNOWN",
   "candidates": [
     { "uid": "...", "name": "...", "kind": "Function", "filePath": "...", "line": 42, "score": 0.76 }
   ]
 }
 ```
+
+> `impactedCount` is `null`, not `0`, on an ambiguous result (#2687): no single
+> symbol was resolved, so the blast radius is *undetermined*. A numeric `0` was
+> indistinguishable from a genuine "nothing depends on this", so a caller
+> testing `impactedCount === 0` read a false all-clear. Read `maxImpactedCount`
+> (callgraph ambiguity) or the per-candidate counts in `candidates[]` for the
+> real figure. Callers written as `impactedCount || 0` are unaffected.
 
 ### Do I need to migrate?
 
@@ -69,3 +228,177 @@ normal full re-index.
 
 The `OVERRIDES` compat alias will remain until a future major version. Removal
 will be announced in this file and in the changelog before it happens.
+
+## meta.json → gitnexus.json (PR #2363)
+
+The per-repo index metadata file's primary name changed from
+`.gitnexus/meta.json` to `.gitnexus/gitnexus.json` (and from
+`branches/<slug>/meta.json` to `branches/<slug>/gitnexus.json` for
+multi-branch indexes). This is purely a filename change — the JSON content
+and every field in it are identical.
+
+### Do I need to migrate?
+
+**No.** Backward compatibility is handled automatically at runtime:
+
+- `saveMeta` dual-writes both filenames on every analyze, so `meta.json`
+  keeps existing and staying current. Older GitNexus binaries, still-running
+  MCP servers, and the shipped editor hooks that read `meta.json` continue
+  to work unchanged.
+- `loadMeta` reads `gitnexus.json` first and falls back to `meta.json` when
+  the primary file is absent, so a repo indexed by an older version works
+  without re-analysis.
+- Each `analyze` run also reconciles the two files (the fresher `indexedAt`
+  wins and is written to both), so even a repo written by a mix of old and
+  new versions converges. Nothing is ever deleted.
+
+### What happens on re-index?
+
+Running `npx gitnexus analyze` writes both `gitnexus.json` and `meta.json`
+with identical content. A pre-existing repo that only has `meta.json` gets
+`gitnexus.json` bootstrapped from it on the first run.
+
+### Process ids are not stable across this release
+
+Before #3855, `Process` ids were positional (`proc_<idx>_<entry>`). The earlier
+flow-detection release described here changed both which execution flows are
+detected and the order they are selected in:
+tracing is depth-first, sibling branches follow source order, and selection
+round-robins across terminals so one flow cannot take every slot. A given
+`proc_7_handle` before the upgrade is not the same flow afterwards.
+
+Nothing in GitNexus persists or joins on a raw process id across a re-index —
+the MCP resource keys by label — so this is one-time index churn rather than a
+broken consumer. If you have external tooling that stored a process id, re-
+resolve it by label after the next analyze.
+
+### What about rollback?
+
+Downgrading to an older GitNexus version is safe: `meta.json` is always
+present and current, so the older binary sees the existing index (including
+the `incrementalInProgress` crash-recovery flag) instead of treating the
+repo as never analyzed.
+
+### When will the legacy mirror be removed?
+
+The `meta.json` mirror will remain until a future major version. Removal
+will be announced in this file and in the changelog before it happens.
+
+## Ambiguous responses report the true match count (PR #2796, issue #2787)
+
+The MCP symbol resolver returns at most 20 candidate rows. Every ambiguous
+response used to take its count from that capped window, so a name with 92
+matches (`constructor`, in this repo's own index) reported 20. The same PR
+pinned the window with an `ORDER BY`, which turned that undercount from
+flaky into stable — and a stable wrong number reads as authoritative.
+
+Three consumer-visible changes follow:
+
+- **`impact`'s `totalCandidates` changed meaning.** It was the length of the
+  capped 20-row window; it is now the true `COUNT(*)` of matching symbols.
+  Callers using `totalCandidates === candidates.length` as a "not truncated"
+  proxy will now see the two diverge. This is a bug fix — the old number was
+  wrong — but it is still a value change on a published field.
+- **`totalCandidates` and `candidatesTruncated` are new on other tools.**
+  They now also appear on `context`, `trace`, the `explain` / `pdg_query`
+  block-anchor path, and on `rename` (which returns `context`'s ambiguous
+  payload verbatim). `candidatesTruncated: true` is present only when
+  `candidates[]` is shorter than `totalCandidates` — absent otherwise, never
+  `false`.
+- **The `message` template gained a `(showing M)` suffix.** It follows the
+  total — `Found 92 symbols matching 'constructor' (showing 20). …` — and
+  appears only when the returned window is smaller than the total. `impact`
+  uses the longer `(showing M of N)` form.
+
+### Do I need to migrate?
+
+**Only if you read `totalCandidates` or parse `message`.** The last two
+changes are purely additive — no field was removed or renamed and
+`candidates[]` keeps its shape — so PR #888's "no existing field has changed.
+No migration required for `context` callers" still holds for `context`.
+
+- Reading `totalCandidates` on `impact`: it is a true total now. Detect a
+  shortened window with `candidatesTruncated` (or `totalCandidates >
+  candidates.length`) rather than by comparing it to an array length.
+- Parsing `message` for a count: the total is still the first number, but a
+  `(showing M)` parenthetical may now follow it. Prefer the structured
+  `totalCandidates` field over the string.
+
+### What happens on re-index?
+
+Nothing — this is an MCP-surface change only. The graph schema, indexer,
+and stored data are untouched.
+
+## `schemaVersion` → `schemaFingerprint` (issue #2798)
+
+The field that decides whether an existing index can be reused changed in
+`.gitnexus/gitnexus.json` (and in each `branches/<slug>/gitnexus.json`):
+`schemaVersion?: number` has been removed and `schemaFingerprint?: string`
+added. The new value is a 12-character digest of the graph DDL this build
+creates, so it *describes* the schema an index's tables were actually built
+from rather than asserting a number about it.
+
+An absent fingerprint is treated as a mismatch, and that is the whole
+backward-compatibility story: every index written by an earlier GitNexus
+carries no fingerprint, so it is rebuilt exactly once.
+
+### Do I need to migrate?
+
+**No.** There is nothing to run, edit, or pass. The first `analyze` after
+upgrading logs one line —
+
+```
+index schema changed (built by an unidentified GitNexus build, this build is <fingerprint>); forcing a full re-analyze so the database is recreated from the current schema.
+```
+
+— and then performs that full re-analyze itself. The same run stamps the
+fingerprint, and every run after it takes the normal incremental path again.
+
+### What happens on re-index?
+
+One automatic full re-analyze, once per index. Nothing else changes; the
+resulting graph is what the current build would have produced anyway.
+
+The scope of that one-time cost is worth knowing before you hit it. It is
+per **index**, not per machine or per repository — branch-scoped index slots
+(#2106) each keep their own `gitnexus.json`, so every slot pays for itself
+the first time it is analyzed after the upgrade. On a very large repository
+a full re-analyze is substantial, not a blip; plan the first post-upgrade
+run accordingly.
+
+### Why a digest instead of a version number?
+
+`schemaVersion` was hand-incremented, and it had to predict something a
+number cannot know: whether the DDL an on-disk database was created from
+matches this build's. It collided with `main` eight times, twice *exactly* —
+and an exact clash was the quiet failure. Two builds stamp the same number
+over different DDL, the strict `===` reuse gate reads the index as current,
+the `CREATE … TABLE` statements are skipped as "already exists", and edges
+whose endpoint pair the live database cannot persist are dropped. A wrong
+graph, with no error anywhere.
+
+A derived digest cannot fail that way: two builds agree exactly when their
+DDL agrees, so concurrent branches never need renumbering and a mismatch is
+always a real mismatch. The retired ladder's per-version rationale (v2
+`BasicBlock.callees` through v35's generated relation cross-product) now
+lives only in git history:
+`git show 561f913a3:gitnexus/src/storage/repo-manager.ts`.
+
+### What about rollback?
+
+Downgrading to an older GitNexus is safe. The older binary looks for
+`schemaVersion`, does not find one, treats the index as pre-versioning, and
+forces its own full rebuild — the same one-time cost in the other direction,
+never a stale or mismatched graph.
+
+### What if I alternate between an old and a new binary?
+
+Every switch forces a rebuild. The end-of-run metadata is written as a fresh
+object literal rather than merged over the previous file, so a new build's
+write drops `schemaVersion` and an old build's write drops
+`schemaFingerprint` — neither field survives the other's run, and each binary
+then finds its own gate unsatisfied. This hits anyone running a pinned
+`npx gitnexus@<version>` alongside a local build, or an editor hook still on
+an older release. It is a cost, not a correctness problem: each run rebuilds
+against its own schema, and the graph it serves is correct for the binary
+that produced it. Pin one version per index to avoid the churn.

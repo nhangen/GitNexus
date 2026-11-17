@@ -10,6 +10,12 @@ import type { GraphNode, GraphRelationship, RelationshipType } from 'gitnexus-sh
 
 // CLI-specific: full KnowledgeGraph with mutation methods for incremental updates
 export interface KnowledgeGraph {
+  /** Shared pre-write check used by in-memory and streaming relationship writers. */
+  inspectRelationship?: (
+    relationship: GraphRelationship,
+    duplicate: boolean,
+    conflictingIdentity?: boolean,
+  ) => void;
   nodes: GraphNode[];
   relationships: GraphRelationship[];
   iterNodes: () => IterableIterator<GraphNode>;
@@ -27,12 +33,46 @@ export interface KnowledgeGraph {
   iterRelationshipsByType: (type: RelationshipType) => IterableIterator<GraphRelationship>;
   forEachNode: (fn: (node: GraphNode) => void) => void;
   forEachRelationship: (fn: (rel: GraphRelationship) => void) => void;
+  /**
+   * Zero-allocation relationship scan: fields, not objects (#2680).
+   *
+   * The whole-graph scans (the local-symbol pruner, community detection,
+   * process extraction) read only these five fields, and materializing a
+   * `GraphRelationship` per edge just to read them dominates iteration cost once
+   * relationships are held columnar — measured at ~90 ms per analyze on a
+   * million-edge graph. Prefer this over `forEachRelationship` in any pass that
+   * walks every edge and needs no other field.
+   *
+   * `reason` is passed because confidence alone cannot separate a heuristic
+   * name guess from a resolved edge that happens to sit at the same number:
+   * the global-name fallback emits at exactly the process/community threshold
+   * (0.5), so the walks that must exclude it have to read the reason. See
+   * `GraphEmitSink`'s reason column, added for this consumer.
+   */
+  forEachRelationshipFields: (
+    fn: (
+      sourceId: string,
+      targetId: string,
+      type: RelationshipType,
+      confidence: number,
+      reason: string,
+    ) => void,
+  ) => void;
   getNode: (id: string) => GraphNode | undefined;
+  /** Optional direct lookup for graphs that retain relationship identities. */
+  getRelationship?: (id: string) => GraphRelationship | undefined;
   nodeCount: number;
   relationshipCount: number;
   addNode: (node: GraphNode) => void;
   addRelationship: (relationship: GraphRelationship) => void;
   removeNode: (nodeId: string) => boolean;
   removeNodesByFile: (filePath: string) => number;
+  /**
+   * Removes the relationship with this id, returning whether it existed.
+   *
+   * Implementations that offload relationships out of memory cannot always tell
+   * "absent" from "already written out" — `GraphEmitSink` deliberately throws
+   * rather than answering `false` for an edge it can no longer recall (#2680).
+   */
   removeRelationship: (relationshipId: string) => boolean;
 }

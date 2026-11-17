@@ -1,0 +1,813 @@
+/**
+ * Content-addressed parser reuse. Logical entries belong to individual files;
+ * source chunks and dispatch rounds remain scheduling boundaries. Packed V8
+ * facts and scope sections share one staged publication lifecycle. Legacy
+ * chunk helpers remain readable for compatibility but are not split into files.
+ */
+
+import { createHash } from 'crypto';
+import fs from 'fs/promises';
+import path from 'path';
+import { compareCodeUnits } from '../lib/utils.js';
+import { linkOrCopyFile } from './fs-atomic.js';
+import type { ParseCacheIdentity } from '../core/parse-cache-identity.js';
+import type { ParseWorkerResult } from '../core/ingestion/workers/parse-worker.js';
+import { copyV8CacheIfPresent, tryLoadV8Cache, writeV8CacheFile } from './v8-sidecar.js';
+import {
+  decodeFileResultSection,
+  inspectFileResultSection,
+  type EncodedFileResult,
+} from './file-result-codec.js';
+import {
+  emptyFileResultStore,
+  loadFileResultStore,
+  appendFileResults,
+  readFileResults,
+  pinFileResults,
+  writeFileResultIndex,
+  type FileResultReference,
+  type FileResultStore,
+} from './file-result-store.js';
+
+export interface FileParseCacheState {
+  live?: FileResultStore;
+  stage?: FileResultStore;
+  memory: Map<string, EncodedFileResult>;
+}
+
+/** SHA-256 hex of a string or buffer (paths for bucket ids, contents for cache keys). */
+const sha256Hex = (input: Buffer | string): string =>
+  createHash('sha256')
+    .update(typeof input === 'string' ? Buffer.from(input) : input)
+    .digest('hex');
+
+/** Stable parse-cache bucket count (#3088). Membership changes are covered by the parser identity. */
+export const PARSE_CACHE_BUCKET_COUNT = 128;
+
+/** Bucket id for cache membership: `sha256(path) mod N` without IEEE-754 truncation. */
+export const parseCacheBucketId = (filePath: string): number =>
+  Number(BigInt(`0x${sha256Hex(filePath)}`) % BigInt(PARSE_CACHE_BUCKET_COUNT));
+
+export type ParseCachePackFile = { path: string; size: number; language: string };
+
+/**
+ * Pack files into parse-cache chunks: group by (language, bucket id), sort
+ * paths inside the group, then cut at `byteBudget`. Bucket visit order is
+ * the lexicographic order of `${language}\\0${bucketId}` keys (deterministic,
+ * independent of scan order and worker count).
+ */
+export const packParseCacheChunks = (
+  files: readonly ParseCachePackFile[],
+  byteBudget: number,
+): string[][] => {
+  const buckets = new Map<string, ParseCachePackFile[]>();
+  for (const file of files) {
+    const key = `${file.language}\0${parseCacheBucketId(file.path)}`;
+    const list = buckets.get(key);
+    if (list) list.push(file);
+    else buckets.set(key, [file]);
+  }
+  const chunks: string[][] = [];
+  for (const key of [...buckets.keys()].sort()) {
+    const group = buckets.get(key)!;
+    group.sort((a, b) => compareCodeUnits(a.path, b.path));
+    let current: string[] = [];
+    let bytes = 0;
+    for (const file of group) {
+      if (current.length > 0 && bytes + file.size > byteBudget) {
+        chunks.push(current);
+        current = [];
+        bytes = 0;
+      }
+      current.push(file.path);
+      bytes += file.size;
+    }
+    if (current.length > 0) chunks.push(current);
+  }
+  return chunks;
+};
+
+const LEGACY_CACHE_FILENAME = 'parse-cache.json';
+const CACHE_DIRNAME = 'parse-cache';
+/**
+ * Per-run staging root for newly produced parse results. Parse-cache shards and the
+ * ParsedFile stores write here so a crash cannot mix a new generation into the
+ * live `.gitnexus/parse-cache` / `parsedfile-cache` trees. `saveParseCache`
+ * publishes onto the live `storagePath` only after a successful analysis.
+ */
+export const COLD_PARSE_REBUILD_DIRNAME = 'parse-rebuild';
+
+/** Staging owned by one exclusively locked index slot, separate from shared caches. */
+export const getColdParseRebuildDir = (storagePath: string): string =>
+  path.join(storagePath, COLD_PARSE_REBUILD_DIRNAME);
+
+/**
+ * The caller holds this meta directory's index lock and reclaims the previous
+ * run's stage before starting. Branches and shared-store checkouts have their
+ * own meta directories, so an interrupted run can be reclaimed without
+ * touching a live sibling's stage. Keep a unique child per run: a retired
+ * worker may finish its flush after the bounded shutdown drain, and must not
+ * write into a later run's transient store in a long-lived process.
+ */
+export const createColdParseRebuildDir = async (storagePath: string): Promise<string> => {
+  const stagingRoot = getColdParseRebuildDir(storagePath);
+  await fs.mkdir(stagingRoot, { recursive: true });
+  return fs.mkdtemp(path.join(stagingRoot, 'run.'));
+};
+const CACHE_INDEX_FILENAME = 'index.json';
+
+/** Keys on disk always come from `computeChunkHash` — 64-char lowercase hex. */
+const CHUNK_CACHE_KEY_HEX_RE = /^[a-f0-9]{64}$/;
+
+const isValidChunkCacheKey = (chunkHash: string): boolean => CHUNK_CACHE_KEY_HEX_RE.test(chunkHash);
+
+/** On-disk shape for the legacy single-file format. */
+interface ParseCacheFile {
+  version: string;
+  /** key = chunk hash (hex) → cached chunk result list. */
+  entries: Record<string, ParseWorkerResult[]>;
+}
+
+/** On-disk shape for the sharded directory format. */
+interface ShardedParseCacheIndex {
+  version: string;
+  format?: string;
+  keys: string[];
+}
+
+/** Runtime view: keyed Map for fast lookup; mutated in place during a run. */
+export interface ParseCache {
+  fileResults?: FileParseCacheState;
+  identity: ParseCacheIdentity;
+  entries: Map<string, ParseWorkerResult[]>;
+  /**
+   * Hashes referenced (hit OR miss-and-stored) by the current run.
+   * The parse phase populates this as it processes chunks; the orchestrator
+   * uses it as input to `pruneCache` before saving so entries that no
+   * longer correspond to any chunk in the current scan are discarded.
+   * Transient — never serialized to disk.
+   */
+  usedKeys: Set<string>;
+  /**
+   * Hashes this run decided it cannot vouch for — its durable generation could
+   * not be reset, or its chunk was worker-quarantined (#3204). `saveParseCache`
+   * refuses them, so neither a pre-existing `.v8` nor the chunk's durable
+   * directory survives into the next run. Kept separate from `usedKeys`
+   * because the orchestrator re-adds keys to that set after the parse phase
+   * (#2106 sibling fold), which would undo a deletion.
+   * Transient — never serialized to disk.
+   */
+  staleKeys?: Set<string>;
+  /** Live generation used for compatible cache reads. */
+  storagePath?: string;
+  /** Run-owned generation receiving newly produced or repaired shards. */
+  writeStoragePath?: string;
+  /** Keys admitted by the identity-validated live index. */
+  onDiskKeys?: Set<string>;
+  /** Keys successfully written beneath writeStoragePath in this run. */
+  stagedKeys?: Set<string>;
+}
+
+/** Stable hash of a single file's contents — used by callers to compose a chunk hash. */
+export const fileContentHash = (content: Buffer | string): string => sha256Hex(content);
+
+/**
+ * Compute the canonical cache key for a chunk's contents.
+ *
+ * `entries` is the list of (filePath, file content hash) for every file
+ * in the chunk. We sort by filePath before hashing so chunks composed of
+ * the same files in different order produce the same key.
+ */
+/** PDG/CFG cache namespace (#2081 M1) — every input that changes the
+ *  WORKER-EMITTED `cfgSideChannel` must be folded into the chunk key, and
+ *  ONLY those. The classification test for a future option: does the worker
+ *  see it (workerData) and does it change the bytes the worker writes to the
+ *  shard? `pdgMaxEdgesPerFunction` famously fails that test — it is applied
+ *  at EMIT time on the main thread (scope-resolution run.ts), the worker
+ *  never receives it, and the cached output is byte-identical across cap
+ *  values; folding it in (as a prior review round did) only forced a
+ *  spurious full re-parse on every cap change (#2099 F3). Options that
+ *  change the PERSISTED GRAPH but not the shard belong in the RepoMeta pdg
+ *  stamp (incremental-eligibility), not here. */
+export interface PdgCacheKey {
+  readonly pdg?: boolean;
+  /** Per-function source-line cap (changes WHICH functions get a CFG —
+   *  applied in the worker, so it shapes the cached shard). Callers must
+   *  pass the RESOLVED value (the production call site in parse-impl.ts
+   *  applies the worker's default before folding) so an explicit-default
+   *  run shares the default run's keys — this function folds whatever it
+   *  is given verbatim. */
+  readonly maxFunctionLines?: number;
+}
+
+export const computeChunkHash = (
+  entries: Array<{ filePath: string; contentHash: string }>,
+  identity: ParseCacheIdentity,
+  pdg: boolean | PdgCacheKey = false,
+): string => {
+  const sorted = [...entries].sort((a, b) => compareCodeUnits(a.filePath, b.filePath));
+  const opts: PdgCacheKey = typeof pdg === 'boolean' ? { pdg } : pdg;
+  // JSON framing avoids ambiguous path/content delimiters. Every
+  // physical shard address binds the base identity; extraction-only changes
+  // affect PDG keys without evicting ordinary parsing results.
+  const components: unknown[] = ['gitnexus-parse-chunk-v1', identity.base];
+  if (opts.pdg) {
+    if (opts.maxFunctionLines === undefined) {
+      throw new Error('PDG chunk keys require the resolved function-line cap');
+    }
+    components.push(identity.pdg, opts.maxFunctionLines);
+  }
+  components.push(sorted.map(({ filePath, contentHash }) => [filePath, contentHash]));
+  return sha256Hex(JSON.stringify(components));
+};
+
+/**
+ * JSON replacer that round-trips Map/Set instances through plain JSON.
+ *
+ * `ParseWorkerResult.parsedFiles[*].scopes[*].typeBindings` is a
+ * `ReadonlyMap<string, TypeRef>`; without this transform it serializes
+ * to `{}` and downstream code that iterates / `.get()`s on it crashes
+ * with "is not iterable". Applied symmetrically by `mapReviver` on
+ * load so the in-memory shape stays Map-typed.
+ */
+const MAP_TAG = '__$mapEntries$__';
+const SET_TAG = '__$setValues$__';
+
+export const mapReplacer = (_key: string, value: unknown): unknown => {
+  if (value instanceof Map) return { [MAP_TAG]: Array.from(value.entries()) };
+  if (value instanceof Set) return { [SET_TAG]: Array.from(value.values()) };
+  return value;
+};
+
+export const mapReviver = (_key: string, value: unknown): unknown => {
+  if (value && typeof value === 'object') {
+    const v = value as Record<string, unknown>;
+    if (Array.isArray(v[MAP_TAG])) return new Map(v[MAP_TAG] as [unknown, unknown][]);
+    if (Array.isArray(v[SET_TAG])) return new Set(v[SET_TAG] as unknown[]);
+  }
+  return value;
+};
+
+const getLegacyCachePath = (storagePath: string): string =>
+  path.join(storagePath, LEGACY_CACHE_FILENAME);
+
+const getCacheDirPath = (storagePath: string): string => path.join(storagePath, CACHE_DIRNAME);
+
+const getCacheIndexPath = (storagePath: string): string =>
+  path.join(getCacheDirPath(storagePath), CACHE_INDEX_FILENAME);
+
+const getCacheChunkPath = (storagePath: string, chunkHash: string): string =>
+  path.join(getCacheDirPath(storagePath), `${chunkHash}.v8`);
+
+/**
+ * Drop fields that are not replayed by `mergeChunkResults` / parse-impl after
+ * RING4-1 (#942). Shrinks on-disk shards and peak RSS during cold runs.
+ */
+export const slimParseWorkerResultsForCache = (
+  chunkResults: readonly ParseWorkerResult[],
+): ParseWorkerResult[] => {
+  const slim: ParseWorkerResult[] = [];
+  for (const result of chunkResults) {
+    slim.push({
+      ...result,
+      calls: [],
+      assignments: [],
+      constructorBindings: [],
+      parsedFiles: [],
+      // #2112: a clone-safety skip list is per-run telemetry, not graph data —
+      // replay ignores it. Drop it so it doesn't bloat the cached shard.
+      skippedPaths: [],
+    });
+  }
+  return slim;
+};
+
+const readParseCacheChunkFromDisk = async (
+  storagePath: string,
+  chunkHash: string,
+): Promise<ParseWorkerResult[] | undefined> => {
+  if (!isValidChunkCacheKey(chunkHash)) return undefined;
+  try {
+    const chunkPath = getCacheChunkPath(storagePath, chunkHash);
+    const v8Hit = await tryLoadV8Cache(chunkPath);
+    if (v8Hit?.kind === 'hit' && Array.isArray(v8Hit.value)) {
+      return v8Hit.value as ParseWorkerResult[];
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+/** Load one chunk shard. Does not retain it in `cache.entries`. */
+export const loadParseCacheChunk = async (
+  cache: ParseCache,
+  chunkHash: string,
+): Promise<ParseWorkerResult[] | undefined> => {
+  const inMemory = cache.entries.get(chunkHash);
+  if (inMemory !== undefined) return inMemory;
+  if (cache.writeStoragePath && cache.stagedKeys?.has(chunkHash)) {
+    return readParseCacheChunkFromDisk(cache.writeStoragePath, chunkHash);
+  }
+  if (cache.storagePath && cache.onDiskKeys?.has(chunkHash)) {
+    return readParseCacheChunkFromDisk(cache.storagePath, chunkHash);
+  }
+  return undefined;
+};
+
+/**
+ * Cache directories already created this process. `persistParseCacheChunk` runs
+ * once per cache-miss chunk; without this guard every miss re-issues a redundant
+ * `mkdir` syscall (hundreds on a large cold repo) (#1983). Storage paths are
+ * process-scoped, so the Set stays bounded.
+ */
+const createdCacheDirs = new Set<string>();
+
+/** Drop the mkdir memo after the staging tree is wiped so the next persist recreates it. */
+export const forgetCreatedParseCacheDir = (storagePath: string): void => {
+  createdCacheDirs.delete(getCacheDirPath(storagePath));
+};
+
+/**
+ * Persist one chunk shard and avoid retaining it in RAM for the rest of the
+ * run. Falls back to `cache.entries` when `writeStoragePath` is unset (unit tests).
+ */
+export const persistParseCacheChunk = async (
+  cache: ParseCache,
+  chunkHash: string,
+  chunkResults: readonly ParseWorkerResult[],
+): Promise<void> => {
+  const slim = slimParseWorkerResultsForCache(chunkResults);
+  if (cache.writeStoragePath) {
+    const cacheDir = getCacheDirPath(cache.writeStoragePath);
+    if (!createdCacheDirs.has(cacheDir)) {
+      await fs.mkdir(cacheDir, { recursive: true });
+      createdCacheDirs.add(cacheDir);
+    }
+    const chunkPath = getCacheChunkPath(cache.writeStoragePath, chunkHash);
+    let ok = await writeV8CacheFile(chunkPath, slim);
+    if (!ok) {
+      await fs.mkdir(cacheDir, { recursive: true });
+      createdCacheDirs.add(cacheDir);
+      ok = await writeV8CacheFile(chunkPath, slim);
+    }
+    if (!ok) {
+      cache.entries.set(chunkHash, slim);
+      return;
+    }
+    cache.stagedKeys ??= new Set<string>();
+    cache.stagedKeys.add(chunkHash);
+    cache.entries.delete(chunkHash);
+    return;
+  }
+  cache.entries.set(chunkHash, slim);
+};
+
+/**
+ * Retire a chunk this run cannot vouch for — its durable ParsedFile generation
+ * could not be reset, or its chunk was worker-quarantined (#3204).
+ *
+ * `saveParseCache` refuses a stale key, so no pre-existing `.v8` is copied
+ * forward and the durable store — pruned to exactly the keys that save
+ * returns — drops the chunk in the same step. Clear all lookup sets because
+ * `loadParseCacheChunk` reads `entries`, `stagedKeys` and `onDiskKeys` without consulting
+ * `staleKeys`: otherwise a second lookup of the same hash inside this run
+ * would still serve the retired shard.
+ */
+export const markParseCacheChunkStale = (cache: ParseCache, chunkHash: string): void => {
+  cache.staleKeys ??= new Set<string>();
+  cache.staleKeys.add(chunkHash);
+  cache.fileResults?.memory.delete(chunkHash);
+  cache.fileResults?.stage?.records.delete(chunkHash);
+  cache.entries.delete(chunkHash);
+  cache.onDiskKeys?.delete(chunkHash);
+  cache.stagedKeys?.delete(chunkHash);
+};
+
+const loadLegacyParseCache = async (
+  storagePath: string,
+  identity: ParseCacheIdentity,
+  writeStoragePath: string,
+): Promise<ParseCache> => {
+  const cachePath = getLegacyCachePath(storagePath);
+  try {
+    const raw = await fs.readFile(cachePath, 'utf-8');
+    const data = JSON.parse(raw, mapReviver) as ParseCacheFile;
+    if (
+      typeof data !== 'object' ||
+      data === null ||
+      data.version !== identity.base ||
+      typeof data.entries !== 'object' ||
+      data.entries === null
+    ) {
+      return emptyParseCache(identity, { storagePath, writeStoragePath });
+    }
+    const entries = new Map<string, ParseWorkerResult[]>();
+    for (const [k, v] of Object.entries(data.entries)) {
+      if (Array.isArray(v)) entries.set(k, v as ParseWorkerResult[]);
+    }
+    return { ...emptyParseCache(identity, { storagePath, writeStoragePath }), entries };
+  } catch {
+    return emptyParseCache(identity, { storagePath, writeStoragePath });
+  }
+};
+
+const loadShardedParseCache = async (
+  storagePath: string,
+  identity: ParseCacheIdentity,
+  writeStoragePath: string,
+): Promise<ParseCache | null> => {
+  const indexPath = getCacheIndexPath(storagePath);
+  try {
+    const raw = await fs.readFile(indexPath, 'utf-8');
+    const data = JSON.parse(raw) as ShardedParseCacheIndex;
+    if (
+      typeof data !== 'object' ||
+      data === null ||
+      data.version !== identity.base ||
+      !Array.isArray(data.keys)
+    ) {
+      return emptyParseCache(identity, { storagePath, writeStoragePath });
+    }
+
+    const onDiskKeys = new Set<string>();
+    for (const chunkHash of data.keys) {
+      if (typeof chunkHash === 'string' && isValidChunkCacheKey(chunkHash)) {
+        onDiskKeys.add(chunkHash);
+      }
+    }
+
+    // Lazy: manifests only. Payloads are range-read at the file hit gate.
+    const cache: ParseCache = {
+      identity,
+      entries: new Map(),
+      usedKeys: new Set(),
+      storagePath,
+      writeStoragePath,
+      onDiskKeys,
+      stagedKeys: new Set(),
+    };
+    if (data.format === 'file-results-v1') {
+      const files = await ensureFileParseCache(cache);
+      cache.onDiskKeys = new Set([...onDiskKeys].filter((key) => files.live?.records.has(key)));
+    }
+    return cache;
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * Load the parse cache. Returns an empty cache on any failure (missing
+ * file, corrupt JSON, version mismatch). Never throws on a normal load.
+ */
+export const loadParseCache = async (
+  storagePath: string,
+  identity: ParseCacheIdentity,
+  writeStoragePath: string,
+): Promise<ParseCache> => {
+  const sharded = await loadShardedParseCache(storagePath, identity, writeStoragePath);
+  if (sharded) return sharded;
+  return loadLegacyParseCache(storagePath, identity, writeStoragePath);
+};
+
+/**
+ * Persist the cache to disk using a temp directory + rename.
+ *
+ * Writes shards under `${cacheDir}.tmp`, then removes the old `cacheDir` and
+ * renames the temp directory into place. There is a crash window after
+ * `rm(cacheDir)` and before `rename(tmpDir, cacheDir)` where no cache exists;
+ * that is acceptable — `loadParseCache` yields empty and the next run
+ * reparses. This is not a single atomic swap of the whole tree, but avoids
+ * leaving a half-written shard set visible to readers.
+ */
+export const saveParseCache = async (storagePath: string, cache: ParseCache): Promise<string[]> => {
+  if (cache.fileResults) return saveFileParseCache(storagePath, cache);
+  await fs.mkdir(storagePath, { recursive: true });
+  const cacheDir = getCacheDirPath(storagePath);
+  const tmpDir = `${cacheDir}.tmp`;
+  await fs.rm(tmpDir, { recursive: true, force: true });
+  await fs.mkdir(tmpDir, { recursive: true });
+
+  // A stale key is dropped here rather than at the failure site: the
+  // orchestrator folds sibling-branch keys back into `usedKeys` after the parse
+  // phase (#2106), so this is the last point that sees the final key set. The
+  // exclusion also reaches the durable store, which prunes to the keys this
+  // function returns — both stores drop the chunk together (#3204).
+  const keys = [...cache.usedKeys]
+    .filter((key) => isValidChunkCacheKey(key) && !cache.staleKeys?.has(key))
+    .sort();
+  // Track hashes whose shard was actually written/copied this save. A hash can
+  // be in `usedKeys` without a backing shard — its in-memory serialize threw, or
+  // its on-disk copy failed/was-absent (e.g. a worker-quarantined chunk added to
+  // usedKeys but never persisted). Writing such a hash into `index.keys` would
+  // make the next load reference a shard that doesn't exist (#1983). Build the
+  // index from what we persisted, not from the raw usedKeys snapshot.
+  const writtenKeys: string[] = [];
+  for (const chunkHash of keys) {
+    const chunkPath = path.join(tmpDir, `${chunkHash}.v8`);
+    const inMemory = cache.entries.get(chunkHash);
+    if (inMemory !== undefined) {
+      if (await writeV8CacheFile(chunkPath, inMemory)) {
+        writtenKeys.push(chunkHash);
+      }
+      continue;
+    }
+    // A key is eligible only if this run produced it or the loaded index
+    // admitted it under this base identity. Sibling metadata alone cannot
+    // reclassify a foreign shard. Never fall back to live data for a missing
+    // staged repair: that would publish mismatched worker/durable generations.
+    const sourceRoot = cache.stagedKeys?.has(chunkHash)
+      ? cache.writeStoragePath
+      : cache.onDiskKeys?.has(chunkHash)
+        ? cache.storagePath
+        : undefined;
+    if (sourceRoot === undefined) continue;
+    const sourcePath = getCacheChunkPath(sourceRoot, chunkHash);
+    if (await copyV8CacheIfPresent(sourcePath, chunkPath)) {
+      writtenKeys.push(chunkHash);
+    }
+  }
+
+  const index: ShardedParseCacheIndex = {
+    version: cache.identity.base,
+    keys: writtenKeys,
+  };
+  await fs.writeFile(path.join(tmpDir, CACHE_INDEX_FILENAME), JSON.stringify(index), 'utf-8');
+
+  await fs.rm(cacheDir, { recursive: true, force: true });
+  await fs.rename(tmpDir, cacheDir);
+  await fs.rm(getLegacyCachePath(storagePath), { force: true });
+  // The authoritative final key set actually backed by a shard on disk.
+  // Callers (the durable ParsedFile store) prune to exactly these so the two
+  // content-addressed stores stay coherent — a chunk is cached iff BOTH have it.
+  return writtenKeys;
+};
+
+/**
+ * Drop entries whose hashes are not in `usedHashes`. Called at the end
+ * of a run so chunks that no longer correspond to any current chunk
+ * don't keep their stale entries forever.
+ */
+export const pruneCache = (cache: ParseCache, usedHashes: ReadonlySet<string>): number => {
+  let removed = 0;
+  for (const k of cache.entries.keys()) {
+    if (!usedHashes.has(k)) {
+      cache.entries.delete(k);
+      removed++;
+    }
+  }
+  if (cache.onDiskKeys) {
+    for (const k of cache.onDiskKeys) {
+      if (!usedHashes.has(k)) {
+        cache.onDiskKeys.delete(k);
+        removed++;
+      }
+    }
+  }
+  return removed;
+};
+
+export const emptyParseCache = (
+  identity: ParseCacheIdentity,
+  locations: { storagePath?: string; writeStoragePath?: string } = {},
+): ParseCache => ({
+  identity,
+  entries: new Map<string, ParseWorkerResult[]>(),
+  usedKeys: new Set<string>(),
+  ...locations,
+  onDiskKeys: locations.storagePath ? new Set<string>() : undefined,
+  stagedKeys: locations.writeStoragePath ? new Set<string>() : undefined,
+});
+
+/** Lazily initialize packed state; legacy aggregate shards cannot be split safely. */
+export async function ensureFileParseCache(cache: ParseCache): Promise<FileParseCacheState> {
+  if (cache.fileResults) return cache.fileResults;
+  const live = cache.storagePath
+    ? await loadFileResultStore(
+        path.join(cache.storagePath, 'parse-cache', 'files'),
+        cache.identity.base,
+      )
+    : undefined;
+  const stage = cache.writeStoragePath
+    ? await loadFileResultStore(
+        path.join(cache.writeStoragePath, 'parse-cache', 'files'),
+        cache.identity.base,
+      )
+    : undefined;
+  return (cache.fileResults = { live, stage, memory: new Map() });
+}
+
+/** One file uses the existing framed parser/PDG identity, independent of packing. */
+export function computeFileResultKey(
+  filePath: string,
+  contentHash: string,
+  identity: ParseCacheIdentity,
+  pdg: boolean | PdgCacheKey = false,
+): string {
+  return computeChunkHash([{ filePath, contentHash }], identity, pdg);
+}
+
+export async function loadParseCacheFiles(
+  cache: ParseCache,
+  files: readonly { key: string; path: string }[],
+  scopeStoragePath?: string,
+): Promise<Map<string, ParseWorkerResult>> {
+  const state = await ensureFileParseCache(cache);
+  const result = new Map<string, ParseWorkerResult>();
+  const groups = new Map<FileResultStore, string[]>();
+  const wanted = new Map(files.map((file) => [file.key, file.path]));
+  // Per-file deserialization repeats paths, IDs, and labels. Share their strings
+  // within this batch without keeping the interning table alive after replay.
+  const strings = new Map<string, string>();
+  const accept = (record: EncodedFileResult): ParseWorkerResult | undefined => {
+    if (
+      !record.cacheable ||
+      wanted.get(record.key) !== record.path ||
+      cache.staleKeys?.has(record.key)
+    )
+      return undefined;
+    if (!inspectFileResultSection(record.scopes, record.key, record.path, 'scopes'))
+      return undefined;
+    const facts =
+      decodeFileResultSection(record.facts, record.key, record.path, 'facts', strings) ??
+      decodeFileResultSection(record.facts, record.key, record.path, 'facts');
+    if (!facts) return undefined;
+    const value = facts.value as ParseWorkerResult;
+    if (!value || !Array.isArray(value.nodes) || !Array.isArray(value.parsedFiles))
+      return undefined;
+    return value;
+  };
+  for (const file of files) {
+    if (cache.staleKeys?.has(file.key)) continue;
+    const memory = state.memory.get(file.key);
+    if (memory) {
+      const value = accept(memory);
+      if (value) {
+        const scopes = decodeFileResultSection(memory.scopes, file.key, file.path, 'scopes');
+        if (!scopes || !Array.isArray(scopes.value)) continue;
+        value.parsedFiles = scopes.value as ParseWorkerResult['parsedFiles'];
+        result.set(file.key, value);
+      }
+      continue;
+    }
+    const source = cache.stagedKeys?.has(file.key)
+      ? state.stage
+      : cache.onDiskKeys?.has(file.key)
+        ? state.live
+        : undefined;
+    if (source) {
+      const keys = groups.get(source) ?? [];
+      keys.push(file.key);
+      groups.set(source, keys);
+    }
+  }
+  for (const [source, keys] of groups) {
+    const records = await readFileResults(source, keys);
+    const accepted = new Map<string, ParseWorkerResult>();
+    for (const record of records.values()) {
+      const value = accept(record);
+      if (value) accepted.set(record.key, value);
+    }
+    try {
+      if (scopeStoragePath) await pinFileResults(source, [...accepted.keys()], scopeStoragePath);
+      for (const [key, value] of accepted) {
+        if (!scopeStoragePath) {
+          const scopes = decodeFileResultSection(
+            records.get(key)!.scopes,
+            key,
+            wanted.get(key)!,
+            'scopes',
+          );
+          if (!scopes || !Array.isArray(scopes.value)) continue;
+          value.parsedFiles = scopes.value as ParseWorkerResult['parsedFiles'];
+        }
+        result.set(key, value);
+      }
+    } catch {
+      /* Cannot pin a complete scope snapshot: dispatch these files. */
+    }
+  }
+  return result;
+}
+
+export async function persistParseCacheFiles(
+  cache: ParseCache,
+  records: readonly EncodedFileResult[],
+): Promise<void> {
+  const state = await ensureFileParseCache(cache);
+  const complete = records.filter(
+    (record) => record.cacheable && !cache.staleKeys?.has(record.key),
+  );
+  if (state.stage) {
+    try {
+      await appendFileResults(state.stage, complete);
+      cache.stagedKeys ??= new Set();
+      for (const record of complete) {
+        cache.stagedKeys.add(record.key);
+        state.memory.delete(record.key);
+      }
+      return;
+    } catch {
+      /* Keep graph output usable and retry optional persistence at handoff. */
+    }
+  }
+  for (const record of complete) state.memory.set(record.key, record);
+}
+
+export async function flushFileParseCache(cache: ParseCache): Promise<void> {
+  const state = await ensureFileParseCache(cache);
+  if (state.memory.size) await persistParseCacheFiles(cache, [...state.memory.values()]);
+  if (state.memory.size)
+    throw new Error('Could not persist prepared per-file parser cache records');
+  if (state.stage) await writeFileResultIndex(state.stage);
+}
+
+async function saveFileParseCache(storagePath: string, cache: ParseCache): Promise<string[]> {
+  const state = await ensureFileParseCache(cache);
+  const cacheDir = getCacheDirPath(storagePath),
+    temporary = `${cacheDir}.tmp`;
+  await fs.rm(temporary, { recursive: true, force: true });
+  const output = emptyFileResultStore(path.join(temporary, 'files'), cache.identity.base);
+  // Publication holds the store lock. Refresh the live manifest here because a
+  // sibling may have rotated it after this run selected its immutable snapshots.
+  const live = cache.storagePath
+    ? await loadFileResultStore(
+        path.join(cache.storagePath, 'parse-cache', 'files'),
+        cache.identity.base,
+      )
+    : undefined;
+  const keys = [...cache.usedKeys]
+    .filter((key) => isValidChunkCacheKey(key) && !cache.staleKeys?.has(key))
+    .sort();
+  // Published packs are immutable. Retain their names and bytes when at least
+  // half the pack remains live; compact sparse packs to bound dead-byte storage.
+  // Hashes are still checked when each record is read, before accepting a hit.
+  const packs = new Map<string, FileResultReference[]>();
+  for (const key of keys) {
+    if (cache.stagedKeys?.has(key) || state.memory.has(key) || !cache.onDiskKeys?.has(key))
+      continue;
+    const ref = live?.records.get(key);
+    if (!ref) continue;
+    const refs = packs.get(ref.pack) ?? [];
+    refs.push(ref);
+    packs.set(ref.pack, refs);
+  }
+  await fs.mkdir(output.directory, { recursive: true });
+  for (const [pack, refs] of packs) {
+    const source = path.join(live!.directory, pack);
+    const target = path.join(output.directory, pack);
+    try {
+      const size = (await fs.stat(source)).size;
+      const intact = refs.filter((ref) => ref.offset + ref.factsLength + ref.scopesLength <= size);
+      const retainedBytes = intact.reduce(
+        (sum, ref) => sum + ref.factsLength + ref.scopesLength,
+        0,
+      );
+      if (!retainedBytes || retainedBytes < size / 2) continue;
+      await linkOrCopyFile(source, target);
+      const linkedSize = (await fs.stat(target)).size;
+      for (const ref of intact)
+        if (ref.offset + ref.factsLength + ref.scopesLength <= linkedSize)
+          output.records.set(ref.key, ref);
+    } catch {
+      // Retry through the ordinary verified range reader below. Missing packs
+      // become misses; a staged repair is never replaced by an old live record.
+    }
+  }
+  for (let start = 0; start < keys.length; start += 64) {
+    const batch = keys.slice(start, start + 64).filter((key) => !output.records.has(key));
+    const staged = state.stage
+      ? await readFileResults(
+          state.stage,
+          batch.filter((key) => cache.stagedKeys?.has(key) && !state.memory.has(key)),
+        )
+      : new Map<string, EncodedFileResult>();
+    const retained = live
+      ? await readFileResults(
+          live,
+          batch.filter(
+            (key) =>
+              !cache.stagedKeys?.has(key) && cache.onDiskKeys?.has(key) && !state.memory.has(key),
+          ),
+        )
+      : new Map<string, EncodedFileResult>();
+    const records: EncodedFileResult[] = [];
+    for (const key of batch) {
+      const record = state.memory.get(key) ?? staged.get(key) ?? retained.get(key);
+      if (record) records.push(record);
+    }
+    await appendFileResults(output, records);
+  }
+  const writtenKeys = keys.filter((key) => output.records.has(key));
+  output.records = new Map(writtenKeys.map((key) => [key, output.records.get(key)!]));
+  await writeFileResultIndex(output);
+  await fs.writeFile(
+    path.join(temporary, CACHE_INDEX_FILENAME),
+    JSON.stringify({ version: cache.identity.base, format: 'file-results-v1', keys: writtenKeys }),
+  );
+  await fs.rm(cacheDir, { recursive: true, force: true });
+  await fs.rename(temporary, cacheDir);
+  await fs.rm(getLegacyCachePath(storagePath), { force: true });
+  return writtenKeys;
+}

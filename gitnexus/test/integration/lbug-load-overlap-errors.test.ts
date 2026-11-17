@@ -1,0 +1,451 @@
+/**
+ * Integration test: loadGraphToLbug overlap ERROR paths (#2226 review F1/F2).
+ *
+ * The node-COPY ‖ relationship-emit overlap (#2203) added two error branches the
+ * happy-path tests don't exercise:
+ *  - F1: relationship emit fails while node COPY is in flight — the emit error
+ *    must surface from loadGraphToLbug AND the in-flight node-COPY promise must
+ *    be settled, so nothing leaks as an unhandled rejection.
+ *  - F2: node COPY itself fails — the captured error must be rethrown at the FK
+ *    barrier rather than silently swallowed.
+ *
+ * Both are fault-injected by mocking `streamAllCSVsToDisk` so the test controls
+ * when `onNodePhaseComplete` fires (starting node COPY) and whether emit throws,
+ * while a REAL LadybugDB connection (`initLbug`) runs the node COPY. The mock
+ * pattern (vi.hoisted + vi.mock with importOriginal, preserving every other
+ * export) mirrors test/unit/api-graph-streaming.test.ts.
+ */
+import { describe, it, expect, beforeAll, afterAll, afterEach, vi } from 'vitest';
+import fs from 'fs/promises';
+import path from 'path';
+import os from 'os';
+import type { StreamedCSVResult } from '../../src/core/lbug/csv-generator.js';
+import type { NodeTableName } from '../../src/core/lbug/schema.js';
+import { buildTestGraph } from '../helpers/test-graph.js';
+
+const { emitMock } = vi.hoisted(() => ({ emitMock: vi.fn() }));
+
+// Replace ONLY streamAllCSVsToDisk; importOriginal preserves StreamedCSVResult
+// and every other export lbug-adapter (and its transitive deps) rely on.
+vi.mock('../../src/core/lbug/csv-generator.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/core/lbug/csv-generator.js')>();
+  return { ...actual, streamAllCSVsToDisk: emitMock };
+});
+
+type NodeFiles = Map<NodeTableName, { csvPath: string; rows: number }>;
+
+const REL_HEADER = 'from,to,type,confidence,reason,step';
+const emptyResult = (): StreamedCSVResult => ({
+  nodeFiles: new Map(),
+  relsByPair: new Map(),
+  relHeader: REL_HEADER,
+  skippedRels: 0,
+  totalValidRels: 0,
+});
+
+let tmpBase: string;
+let storagePath: string;
+let dbPath: string;
+
+beforeAll(async () => {
+  tmpBase = await fs.mkdtemp(path.join(os.tmpdir(), 'gitnexus-lbug-overlap-err-'));
+  storagePath = path.join(tmpBase, '.gitnexus');
+  dbPath = path.join(storagePath, 'lbug');
+  await fs.mkdir(dbPath, { recursive: true });
+
+  const adapter = await import('../../src/core/lbug/lbug-adapter.js');
+  await adapter.initLbug(dbPath);
+});
+
+afterEach(() => {
+  emitMock.mockReset();
+  vi.restoreAllMocks();
+});
+
+afterAll(async () => {
+  try {
+    const adapter = await import('../../src/core/lbug/lbug-adapter.js');
+    await adapter.closeLbug();
+  } catch {
+    /* may already be closed */
+  }
+  if (tmpBase) {
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        await fs.rm(tmpBase, { recursive: true, force: true });
+        return;
+      } catch {
+        if (attempt < 4) await new Promise((r) => setTimeout(r, 200 * (attempt + 1)));
+      }
+    }
+  }
+});
+
+describe('loadGraphToLbug overlap error paths (#2226 F1)', () => {
+  it.each([1000, 0])(
+    'retains COPY failures and rejects skipped rows with warning_limit=%i',
+    async (warningLimit) => {
+      const adapter = await import('../../src/core/lbug/lbug-adapter.js');
+      const { _captureLogger } = await import('../../src/core/logger.js');
+      const graph = buildTestGraph([], []);
+      emitMock.mockImplementation(
+        async (_g: unknown, _r: unknown, dir: string, onNodes?: (n: NodeFiles) => void) => {
+          await fs.mkdir(dir, { recursive: true });
+          const csvPath = path.join(dir, 'function.csv');
+          await fs.writeFile(
+            csvPath,
+            'id,name,filePath,startLine,endLine,isExported,content,description,convexEndpointFactory\n' +
+              '"Function:bad.ts:copy","copy","bad.ts",bad,2,false,"","",""\n',
+          );
+          const nodeFiles = new Map([['Function', { csvPath, rows: 1 }]]) as NodeFiles;
+          onNodes?.(nodeFiles);
+          return { ...emptyResult(), nodeFiles };
+        },
+      );
+      const capture = _captureLogger();
+      try {
+        await adapter.executeQuery(`CALL warning_limit=${warningLimit}`);
+        await expect(adapter.loadGraphToLbug(graph, tmpBase, storagePath)).rejects.toThrow(
+          /skipped/i,
+        );
+        const records = capture.records();
+        expect(records.some((r) => /first COPY failure/i.test(String(r.msg)))).toBe(true);
+        expect(records).toContainEqual(
+          expect.objectContaining({
+            expectedRows: 1,
+            copiedRows: 0,
+            skippedRows: 1,
+            retainedWarnings: warningLimit === 0 ? 0 : 1,
+          }),
+        );
+      } finally {
+        try {
+          await adapter.executeQuery('CALL warning_limit=1000');
+        } finally {
+          capture.restore();
+        }
+      }
+    },
+  );
+
+  it('relationship-emit failure with node COPY in flight surfaces the emit error and leaks no unhandled rejection', async () => {
+    const adapter = await import('../../src/core/lbug/lbug-adapter.js');
+    const graph = buildTestGraph(
+      [{ id: 'File:src/u1.ts', label: 'File', name: 'u1.ts', filePath: 'src/u1.ts' }],
+      [],
+    );
+
+    // emit writes a REAL node CSV (so node COPY actually runs to completion in
+    // flight), fires the hook to start node COPY, then throws as if the
+    // relationship pass blew up (EMFILE / disk-full).
+    emitMock.mockImplementation(
+      async (
+        _g: unknown,
+        _r: unknown,
+        dir: string,
+        onNodePhaseComplete?: (n: NodeFiles) => void,
+      ) => {
+        await fs.mkdir(dir, { recursive: true }); // mocked emit skips the real csvDir creation
+        const csvPath = path.join(dir, 'file.csv');
+        await fs.writeFile(
+          csvPath,
+          'id,name,filePath,content\n"File:src/u1.ts","u1.ts","src/u1.ts",""\n',
+        );
+        onNodePhaseComplete?.(new Map([['File', { csvPath, rows: 1 }]]) as NodeFiles);
+        throw new Error('simulated rel emit failure');
+      },
+    );
+
+    const rejections: unknown[] = [];
+    const onUnhandled = (e: unknown): void => {
+      rejections.push(e);
+    };
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      await expect(adapter.loadGraphToLbug(graph, tmpBase, storagePath)).rejects.toThrow(
+        'simulated rel emit failure',
+      );
+      // Flush the macrotask queue so any stray rejection from the in-flight
+      // node-COPY promise actually surfaces BEFORE we assert — otherwise the
+      // check passes vacuously.
+      await new Promise((r) => setImmediate(r));
+      expect(rejections).toEqual([]);
+    } finally {
+      // forks reuse the process across this file's tests — a leaked listener
+      // would corrupt sibling tests.
+      process.off('unhandledRejection', onUnhandled);
+    }
+  });
+
+  it('also logs the node-COPY error when BOTH emit and node COPY fail (emit error still wins)', async () => {
+    const adapter = await import('../../src/core/lbug/lbug-adapter.js');
+    const { _captureLogger } = await import('../../src/core/logger.js');
+    const graph = buildTestGraph(
+      [{ id: 'File:src/u1b.ts', label: 'File', name: 'u1b.ts', filePath: 'src/u1b.ts' }],
+      [],
+    );
+
+    // nodeFiles points at a MISSING csv (node COPY fails) AND emit throws.
+    emitMock.mockImplementation(
+      async (
+        _g: unknown,
+        _r: unknown,
+        dir: string,
+        onNodePhaseComplete?: (n: NodeFiles) => void,
+      ) => {
+        onNodePhaseComplete?.(
+          new Map([['File', { csvPath: path.join(dir, 'missing-u1b.csv'), rows: 1 }]]) as NodeFiles,
+        );
+        throw new Error('simulated rel emit failure (double)');
+      },
+    );
+
+    const cap = _captureLogger();
+    const rejections: unknown[] = [];
+    const onUnhandled = (e: unknown): void => {
+      rejections.push(e);
+    };
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      await expect(adapter.loadGraphToLbug(graph, tmpBase, storagePath)).rejects.toThrow(
+        'simulated rel emit failure (double)',
+      );
+      await new Promise((r) => setImmediate(r));
+      expect(rejections).toEqual([]);
+      const warned = cap
+        .records()
+        .map((rec) => (typeof rec.msg === 'string' ? rec.msg : ''))
+        .some((m) => m.includes('node COPY also failed'));
+      expect(warned).toBe(true);
+    } finally {
+      cap.restore();
+      process.off('unhandledRejection', onUnhandled);
+    }
+  });
+});
+
+describe('loadGraphToLbug overlap error paths (#2226 F2)', () => {
+  it('a node-COPY hard failure is rethrown at the FK barrier', async () => {
+    const adapter = await import('../../src/core/lbug/lbug-adapter.js');
+    const graph = buildTestGraph(
+      [{ id: 'File:src/u2.ts', label: 'File', name: 'u2.ts', filePath: 'src/u2.ts' }],
+      [],
+    );
+
+    // Node COPY targets a MISSING csv. This is now caught by the staging-CSV
+    // preflight BEFORE the engine sees it, so the message is the actionable
+    // "Staging CSV for File is missing …" rather than LadybugDB's bind-time
+    // "No file found …" (which IGNORE_ERRORS does not suppress either). What
+    // this test pins is unchanged and is the point: whatever the node COPY
+    // fails with, it is captured in nodeCopyError and RETHROWN AT THE FK
+    // BARRIER rather than being swallowed. Emit otherwise "succeeds"
+    // (returns an empty result), so the node COPY is the only failure.
+    emitMock.mockImplementation(
+      async (
+        _g: unknown,
+        _r: unknown,
+        dir: string,
+        onNodePhaseComplete?: (n: NodeFiles) => void,
+      ) => {
+        onNodePhaseComplete?.(
+          new Map([['File', { csvPath: path.join(dir, 'missing-u2.csv'), rows: 1 }]]) as NodeFiles,
+        );
+        return emptyResult();
+      },
+    );
+
+    await expect(adapter.loadGraphToLbug(graph, tmpBase, storagePath)).rejects.toThrow(
+      /Staging CSV for File is missing/,
+    );
+  });
+});
+
+describe('graph write buffer exhaustion (#3526)', () => {
+  let fixtureId = 0;
+
+  const emitGraphCSVs = (malformedRelationship = false) => {
+    const prefix = `pool-${++fixtureId}`;
+    emitMock.mockImplementation(
+      async (_g: unknown, _r: unknown, dir: string, onNodes?: (n: NodeFiles) => void) => {
+        await fs.mkdir(dir, { recursive: true });
+        const csvPath = path.join(dir, 'file.csv');
+        await fs.writeFile(
+          csvPath,
+          'id,name,filePath,content\n' +
+            `"File:${prefix}-a.ts","a.ts","${prefix}-a.ts",""\n` +
+            `"File:${prefix}-b.ts","b.ts","${prefix}-b.ts",""\n`,
+        );
+        const nodeFiles = new Map([['File', { csvPath, rows: 2 }]]) as NodeFiles;
+        onNodes?.(nodeFiles);
+        const relPath = path.join(dir, 'rel_File_File.csv');
+        await fs.writeFile(
+          relPath,
+          REL_HEADER +
+            ',staticGated\n' +
+            `"File:${prefix}-a.ts","File:${prefix}-b.ts","IMPORTS",${malformedRelationship ? 'bad' : '1'},"first",0,0\n` +
+            `"File:${prefix}-b.ts","File:${prefix}-a.ts","IMPORTS",1,"second",0,0\n`,
+        );
+        return {
+          ...emptyResult(),
+          nodeFiles,
+          relsByPair: new Map([['File|File', { csvPath: relPath, rows: 2 }]]),
+          totalValidRels: 2,
+        };
+      },
+    );
+    return prefix;
+  };
+
+  // Keep real native results (including warning cursors and their cleanup),
+  // replacing only the particular statement that simulates the failure.
+  const injectQueries = async (replace: (sql: string) => Error | string | undefined) => {
+    const { default: lbug } = await import('@ladybugdb/core');
+    const originalQuery = lbug.Connection.prototype.query;
+    const seen: string[] = [];
+    vi.spyOn(lbug.Connection.prototype, 'query').mockImplementation(function (
+      this: unknown,
+      sql: string,
+      ...rest: unknown[]
+    ) {
+      seen.push(sql);
+      const replacement = replace(sql);
+      if (replacement instanceof Error) return Promise.reject(replacement);
+      return originalQuery.call(this, replacement ?? sql, ...rest);
+    });
+    return seen;
+  };
+
+  const isRelationshipCopy = (sql: string) => /^COPY CodeRelation\b/.test(sql);
+  const isFallbackInsert = (sql: string) => /CREATE \(a\)-\[:CodeRelation/.test(sql);
+
+  it.each([
+    { phase: 'node', isCopy: (sql: string) => /^COPY File\(/.test(sql) },
+    { phase: 'relationship', isCopy: isRelationshipCopy },
+  ])(
+    'aborts a first $phase COPY exhaustion without retrying or falling back',
+    async ({ isCopy }) => {
+      const adapter = await import('../../src/core/lbug/lbug-adapter.js');
+      emitGraphCSVs();
+      const original = new Error('Unable to allocate memory! The buffer pool is full!');
+      const seen = await injectQueries((sql) =>
+        isCopy(sql) && !sql.includes('IGNORE_ERRORS') ? original : undefined,
+      );
+
+      const error = await adapter
+        .loadGraphToLbug(buildTestGraph([], []), tmpBase, storagePath)
+        .catch((err: unknown) => err);
+      expect(error).toBeInstanceOf(Error);
+      expect(error).toMatchObject({ cause: original });
+      expect((error as Error).message).toContain(original.message);
+      expect((error as Error).message).toContain('GITNEXUS_LBUG_BUFFER_POOL_SIZE');
+      expect(seen.some((sql) => sql.includes('IGNORE_ERRORS'))).toBe(false);
+      expect(seen.some(isFallbackInsert)).toBe(false);
+    },
+  );
+
+  it('aborts retry exhaustion before relationship fallback', async () => {
+    const adapter = await import('../../src/core/lbug/lbug-adapter.js');
+    emitGraphCSVs();
+    const original = new Error('Unable to allocate memory during relationship retry');
+    const seen = await injectQueries((sql) => {
+      if (isRelationshipCopy(sql)) {
+        return sql.includes('IGNORE_ERRORS') ? original : new Error('ordinary COPY failure');
+      }
+    });
+
+    const error = await adapter
+      .loadGraphToLbug(buildTestGraph([], []), tmpBase, storagePath)
+      .catch((err: unknown) => err);
+    expect(error).toBeInstanceOf(Error);
+    expect(error).toMatchObject({ cause: original });
+    expect((error as Error).message).toContain(original.message);
+    expect((error as Error).message).toContain('ordinary COPY failure');
+    expect((error as Error).message).toContain('GITNEXUS_LBUG_BUFFER_POOL_SIZE');
+    expect(seen.filter(isRelationshipCopy)).toHaveLength(2);
+    expect(seen.some(isFallbackInsert)).toBe(false);
+  });
+
+  it('aborts when a retained resource warning is beyond the five logged samples', async () => {
+    const adapter = await import('../../src/core/lbug/lbug-adapter.js');
+    emitGraphCSVs();
+    const seen = await injectQueries((sql) => {
+      if (isRelationshipCopy(sql) && !sql.includes('IGNORE_ERRORS')) {
+        return new Error('ordinary COPY failure');
+      }
+      if (sql.startsWith('CALL SHOW_WARNINGS()')) {
+        return (
+          "UNWIND ['row one', 'row two', 'row three', 'row four', 'row five', " +
+          "'Unable to allocate memory in COPY'] AS message RETURN message, '' AS file_path, 1 AS line_number"
+        );
+      }
+    });
+
+    await expect(
+      adapter.loadGraphToLbug(buildTestGraph([], []), tmpBase, storagePath),
+    ).rejects.toThrow(/Unable to allocate memory.*GITNEXUS_LBUG_BUFFER_POOL_SIZE/);
+    expect(seen.some(isFallbackInsert)).toBe(false);
+  });
+
+  it('stops fallback on resource exhaustion before the next relationship', async () => {
+    const adapter = await import('../../src/core/lbug/lbug-adapter.js');
+    emitGraphCSVs();
+    const original = new Error('The buffer pool is full during CREATE');
+    const seen = await injectQueries((sql) => {
+      if (isRelationshipCopy(sql)) return new Error('ordinary COPY failure');
+      if (isFallbackInsert(sql)) return original;
+    });
+
+    const error = await adapter
+      .loadGraphToLbug(buildTestGraph([], []), tmpBase, storagePath)
+      .catch((err: unknown) => err);
+    expect(error).toMatchObject({ cause: original });
+    expect((error as Error).message).toContain('GITNEXUS_LBUG_BUFFER_POOL_SIZE');
+    expect(seen.filter(isFallbackInsert)).toHaveLength(1);
+  });
+
+  it('still skips an ordinary fallback row error and inserts subsequent relationships', async () => {
+    const adapter = await import('../../src/core/lbug/lbug-adapter.js');
+    const prefix = emitGraphCSVs();
+    let inserts = 0;
+    const seen = await injectQueries((sql) => {
+      if (isRelationshipCopy(sql)) return new Error('ordinary COPY failure');
+      if (isFallbackInsert(sql) && ++inserts === 1) return new Error('ordinary row failure');
+    });
+
+    await expect(
+      adapter.loadGraphToLbug(buildTestGraph([], []), tmpBase, storagePath),
+    ).resolves.toMatchObject({ success: true });
+    expect(seen.filter(isFallbackInsert)).toHaveLength(2);
+    const rows = await adapter.executeQuery(
+      `MATCH (a:File {id: 'File:${prefix}-b.ts'})-[r:CodeRelation]->(b) RETURN r.reason AS reason`,
+    );
+    expect(rows).toEqual([{ reason: 'second' }]);
+  });
+
+  it('loads a healthy graph through real COPY', async () => {
+    const adapter = await import('../../src/core/lbug/lbug-adapter.js');
+    const prefix = emitGraphCSVs();
+    await expect(
+      adapter.loadGraphToLbug(buildTestGraph([], []), tmpBase, storagePath),
+    ).resolves.toMatchObject({ success: true, warnings: [] });
+    const rows = await adapter.executeQuery(
+      `MATCH (a:File)-[r:CodeRelation]->(b) WHERE a.id STARTS WITH 'File:${prefix}-' RETURN count(r) AS count`,
+    );
+    expect(Number(rows[0].count)).toBe(2);
+  });
+
+  it('still skips an ordinary malformed relationship during COPY retry without replaying it', async () => {
+    const adapter = await import('../../src/core/lbug/lbug-adapter.js');
+    const prefix = emitGraphCSVs(true);
+    const seen = await injectQueries(() => undefined);
+    await expect(
+      adapter.loadGraphToLbug(buildTestGraph([], []), tmpBase, storagePath),
+    ).resolves.toMatchObject({ success: true });
+    expect(seen.filter(isRelationshipCopy)).toHaveLength(2);
+    expect(seen.some(isFallbackInsert)).toBe(false);
+    const rows = await adapter.executeQuery(
+      `MATCH (a:File)-[r:CodeRelation]->(b) WHERE a.id STARTS WITH 'File:${prefix}-' RETURN r.reason AS reason`,
+    );
+    expect(rows).toEqual([{ reason: 'second' }]);
+  });
+});

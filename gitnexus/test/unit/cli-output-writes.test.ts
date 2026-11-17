@@ -112,9 +112,19 @@ describe('output() writes the whole payload (#3947)', () => {
     expect(process.exitCode).toBe(1);
   });
 
-  // NOTE: upstream's "keeps the cycles-found exit code of check on EPIPE" test
-  // is omitted here: this fork does not yet carry upstream's `checkCommand`
-  // (#3947's sibling work), so the test would reference a missing export.
+  it('keeps the cycles-found exit code of check on EPIPE', async () => {
+    writeSyncMock.mockImplementation(fail('EPIPE'));
+    callToolMock.mockResolvedValue({
+      status: 'cycles_found',
+      cycleCount: 1,
+      cycles: [{ files: ['src/a.ts', 'src/b.ts', 'src/a.ts'] }],
+    });
+    const { checkCommand } = await import('../../src/cli/tool.js');
+
+    await checkCommand({ cycles: true });
+
+    expect(process.exitCode).toBe(1);
+  });
 
   it('falls back to stderr and fails when stdout breaks after a partial write', async () => {
     const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);

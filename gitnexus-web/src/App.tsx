@@ -9,24 +9,56 @@ import { SettingsPanel } from './components/SettingsPanel';
 import { StatusBar } from './components/StatusBar';
 import { FileTreePanel } from './components/FileTreePanel';
 import { CodeReferencesPanel } from './components/CodeReferencesPanel';
+import { ExecutionDashboard } from './components/ExecutionDashboard';
 import { getActiveProviderConfig } from './core/llm/settings-service';
-import { createKnowledgeGraph } from './core/graph/graph';
+import { buildGraphFromConnectResult } from './lib/apply-connect-result';
 import {
   connectToServer,
   fetchRepos,
+  fetchServerInfo,
   normalizeServerUrl,
   connectHeartbeat,
   BackendError,
   type ConnectResult,
   type BackendRepo,
+  type ServerInfo,
 } from './services/backend-client';
-import { ERROR_RESET_DELAY_MS } from './config/ui-constants';
+import {
+  ERROR_RESET_DELAY_MS,
+  UPDATE_DISMISSED_VERSION_KEY,
+  UPDATE_INFO_REFETCH_MS,
+} from './config/ui-constants';
+import { parseSkipGraphParam } from './lib/graph-load-decision';
+import { formatBackendError } from './i18n/error-messages';
+import { useTranslation } from 'react-i18next';
+
+/** Positional shell shared by the fixed bottom banners (reconnect, update). */
+const BOTTOM_BANNER_CLASS =
+  'fixed bottom-12 left-1/2 z-50 -translate-x-1/2 rounded-lg border px-4 py-2 text-sm shadow-lg backdrop-blur';
+
+/**
+ * Restore-param preference for the auto-connect effect: `repo` carries the
+ * server-resolved path identity (restores the exact repo even when duplicate
+ * display names exist, #2419), while older `project`-only URLs degrade to a
+ * name-based restore. Exported for direct unit testing — no test harness
+ * renders <App/>.
+ */
+export const pickRestoreRepo = (params: URLSearchParams): string | undefined =>
+  params.get('repo') ?? params.get('project') ?? undefined;
+
+const isOpsView = (): boolean => {
+  if (typeof window === 'undefined') return false;
+  return new URLSearchParams(window.location.search).get('view') === 'ops';
+};
 
 const AppContent = () => {
+  const { t } = useTranslation(['common', 'errors']);
   const {
     viewMode,
     setViewMode,
     setGraph,
+    setGraphMode,
+    setChatOnlyNodeCount,
     setProgress,
     setProjectName,
     progress,
@@ -49,43 +81,90 @@ const AppContent = () => {
 
   const graphCanvasRef = useRef<GraphCanvasHandle>(null);
   const [serverDisconnected, setServerDisconnected] = useState(false);
+  const [serverInfo, setServerInfo] = useState<ServerInfo | null>(null);
+  const [dismissedUpdateVersion, setDismissedUpdateVersion] = useState<string | null>(() => {
+    try {
+      return localStorage.getItem(UPDATE_DISMISSED_VERSION_KEY);
+    } catch {
+      return null;
+    }
+  });
+  const wasDisconnectedRef = useRef(false);
+  const refreshSeqRef = useRef(0);
+
+  const refreshServerInfo = useCallback(async (): Promise<void> => {
+    const seq = ++refreshSeqRef.current;
+    try {
+      const next = await fetchServerInfo();
+      // A newer fetch is already in flight; never commit an older payload.
+      if (seq !== refreshSeqRef.current) return;
+      // Keep the previous state (and banner) when nothing changed, so
+      // reconnect refetches don't flicker the UI.
+      setServerInfo((prev) =>
+        prev?.version === next.version &&
+        prev?.latestVersion === next.latestVersion &&
+        prev?.updateAvailable === next.updateAvailable
+          ? prev
+          : next,
+      );
+    } catch {
+      // Update state is informational; unavailable server info must not affect the app.
+    }
+  }, []);
+
+  const dismissUpdate = useCallback(() => {
+    const latestVersion = serverInfo?.latestVersion;
+    if (!latestVersion) return;
+    setDismissedUpdateVersion(latestVersion);
+    try {
+      localStorage.setItem(UPDATE_DISMISSED_VERSION_KEY, latestVersion);
+    } catch {
+      // The in-memory dismissal still applies when storage is unavailable.
+    }
+  }, [serverInfo?.latestVersion]);
 
   const handleServerConnect = useCallback(
     async (result: ConnectResult): Promise<void> => {
       // Use the canonical repo name from the server response so all subsequent
       // backend calls (queries, search, grep, readFile) scope to this repo.
-      const repoName = result.repoInfo.name;
       const repoPath = result.repoInfo.repoPath ?? result.repoInfo.path;
       // Normalize both Windows (\) and Unix (/) path separators before splitting
       const projectName =
         result.repoInfo.name ||
         (repoPath || '').replace(/\\/g, '/').split('/').filter(Boolean).pop() ||
         'server-project';
+      const repoIdentity = repoPath || projectName;
       setProjectName(projectName);
-      setCurrentRepo(projectName);
+      setCurrentRepo(repoIdentity);
 
-      // Build KnowledgeGraph from server data for visualization
-      const graph = createKnowledgeGraph();
-      for (const node of result.nodes) {
-        graph.addNode(node);
-      }
-      for (const rel of result.relationships) {
-        graph.addRelationship(rel);
-      }
-      setGraph(graph);
+      // Build KnowledgeGraph from server data for visualization. In chat-only
+      // mode the graph download was skipped, so the shared builder keeps an
+      // empty (but non-null) graph and flags the mode so the UI shows the
+      // chat-only empty state, with the node count captured for its notice.
+      const built = buildGraphFromConnectResult(result);
+      setGraph(built.graph);
+      setGraphMode(built.graphMode);
+      setChatOnlyNodeCount(built.graphMode === 'chatOnly' ? built.nodeCount : null);
 
-      // Persist the active project in the URL for bookmarkability and F5 refresh resilience
+      // Persist the active project in the URL for bookmarkability and F5 refresh resilience.
+      // `repo` carries the server-resolved path identity (never the request-side
+      // string) so a refresh restores this exact repo even when duplicate display
+      // names exist (#2419); `project` stays as the readable display name.
       const urlObj = new URL(window.location.href);
       urlObj.searchParams.set('project', projectName);
+      if (repoPath) {
+        urlObj.searchParams.set('repo', repoPath);
+      }
       window.history.replaceState(null, '', urlObj.toString());
 
       // Transition directly to exploring view
       setViewMode('exploring');
 
-      // Initialize agent with backend queries, then start embeddings
+      // Initialize agent with backend queries, then start embeddings. Pass the
+      // chat-only flag so the agent's prompt matches the loaded/skipped graph (#2178).
       try {
         if (getActiveProviderConfig()) {
-          await initializeAgent(projectName);
+          await initializeAgent(projectName, { chatOnly: result.graphSkipped, repo: repoIdentity });
         }
         startEmbeddingsWithFallback();
       } catch (err) {
@@ -95,6 +174,8 @@ const AppContent = () => {
     [
       setViewMode,
       setGraph,
+      setGraphMode,
+      setChatOnlyNodeCount,
       setProjectName,
       setCurrentRepo,
       initializeAgent,
@@ -102,22 +183,34 @@ const AppContent = () => {
     ],
   );
 
-  // Auto-connect when ?server or ?project query param is present (bookmarkable shortcut)
+  // Auto-connect when a ?server, ?repo or ?project query param is present
+  // (bookmarkable shortcut). A failed ?repo= restore (e.g. the bookmarked path
+  // was deleted) fails visibly via the error overlay → onboarding — it must
+  // NOT silently fall back to a name-based connect, which could reconnect a
+  // same-named sibling repo (#2419).
   const autoConnectRan = useRef(false);
+  const tRef = useRef(t);
+  useEffect(() => {
+    tRef.current = t;
+  }, [t]);
+
   useEffect(() => {
     if (autoConnectRan.current) return;
     const params = new URLSearchParams(window.location.search);
     const serverUrlParam = params.get('server');
-    const projectParam = params.get('project');
+    const restoreRepoParam = pickRestoreRepo(params);
+    // `?skipGraph=1` forces chat-only, `?skipGraph=0` forces a full graph;
+    // absent → auto-detect by node count. Bookmarkable / survives F5 (#2178).
+    const skipGraphParam = parseSkipGraphParam(params.get('skipGraph'));
 
-    if (!serverUrlParam && !projectParam) return;
+    if (!serverUrlParam && !restoreRepoParam) return;
     autoConnectRan.current = true;
 
     setProgress({
       phase: 'extracting',
       percent: 0,
-      message: 'Connecting to server...',
-      detail: 'Validating server',
+      message: tRef.current('common:progress.connecting'),
+      detail: tRef.current('common:progress.validatingServer'),
     });
     setViewMode('loading');
 
@@ -132,8 +225,8 @@ const AppContent = () => {
             setProgress({
               phase: 'extracting',
               percent: 5,
-              message: 'Connecting to server...',
-              detail: 'Validating server',
+              message: tRef.current('common:progress.connecting'),
+              detail: tRef.current('common:progress.validatingServer'),
             });
           } else if (phase === 'downloading') {
             const pct = total ? Math.round((downloaded / total) * 90) + 5 : 50;
@@ -141,29 +234,34 @@ const AppContent = () => {
             setProgress({
               phase: 'extracting',
               percent: pct,
-              message: 'Downloading graph...',
-              detail: `${mb} MB downloaded`,
+              message: tRef.current('common:progress.downloadingGraph'),
+              detail: tRef.current('common:progress.downloadedMb', { mb }),
             });
           } else if (phase === 'extracting') {
             setProgress({
               phase: 'extracting',
               percent: 97,
-              message: 'Processing...',
-              detail: 'Extracting file contents',
+              message: tRef.current('common:progress.processing'),
+              detail: tRef.current('common:progress.extractingFileContents'),
             });
           }
         },
         undefined,
-        projectParam || undefined,
-        { awaitAnalysis: true }, // enable backend hold-queue for repos still being analyzed
+        restoreRepoParam,
+        { awaitAnalysis: true, skipGraph: skipGraphParam }, // hold-queue + chat-only control (#2178)
       );
     };
 
     tryConnect()
       .then(async (result) => {
+        // Set serverBaseUrl BEFORE handleServerConnect: the latter transitions
+        // to 'exploring' (rendering the chat-only overlay + its "Load graph
+        // anyway" button) and then awaits agent init, leaving a window where
+        // loadGraphAnyway would silently no-op on a still-null serverBaseUrl.
+        setServerBaseUrl(baseUrl);
+        void refreshServerInfo();
         await handleServerConnect(result);
         setProgress(null);
-        setServerBaseUrl(baseUrl);
         fetchRepos()
           .then((repos) => setAvailableRepos(repos))
           .catch((e) => console.warn('Failed to fetch repo list:', e));
@@ -173,15 +271,22 @@ const AppContent = () => {
         setProgress({
           phase: 'error',
           percent: 0,
-          message: 'Failed to connect to server',
-          detail: err instanceof Error ? err.message : 'Unknown error',
+          message: tRef.current('errors:connectFailed'),
+          detail: formatBackendError(err, tRef.current),
         });
         setTimeout(() => {
           setViewMode('onboarding');
           setProgress(null);
         }, ERROR_RESET_DELAY_MS);
       });
-  }, [handleServerConnect, setProgress, setViewMode, setServerBaseUrl, setAvailableRepos]);
+  }, [
+    handleServerConnect,
+    refreshServerInfo,
+    setProgress,
+    setViewMode,
+    setServerBaseUrl,
+    setAvailableRepos,
+  ]);
 
   const handleFocusNode = useCallback((nodeId: string) => {
     graphCanvasRef.current?.focusNode(nodeId);
@@ -194,6 +299,14 @@ const AppContent = () => {
     initializeAgent();
   }, [refreshLLMSettings, initializeAgent]);
 
+  // While exploring, re-read server info on a slow cadence so an update the
+  // server discovers after page load surfaces without a manual reload.
+  useEffect(() => {
+    if (viewMode !== 'exploring' || serverDisconnected) return;
+    const interval = setInterval(() => void refreshServerInfo(), UPDATE_INFO_REFETCH_MS);
+    return () => clearInterval(interval);
+  }, [viewMode, serverDisconnected, refreshServerInfo]);
+
   // ── Server heartbeat: detect when server goes down while exploring ────────
   // Uses SSE (EventSource) for instant detection — no polling delay.
   // On disconnect: show a reconnecting banner instead of resetting to onboarding.
@@ -202,12 +315,21 @@ const AppContent = () => {
     if (viewMode !== 'exploring') return;
 
     const cleanup = connectHeartbeat(
-      () => setServerDisconnected(false),
-      () => setServerDisconnected(true),
+      () => {
+        setServerDisconnected(false);
+        if (wasDisconnectedRef.current) {
+          wasDisconnectedRef.current = false;
+          void refreshServerInfo();
+        }
+      },
+      () => {
+        wasDisconnectedRef.current = true;
+        setServerDisconnected(true);
+      },
     );
 
     return cleanup;
-  }, [viewMode]);
+  }, [viewMode, refreshServerInfo]);
 
   // Render based on view mode
   if (viewMode === 'onboarding') {
@@ -215,6 +337,7 @@ const AppContent = () => {
       <DropZone
         onServerConnect={async (result, serverUrl) => {
           // Refresh repo list before transitioning so it's ready in the header
+          void refreshServerInfo();
           const repos = await fetchRepos().catch(() => [] as BackendRepo[]);
           setAvailableRepos(repos);
           await handleServerConnect(result);
@@ -254,14 +377,20 @@ const AppContent = () => {
             try {
               const repos = await fetchRepos();
               setAvailableRepos(repos);
+              // Auto-detect by size for a freshly-analyzed repo (#2178). A stale
+              // ?skipGraph from a previously-viewed repo must NOT leak in here —
+              // that would bypass the size guard and could re-trigger the hang.
               const result = await connectToServer(url, undefined, undefined, repoName);
               await handleServerConnect(result);
               setServerBaseUrl(normalizeServerUrl(url));
               setProgress(null);
               return;
             } catch (err: unknown) {
-              if (attempt === 0 && err instanceof BackendError && err.status === 404) {
-                // Server may still be reinitializing — wait and retry
+              // Server may still be reinitializing after the worker completed:
+              // that surfaces as a 404 (repo not registered yet) OR a transient
+              // 5xx/binder error while the freshly-written DB becomes readable.
+              // Either way, wait and retry once before giving up.
+              if (attempt === 0 && err instanceof BackendError) {
                 await new Promise((r) => setTimeout(r, 1500));
                 continue;
               }
@@ -298,10 +427,38 @@ const AppContent = () => {
       <StatusBar />
 
       {serverDisconnected && (
-        <div className="fixed bottom-12 left-1/2 z-50 -translate-x-1/2 rounded-lg border border-yellow-500/30 bg-yellow-900/80 px-4 py-2 text-sm text-yellow-200 shadow-lg backdrop-blur">
-          Server connection lost — reconnecting&hellip;
+        <div
+          className={`${BOTTOM_BANNER_CLASS} border-yellow-500/30 bg-yellow-900/80 text-yellow-200`}
+        >
+          {t('errors:backend.reconnecting')}
         </div>
       )}
+
+      {!serverDisconnected &&
+        serverInfo?.updateAvailable === true &&
+        !!serverInfo.latestVersion &&
+        dismissedUpdateVersion !== serverInfo.latestVersion && (
+          <div
+            role="status"
+            aria-live="polite"
+            className={`${BOTTOM_BANNER_CLASS} flex items-center gap-3 border-accent/30 bg-surface/95 text-text-primary`}
+          >
+            <span>
+              {t('common:updateBanner', {
+                latest: serverInfo.latestVersion,
+                installed: serverInfo.version,
+              })}
+            </span>
+            <button
+              type="button"
+              onClick={dismissUpdate}
+              aria-label={t('common:updateBannerDismiss')}
+              className="rounded px-2 py-1 text-text-secondary hover:bg-white/10 hover:text-text-primary focus-visible:ring-2 focus-visible:ring-accent focus-visible:outline-none"
+            >
+              {t('common:actions.dismiss')}
+            </button>
+          </div>
+        )}
 
       {/* Settings Panel (modal) */}
       <SettingsPanel
@@ -314,6 +471,9 @@ const AppContent = () => {
 };
 
 function App() {
+  if (isOpsView()) {
+    return <ExecutionDashboard />;
+  }
   return (
     <AppStateProvider>
       <AppContent />

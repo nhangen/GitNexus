@@ -1,0 +1,48 @@
+{
+  "_comment": "Single source of truth for the VENDORED SET + policy holds, read by BOTH .github/scripts/update-vendored-grammars.mjs (weekly auto-PR bot) and .github/scripts/check-tree-sitter-upgrade-readiness.py (daily readiness report -> issue #858). The monitor also resolves each grammar's upstream from the `upstream` field here; the readiness report reads vendored ABIs from gitnexus/vendor/<name>/src/parser.c and keeps its own upstream-drift coords. A consistency-guard test asserts this set equals the gitnexus/vendor/tree-sitter-* directories. See CONTRIBUTING.md.",
+  "grammars": {
+    "c": {
+      "name": "tree-sitter-c",
+      "upstream": {
+        "github": "tree-sitter/tree-sitter-c"
+      }
+    },
+    "objc": {
+      "name": "tree-sitter-objc",
+      "upstream": {
+        "github": "tree-sitter-grammars/tree-sitter-objc"
+      }
+    },
+    "swift": {
+      "name": "tree-sitter-swift",
+      "upstream": {
+        "npm": "tree-sitter-swift"
+      },
+      "hold": "Pinned to upstream 0.7.2-with-generated-files (7b7909f2): 0.7.3 and 0.7.4 re-parent a later top-level declaration after split conditional function headers. Keep until the declaration-ownership regression tests pass; see gitnexus/vendor/README.md."
+    },
+    "kotlin": {
+      "name": "tree-sitter-kotlin",
+      "upstream": {
+        "github": "fwcd/tree-sitter-kotlin"
+      }
+    },
+    "dart": {
+      "name": "tree-sitter-dart",
+      "upstream": {
+        "github": "UserNobody14/tree-sitter-dart"
+      }
+    },
+    "proto": {
+      "name": "tree-sitter-proto",
+      "upstream": {
+        "github": "coder3101/tree-sitter-proto"
+      }
+    },
+    "zig": {
+      "name": "tree-sitter-zig",
+      "upstream": {
+        "github": "tree-sitter-grammars/tree-sitter-zig"
+      }
+    }
+  }
+}

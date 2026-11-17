@@ -23,26 +23,570 @@
  * Plan: `docs/plans/2026-04-20-001-refactor-emit-pipeline-generalization-plan.md`.
  */
 
-import type { ParsedFile, RegistryProviders } from 'gitnexus-shared';
+import type {
+  CallResultAssignmentSite,
+  ParsedFile,
+  ReferenceSite,
+  RegistryProviders,
+  Scope,
+  SymbolDefinition,
+} from 'gitnexus-shared';
+import type { TypeRef } from 'gitnexus-shared';
 import type { KnowledgeGraph } from '../../../graph/types.js';
+import { GraphReferenceIntegrityError } from '../../../graph/relationship-integrity.js';
+import { generateId } from '../../../../lib/utils.js';
+import { lookupOwnedMembersByOwner } from '../../model/owned-members-lookup.js';
 import type { MutableSemanticModel, SemanticModel } from '../../model/semantic-model.js';
+import type { ScopeResolutionIndexes } from '../../model/scope-resolution-indexes.js';
 import { reconcileOwnership, validateOwnershipParity } from './reconcile-ownership.js';
 import { validateBindingsImmutability } from './validate-bindings-immutability.js';
 import { extractParsedFile } from '../../scope-extractor-bridge.js';
 import { finalizeScopeModel } from '../../finalize-orchestrator.js';
 import { resolveReferenceSites, type ResolveStats } from '../../resolve-references.js';
+import {
+  sourceBindingForDefinition,
+  type SourceBindingRecorder,
+  type SourceBindingResolution,
+} from '../source-binding-resolution.js';
 import { buildGraphNodeLookup } from '../graph-bridge/node-lookup.js';
+import {
+  emitFileCfgs,
+  emitFileReachingDefs,
+  emitFileCdg,
+  isEmitSafeCfg,
+  DEFAULT_MAX_CFG_EDGES_PER_FUNCTION,
+  DEFAULT_PDG_MAX_REACHING_DEF_EDGES_PER_FUNCTION,
+  DEFAULT_PDG_MAX_REACHING_DEF_FACTS_PER_FUNCTION,
+  DEFAULT_PDG_MAX_CDG_EDGES_PER_FUNCTION,
+  REACHING_DEF_FACTS_PER_EDGE_CAP,
+} from '../../cfg/emit.js';
+import { createMemoizedReachingDefs } from '../../cfg/reaching-defs.js';
+import { DEFAULT_PDG_MAX_FUNCTION_LINES } from '../../cfg/collect.js';
+import {
+  emitFileTaint,
+  DEFAULT_PDG_MAX_TAINT_FINDINGS_PER_FUNCTION,
+  DEFAULT_PDG_MAX_TAINT_HOPS,
+  type TaintEmitLimits,
+} from '../../taint/emit.js';
+import { registerBuiltinTaintModels } from '../../taint/typescript-model.js';
+import { createMemoizedRefinement } from '../../taint/guard-refinement.js';
+import { getSourceSinkConfig } from '../../taint/source-sink-registry.js';
+import {
+  buildFunctionNodeIndex,
+  harvestFileSummaries,
+  type FunctionNodeIndex,
+} from '../../taint/summary-harvest-driver.js';
+import { harvestFileCallSummaries } from '../../taint/summary-harvest-driver.js';
+import type { FunctionSummary } from '../../taint/summary-model.js';
+import type { CallSummary } from '../../taint/call-summary-model.js';
+import type { FunctionCfg } from '../../cfg/types.js';
+import { resolveDefGraphId } from '../graph-bridge/ids.js';
 import { buildPopulatedMethodDispatch } from '../graph-bridge/method-dispatch.js';
 import { propagateImportedReturnTypes } from '../passes/imported-return-types.js';
-import { emitReceiverBoundCalls } from '../passes/receiver-bound-calls.js';
+import {
+  emitReceiverBoundCalls,
+  MAX_INTERFACE_DISPATCH_FANOUT,
+} from '../passes/receiver-bound-calls.js';
 import { emitFreeCallFallback } from '../passes/free-call-fallback.js';
+import {
+  emitPropertyDispatchCalls,
+  MAX_PROPERTY_DISPATCH_FANOUT,
+} from '../passes/property-dispatch.js';
 import { emitReferencesViaLookup } from '../graph-bridge/references-to-edges.js';
+import {
+  buildPropertyNameIndex,
+  emitUniqueNamePropertyAccesses,
+  type PropertyNameIndex,
+} from '../passes/unique-name-properties.js';
+import { emitReturnShapeMemberAccesses } from '../passes/return-shape-members.js';
+import { emitImportedValueReferences } from '../passes/imported-value-refs.js';
+import {
+  calleeIdPosKey,
+  createCalleeIdAccumulator,
+  type CalleeIdAccumulator,
+} from '../graph-bridge/callee-id-sink.js';
 import { emitImportEdges } from '../graph-bridge/imports-to-edges.js';
-import type { ScopeResolver } from '../contract/scope-resolver.js';
+import {
+  callableFlowSiteKey,
+  collectDeferredIndirectCollection,
+  emitCallableValueFlow,
+} from '../passes/callable-value-flow.js';
+import type { ScopeResolver, UndecidedSatisfaction } from '../contract/scope-resolver.js';
+import {
+  findEnclosingClassDef,
+  hasExplicitNameClaim,
+  lookupNameClaim,
+  resolveInheritanceBaseInScope,
+} from '../scope/walkers.js';
+import { normalizeQualifiedName, stripTrailingTypeArguments } from '../../utils/qualified-name.js';
+import {
+  heritageTypeArgumentsKey,
+  type HeritageTypeArgumentSink,
+} from '../utils/generic-instantiation.js';
 import { buildWorkspaceResolutionIndex } from '../workspace-index.js';
+import { narrowOverloadCandidates } from '../passes/overload-narrowing.js';
+import type { ResolutionOutcome, ResolutionOutcomeRecorder } from '../resolution-outcome.js';
+import { answeredSiteKey, withdrawAnsweredReceiverDrops } from '../resolution-outcome.js';
+import { isDebugHeapEnabled, logHeapProbe } from '../../utils/heap-probe.js';
+import { parseTruthyEnv } from '../../utils/env.js';
+import { callResultBindingKey, selectedCallKey } from '../passes/provider-call-outcome.js';
+
+function setCallResultBinding(scope: Scope, name: string, returned: TypeRef | undefined): boolean {
+  const bindings = scope.typeBindings as Map<string, TypeRef>;
+  if (returned === undefined) return bindings.delete(name);
+  const binding: TypeRef = {
+    rawName: returned.rawName,
+    ...(returned.declaredSpelling !== undefined
+      ? { declaredSpelling: returned.declaredSpelling }
+      : {}),
+    declaredAtScope: returned.declaredAtScope,
+    ...(returned.lookupPosition !== undefined ? { lookupPosition: returned.lookupPosition } : {}),
+    source: 'assignment-inferred',
+  };
+  const previous = bindings.get(name);
+  if (
+    previous?.rawName === binding.rawName &&
+    previous.declaredSpelling === binding.declaredSpelling &&
+    previous.declaredAtScope === binding.declaredAtScope &&
+    previous.source === binding.source &&
+    previous.lookupPosition?.startLine === binding.lookupPosition?.startLine &&
+    previous.lookupPosition?.startCol === binding.lookupPosition?.startCol
+  )
+    return false;
+  bindings.set(name, binding);
+  return true;
+}
+
+function applySelectedCallResultBinding(
+  assignment: CallResultAssignmentSite,
+  indexes: ScopeResolutionIndexes,
+  workspaceIndex: ReturnType<typeof buildWorkspaceResolutionIndex>,
+  selected: SymbolDefinition | null | undefined,
+): boolean {
+  const scope = indexes.scopeTree.getScope(assignment.inScope);
+  if (scope === undefined) return false;
+  const returned =
+    selected == null
+      ? undefined
+      : workspaceIndex.declaredReturnTypeByCallableId.get(selected.nodeId);
+  return setCallResultBinding(scope, assignment.lhs, returned);
+}
+
+/**
+ * Join extraction-time assignment identity to Phase-4's exact resolved callee.
+ * Ambiguous dispatch and missing return annotations deliberately produce no
+ * binding. Extraction emits these facts only for untyped declarations, so an
+ * existing entry here is necessarily inference/mirroring and may be corrected;
+ * explicit annotations never enter this join.
+ */
+export function applyPreciseCallResultBindings(
+  parsedFiles: readonly ParsedFile[],
+  indexes: ReturnType<typeof finalizeScopeModel>,
+  workspaceIndex: ReturnType<typeof buildWorkspaceResolutionIndex>,
+  calleeIds: CalleeIdAccumulator,
+  nodeLookup: ReturnType<typeof buildGraphNodeLookup>,
+  model: SemanticModel,
+  requireOwnedHoistedReturn = false,
+  selectedCalls?: ReadonlyMap<string, SymbolDefinition | null>,
+): number {
+  let updated = 0;
+  if (selectedCalls !== undefined) {
+    for (const parsed of parsedFiles) {
+      for (const assignment of parsed.callResultAssignmentSites ?? []) {
+        if (
+          applySelectedCallResultBinding(
+            assignment,
+            indexes,
+            workspaceIndex,
+            selectedCalls.get(selectedCallKey(parsed.filePath, assignment.callSite)),
+          )
+        )
+          updated++;
+      }
+    }
+    return updated;
+  }
+  const returnTypeByGraphId = new Map<string, { type: TypeRef; def: SymbolDefinition }>();
+  for (const parsed of parsedFiles) {
+    for (const def of parsed.localDefs) {
+      const returnType = workspaceIndex.declaredReturnTypeByCallableId.get(def.nodeId);
+      if (returnType === undefined) continue;
+      const graphId = resolveDefGraphId(def.filePath, def, nodeLookup);
+      if (graphId !== undefined) returnTypeByGraphId.set(graphId, { type: returnType, def });
+    }
+  }
+  for (const parsed of parsedFiles) {
+    const resolvedByPosition = calleeIds.get(parsed.filePath);
+    if (resolvedByPosition === undefined) continue;
+    let callsByPosition: Map<string, ReferenceSite | null> | undefined;
+    if (requireOwnedHoistedReturn) {
+      callsByPosition = new Map();
+      for (const site of parsed.referenceSites) {
+        if (site.kind !== 'call') continue;
+        const key = calleeIdPosKey(site.atRange.startLine, site.atRange.startCol);
+        callsByPosition.set(key, callsByPosition.has(key) ? null : site);
+      }
+    }
+    for (const assignment of parsed.callResultAssignmentSites ?? []) {
+      const scope = indexes.scopeTree.getScope(assignment.inScope);
+      if (scope === undefined) continue;
+      const targets = resolvedByPosition.get(
+        calleeIdPosKey(assignment.callSite.startLine, assignment.callSite.startCol),
+      );
+      const targetId =
+        targets?.size === 1 ? (targets.values().next().value as string | undefined) : undefined;
+      const returned = targetId === undefined ? undefined : returnTypeByGraphId.get(targetId);
+      if (returned === undefined) continue;
+      if (requireOwnedHoistedReturn) {
+        const site = callsByPosition?.get(
+          calleeIdPosKey(assignment.callSite.startLine, assignment.callSite.startCol),
+        );
+        if (site == null || site.arity === undefined) continue;
+        const def = returned.def;
+        const candidates =
+          def.ownerId === undefined
+            ? [def]
+            : [def.ownerId, ...indexes.methodDispatch.mroFor(def.ownerId)].flatMap((owner) =>
+                model.methods.lookupAllByOwner(owner, site.name),
+              );
+        const narrowed = [
+          ...new Map(
+            narrowOverloadCandidates(candidates, site.arity, site.argumentTypes).map(
+              (candidate) => [candidate.nodeId, candidate],
+            ),
+          ).values(),
+        ];
+        // The exact selected declaration may shadow distinct ancestors only
+        // with equivalent, fully known parameter metadata. Numeric counts may
+        // both be absent (variadics); an empty type slot is still unknown.
+        const ancestors = new Set(
+          def.ownerId === undefined ? [] : indexes.methodDispatch.mroFor(def.ownerId),
+        );
+        const owners = new Set(narrowed.map((candidate) => candidate.ownerId));
+        const parameters = def.parameterTypes;
+        if (
+          narrowed[0]?.nodeId !== def.nodeId ||
+          owners.size !== narrowed.length ||
+          narrowed
+            .slice(1)
+            .some(
+              (candidate) =>
+                candidate.ownerId === undefined ||
+                !ancestors.has(candidate.ownerId) ||
+                candidate.parameterCount !== def.parameterCount ||
+                (def.parameterCount !== 0 &&
+                  (parameters === undefined ||
+                    parameters.length === 0 ||
+                    (def.parameterCount !== undefined &&
+                      parameters.length !== def.parameterCount) ||
+                    candidate.parameterTypes?.length !== parameters.length ||
+                    parameters.some(
+                      (type, index) => type === '' || type !== candidate.parameterTypes?.[index],
+                    ))),
+            )
+        )
+          continue;
+      }
+      if (
+        setCallResultBinding(scope, assignment.lhs, {
+          ...returned.type,
+          declaredAtScope: assignment.inScope,
+          lookupPosition: undefined,
+        })
+      )
+        updated++;
+    }
+  }
+  return updated;
+}
+import { isValueDefinitionLabel } from '../../utils/ast-helpers.js';
+import { TransitionalScopeTree } from '../../../../storage/scope-index-store.js';
+import { forceGc } from '../../../../storage/parsedfile-store.js';
 
 import { logger } from '../../../logger.js';
+
+/**
+ * Emit one class-owned inheritance edge directly (the inheritance pre-pass is
+ * the authoritative emitter — see `preEmitInheritanceEdges`). Encapsulates the
+ * dual dedup contract so the two sets' joint semantics live in one place:
+ *   - `existing` — coarse per-`(caller, target, type)` gate, seeded from the
+ *     graph (so this pass is a no-op when the legacy path already emitted it).
+ *   - `seen` — per-site key shared with the generic edge bridge so the two
+ *     passes never double-emit the same resolution.
+ * This prepass retains its point-only identity; unlike full spans emitted by
+ * `tryEmitEdge`, it cannot certify source-site distinctness. The caller is the enclosing class (NOT the
+ * method/constructor `resolveCallerGraphId` would prefer — that broke MRO for
+ * C# 12 primary constructors, #1951); the edge type is pre-discriminated.
+ */
+function emitInheritanceEdgeDirect(
+  graph: KnowledgeGraph,
+  seen: Set<string>,
+  existing: Set<string>,
+  callerGraphId: string,
+  targetGraphId: string,
+  edgeType: 'EXTENDS' | 'IMPLEMENTS',
+  site: { readonly atRange: { startLine: number; startCol: number } },
+): void {
+  const edgeKey = `${edgeType}:${callerGraphId}->${targetGraphId}`;
+  const dedupKey = `${edgeKey}:${site.atRange.startLine}:${site.atRange.startCol}`;
+  if (existing.has(edgeKey) || seen.has(dedupKey)) return;
+  seen.add(dedupKey);
+  existing.add(edgeKey);
+  graph.addRelationship({
+    id: `rel:${dedupKey}`,
+    sourceId: callerGraphId,
+    targetId: targetGraphId,
+    type: edgeType,
+    confidence: 0.85,
+    reason: 'scope-resolution: inherits',
+  });
+}
+
+/**
+ * Whether an `inherits` site's base was written as a bare name, with no
+ * qualifier (`a.b.Base`, `Ns::Base`). Captures that keep only the simple tail
+ * carry no `rawQualifiedName`, so the name capture must also start where the
+ * base expression does: `Base<T>` and `Base(args)` lead with the name,
+ * `pkg.Base` does not. A site whose anchor is not the base expression at all
+ * fails the same test, which only costs it the implicit-namespace fallback.
+ */
+function isBareInheritanceBase(site: ReferenceSite): boolean {
+  if (
+    site.rawQualifiedName !== undefined &&
+    stripTrailingTypeArguments(normalizeQualifiedName(site.rawQualifiedName)).includes('.')
+  ) {
+    return false;
+  }
+  const name = site.nameRange;
+  return (
+    name !== undefined &&
+    name.startLine === site.atRange.startLine &&
+    name.startCol === site.atRange.startCol
+  );
+}
+
+/**
+ * The provider's implicit same-namespace base for an `inherits` site the shared
+ * chain left unbound. That visibility (`populateNamespaceSiblings`) is only
+ * populated after the inheritance pre-pass, so without this a base it alone
+ * makes visible reaches nothing but the workspace-unique name fallback. Bare,
+ * unclaimed bases only: for a written qualifier or a shadowing import the
+ * chain has already decided, and its miss stands.
+ */
+function resolveImplicitInheritanceBaseAtSite(
+  site: ReferenceSite,
+  derivingClass: SymbolDefinition,
+  scopes: ScopeResolutionIndexes,
+  resolveImplicitBase: ScopeResolver['resolveImplicitInheritanceBase'],
+): SymbolDefinition | undefined {
+  if (
+    resolveImplicitBase === undefined ||
+    derivingClass.isSynthetic === true ||
+    !isBareInheritanceBase(site)
+  )
+    return undefined;
+  const claim = lookupNameClaim(site.lookupScope ?? site.inScope, site.name, scopes, {
+    position: site.atRange,
+    purpose: site.lookupPurpose ?? 'type',
+  });
+  if (hasExplicitNameClaim(claim, site.name)) return undefined;
+  return resolveImplicitBase(site.name, derivingClass, scopes, site);
+}
+
+/**
+ * Resolve inheritance reference sites early and pre-emit their EXTENDS edges
+ * before MRO construction. This lets template-base captures contribute to the
+ * graph in time for `buildMro`, while `handledSites` prevents the generic
+ * reference-edge bridge from re-emitting the same sites later.
+ *
+ * @returns Site keys to seed the downstream handled-site skip set.
+ *
+ * The generic INSTANTIATION each heritage edge was written with (#2912) goes to
+ * `recordTypeArguments` rather than out through the return, because the caller
+ * shares that sink with the language heritage hook — see
+ * `HeritageTypeArguments` in `utils/generic-instantiation.ts`. This pass is
+ * where the pairing exists at all: the site carries the arguments and this is
+ * the only code that resolves the site to a (subtype, supertype) pair, so
+ * recording it here costs one map write per generic heritage edge, while
+ * recovering it downstream would mean redoing the resolution against a graph
+ * edge that no longer carries the spelling.
+ */
+function preEmitInheritanceEdges(
+  graph: KnowledgeGraph,
+  scopes: ReturnType<typeof finalizeScopeModel>,
+  nodeLookup: ReturnType<typeof buildGraphNodeLookup>,
+  recordTypeArguments: HeritageTypeArgumentSink,
+  unresolvedInheritanceByClass: Set<string>,
+  resolveImplicitBase: ScopeResolver['resolveImplicitInheritanceBase'],
+  recordSourceBinding?: SourceBindingRecorder,
+): Set<string> {
+  const handledSites = new Set<string>();
+  const seen = new Set<string>();
+  // Tracks inheritance edges emitted during this pass so the structural
+  // interface-implementation pass (emitDetectedInterfaceImplementations) and
+  // repeated `inherits` sites don't double-emit. Starts empty: this pre-pass is
+  // the authoritative inheritance emitter — no EXTENDS/IMPLEMENTS edges exist in
+  // the graph before it runs (the legacy heritage path was removed in #942).
+  const existing = new Set<string>();
+
+  for (const site of scopes.referenceSites) {
+    if (site.kind !== 'inherits') continue;
+    const scope = scopes.scopeTree.getScope(site.inScope);
+    const siteKey =
+      scope?.filePath !== undefined ? callableFlowSiteKey(scope.filePath, site.atRange) : undefined;
+    if (siteKey !== undefined) {
+      // Intentionally suppress every `inherits` site from the generic
+      // reference bridge, even when this pre-pass can't emit an EXTENDS
+      // edge. The shared bridge resolves the source via
+      // `resolveCallerGraphId`, which can degrade class-heritage sites into
+      // method-owned EXTENDS edges once methods exist on the class. This
+      // pre-pass is the authoritative inheritance emitter and pins the source
+      // to the enclosing class (via the `callerGraphId` override below), so
+      // suppression keeps `buildMro` and the final graph class-owned.
+      handledSites.add(siteKey);
+    }
+
+    // Resolve the deriving (caller) class first and reuse it as the enclosing
+    // context for qualified-base resolution — avoids a second findEnclosingClassDef
+    // walk per qualified site (#1982 perf). Both need the same enclosing class.
+    const callerClass = findEnclosingClassDef(site.inScope, scopes);
+    if (callerClass === undefined) continue;
+
+    const targetDef =
+      resolveInheritanceBaseInScope(
+        site.lookupScope ?? site.inScope,
+        site.name,
+        scopes,
+        site.rawQualifiedName,
+        callerClass,
+        { position: site.atRange, purpose: site.lookupPurpose ?? 'type' },
+      ) ?? resolveImplicitInheritanceBaseAtSite(site, callerClass, scopes, resolveImplicitBase);
+    if (targetDef === undefined || targetDef.nodeId === callerClass.nodeId) {
+      // Static lookup can mistake the current declaration for an earlier
+      // same-named base. A self-edge is not inheritance evidence and would
+      // poison MRO construction; retain the uncertainty for dispatch.
+      unresolvedInheritanceByClass.add(callerClass.nodeId);
+      continue;
+    }
+    recordSourceBinding?.(site, sourceBindingForDefinition(targetDef, 'inheritance'));
+    const callerGraphId = resolveDefGraphId(callerClass.filePath, callerClass, nodeLookup);
+    const targetGraphId = resolveDefGraphId(targetDef.filePath, targetDef, nodeLookup);
+    if (
+      callerGraphId === undefined ||
+      targetGraphId === undefined ||
+      callerGraphId === targetGraphId
+    ) {
+      unresolvedInheritanceByClass.add(callerClass.nodeId);
+      continue;
+    }
+    // Discriminate EXTENDS vs IMPLEMENTS by the resolved target's symbol kind:
+    // conforming to an interface OR mixing in a trait/protocol is IMPLEMENTS,
+    // deriving from a class-like is EXTENDS. The discriminator is purely
+    // symbol-kind-driven (no language is named here, per AGENTS.md): a base that
+    // resolves to neither an Interface nor a Trait symbol always takes the
+    // EXTENDS branch, so such languages are unchanged.
+    const edgeType: 'EXTENDS' | 'IMPLEMENTS' =
+      targetDef.type === 'Interface' || targetDef.type === 'Trait' ? 'IMPLEMENTS' : 'EXTENDS';
+    emitInheritanceEdgeDirect(graph, seen, existing, callerGraphId, targetGraphId, edgeType, site);
+    // The instantiation this heritage clause wrote (`: IValidator<string>`),
+    // keyed by the same graph-id pair the edge itself carries. Only generic
+    // bases produce an entry; the sink owns the first-writer-wins rule.
+    if (site.typeArguments !== undefined) {
+      recordTypeArguments(callerGraphId, targetGraphId, site.typeArguments);
+    }
+  }
+
+  return handledSites;
+}
+
+/**
+ * Emit language-inferred structural interface implementations before MRO and
+ * interface dispatch are built. Languages such as Go do not declare
+ * `implements` explicitly, so their resolver can infer defId-level interface
+ * satisfaction from parsed files and this bridge converts those defIds to
+ * graph node ids.
+ *
+ * Existing explicit IMPLEMENTS edges win: the local `existing` set prevents
+ * duplicate structural edges and keeps this hook language-neutral. The reason
+ * string carries the provider language (`go-structural-implements`) so callers
+ * can distinguish inferred edges from source-declared heritage.
+ */
+function emitDetectedInterfaceImplementations(
+  graph: KnowledgeGraph,
+  parsedFiles: readonly ParsedFile[],
+  nodeLookup: ReturnType<typeof buildGraphNodeLookup>,
+  provider: ScopeResolver,
+  indexes: ReturnType<typeof finalizeScopeModel>,
+  model: SemanticModel,
+): readonly UndecidedSatisfaction[] {
+  if (provider.detectInterfaceImplementations === undefined) return [];
+
+  const graphIdByDefId = new Map<string, string>();
+  for (const parsed of parsedFiles) {
+    for (const def of parsed.localDefs) {
+      if (def.type !== 'Class' && def.type !== 'Struct' && def.type !== 'Interface') continue;
+      const graphId = resolveDefGraphId(parsed.filePath, def, nodeLookup);
+      if (graphId !== undefined) graphIdByDefId.set(def.nodeId, graphId);
+    }
+  }
+
+  const existing = new Set<string>();
+  for (const rel of graph.iterRelationshipsByType('IMPLEMENTS')) {
+    existing.add(`${rel.sourceId}->${rel.targetId}`);
+  }
+
+  const detected = provider.detectInterfaceImplementations(parsedFiles, indexes, model);
+  for (const [interfaceDefId, implementorDefIds] of detected.implementations) {
+    const targetId = graphIdByDefId.get(interfaceDefId);
+    if (targetId === undefined) continue;
+    for (const implementor of implementorDefIds) {
+      const sourceId = graphIdByDefId.get(implementor.structDefId);
+      if (sourceId === undefined) continue;
+      const edgeKey = `${sourceId}->${targetId}`;
+      if (existing.has(edgeKey)) continue;
+      existing.add(edgeKey);
+      graph.addRelationship({
+        id: generateId('IMPLEMENTS', edgeKey),
+        sourceId,
+        targetId,
+        type: 'IMPLEMENTS',
+        confidence: 0.85,
+        // The receiver form rides in `reason` because relationships carry no
+        // arbitrary properties — adding one would change the relation DDL and
+        // move SCHEMA_FINGERPRINT, forcing a full re-analyze for a fact that a
+        // string already expresses. `-pointer` means ONLY the pointer type
+        // implements: `var x I = T{}` is invalid, `var x I = &T{}` is fine.
+        // The unsuffixed form is unchanged from before, so a consumer matching
+        // the old string keeps seeing exactly the value-form implementors.
+        reason:
+          implementor.receiverForm === 'pointer'
+            ? `${provider.language}-structural-implements-pointer`
+            : `${provider.language}-structural-implements`,
+      });
+    }
+  }
+
+  // The interfaces this provider could not decide. They mint no edges — they
+  // exist so a query can report a lower bound instead of a confident zero
+  // (#2873); see `undecided-satisfaction.ts`.
+  return detected.undecided;
+}
+
+export type ScopeResolutionSubPhase =
+  | 'extracting'
+  | 'analyzing types'
+  | 'resolving references'
+  | 'linking symbols';
+
 interface RunScopeResolutionInput {
+  /** Source-backed providers use the same executable-region cap as workers. */
+  readonly pdgMaxFunctionLines?: number;
+  /** Observe the completed semantic pass without changing its graph output. */
+  readonly onResolved?: (result: {
+    readonly parsedFiles: readonly ParsedFile[];
+    readonly indexes: ScopeResolutionIndexes;
+    readonly referenceBindings: ReadonlyMap<ReferenceSite, SourceBindingResolution>;
+  }) => void;
   readonly graph: KnowledgeGraph;
   /**
    * Semantic model populated by the legacy `parse` phase. Scope-
@@ -54,16 +598,96 @@ interface RunScopeResolutionInput {
    * `ParsedFile[]` to mirror the pipeline shape.
    */
   readonly model: MutableSemanticModel;
-  readonly files: readonly { readonly path: string; readonly content: string }[];
+  readonly files: readonly {
+    readonly path: string;
+    readonly content: string;
+  }[];
   readonly onWarn?: (message: string) => void;
   /**
-   * Optional pre-parsed-Tree lookup keyed by file path. When the
-   * pipeline's parse phase ran sequentially, it populated an
-   * `ASTCache`; passing that here lets the per-file extract step
-   * skip a second `tree-sitter parser.parse(...)` call. Cache miss
-   * is safe — falls back to a fresh parse inside the provider.
+   * Optional pre-parsed-Tree lookup keyed by file path: a cache hit lets the
+   * per-file extract step skip a second `tree-sitter parser.parse(...)` call.
+   * Currently always empty — the only producer was the (removed) sequential
+   * parser, and workers can't return native Trees across the MessageChannel,
+   * so the parse phase no longer threads one. Kept as an extension point;
+   * cache miss is safe (the provider re-parses).
    */
   readonly treeCache?: { get(filePath: string): unknown };
+  /**
+   * CFG/PDG opt-in (#2081 M1). When true, emit BasicBlock nodes + CFG edges
+   * from each ParsedFile's worker-built `cfgSideChannel` during Phase-4 graph
+   * emission (while the disk store is still live). Default/false ⇒ no CFG
+   * nodes or edges and a byte-identical graph.
+   */
+  readonly pdg?: boolean;
+  /** Per-function CFG edge cap. `undefined` ⇒ {@link DEFAULT_MAX_CFG_EDGES_PER_FUNCTION};
+   *  `0` ⇒ no cap (unlimited). */
+  readonly pdgMaxEdgesPerFunction?: number;
+  /** Per-function REACHING_DEF edge cap (#2082 M2). `undefined` ⇒
+   *  {@link DEFAULT_PDG_MAX_REACHING_DEF_EDGES_PER_FUNCTION}; `0` ⇒ no cap. */
+  readonly pdgMaxReachingDefEdgesPerFunction?: number;
+  /** Per-function CDG (control-dependence) edge cap (#2085 M5). `undefined` ⇒
+   *  {@link DEFAULT_PDG_MAX_CDG_EDGES_PER_FUNCTION}; `0` ⇒ no cap. */
+  readonly pdgMaxCdgEdgesPerFunction?: number;
+  /** Per-function taint findings cap (#2083 M3, consumed by the U4 taint
+   *  emit step in the pdg window). `undefined` ⇒
+   *  `DEFAULT_PDG_MAX_TAINT_FINDINGS_PER_FUNCTION` (200); `0` ⇒ no cap. */
+  readonly pdgMaxTaintFindingsPerFunction?: number;
+  /** Per-finding taint hop cap (#2083 M3 KTD6 — bounds the hop-encoded
+   *  `reason`; consumed by the U4 taint emit step). `undefined` ⇒
+   *  `DEFAULT_PDG_MAX_TAINT_HOPS` (32); `0` ⇒ no cap. */
+  readonly pdgMaxTaintHops?: number;
+  /**
+   * Streaming PDG-emit sink (#2202). When present (streaming on, full rebuild),
+   * the `--pdg` emit routes BasicBlock nodes + intra-file PDG edges to THIS
+   * graph-shaped target instead of the in-memory `graph`, so the bulky PDG
+   * layer never accumulates in memory (peak RSS O(chunk)). Typed as a plain
+   * `KnowledgeGraph` so this module stays decoupled from the persistence layer;
+   * the caller (the scope-resolution phase) owns its lifecycle and finalizes it
+   * after the last language. Absent ⇒ the emit writes to `graph` as before
+   * (byte-identical default).
+   */
+  readonly pdgEmitSink?: KnowledgeGraph;
+  /**
+   * Cross-pass per-file dedup set for streaming PDG emit (#2202). Shared across
+   * every language pass (owned by the scope-resolution phase). A file imported
+   * by more than one language (e.g. a `.ts` module pulled into the Vue context
+   * pass) is PDG-emitted in each pass over the same `cfgSideChannel`, producing
+   * identical ids; the in-memory graph dedups that by id, but the streaming sink
+   * is dedup-free (to stay O(write buffer), not O(total ids)). So when present
+   * (streaming on), the emit loop skips a file whose PDG already streamed and
+   * records the rest — keeping the streamed set byte-identical to the
+   * Map-deduped whole-graph emit, for any language-pass order. Absent ⇒ no skip
+   * (the graph Map dedups), so the default path is unchanged.
+   */
+  readonly pdgEmittedFiles?: Set<string>;
+  /**
+   * Optional graph-node lookup built ONCE by the caller and shared across
+   * every language pass. `buildGraphNodeLookup` scans the whole graph and is
+   * language-agnostic, so rebuilding it per language wastes both CPU and ~GBs
+   * of heap (on the kernel it is ~2 GB; a 5-file language would otherwise build
+   * its own full copy that then overlaps the next language's). When omitted
+   * (tests / isolated calls) the lookup is built locally as before. Providers
+   * that add graph nodes mid-pass (e.g. Ruby heritage Property nodes) still
+   * rebuild a fresh post-heritage lookup internally, so sharing the pre-loop
+   * base is safe.
+   */
+  readonly prebuiltNodeLookup?: ReturnType<typeof buildGraphNodeLookup>;
+  /**
+   * Functionish-node index built ONCE by the caller and shared across every
+   * language pass (#2084 review P2-6). Like `prebuiltNodeLookup`,
+   * `buildFunctionNodeIndex` is a whole-graph scan and is language-agnostic, so
+   * rebuilding it per language wastes a full scan each time. When omitted
+   * (tests / isolated calls) it is built locally for the pdg-enabled language.
+   */
+  readonly prebuiltFunctionNodeIndex?: FunctionNodeIndex;
+  /**
+   * `Property`-by-name index built ONCE by the caller and shared across every
+   * language pass. Like the two above it is a whole-graph scan and is
+   * language-agnostic; the per-language restriction is applied at lookup time
+   * against that language's own file set, so sharing the index does not widen
+   * what any single language can resolve to. Built locally when omitted.
+   */
+  readonly prebuiltPropertyNameIndex?: PropertyNameIndex;
   /**
    * Opaque per-language import-resolution config (e.g. tsconfig path
    * aliases for TypeScript). Loaded once by the caller via
@@ -72,15 +696,125 @@ interface RunScopeResolutionInput {
    * provider doesn't supply a config loader.
    */
   readonly resolutionConfig?: unknown;
+  /**
+   * Pre-extracted ParsedFile artifacts keyed by file path. When a
+   * file is present here, the extract loop reuses it directly and
+   * skips `extractParsedFile` (which would re-parse the file with
+   * tree-sitter on the main thread). Only files matching the
+   * provider's language are honored — the loop verifies this
+   * implicitly by language filter at the call-site (scopeResolution
+   * phase).
+   *
+   * Worker-mode parses produce these ParsedFile artifacts as a side
+   * effect of `extractParsedFile` running inside the worker; threading
+   * them here is what lets the warm-cache analyze run skip the ~58s
+   * scope-resolution re-parse loop on a multi-thousand-file repo.
+   * Cache miss is safe — falls back to fresh extract.
+   */
+  readonly preExtractedParsedFiles?: ReadonlyMap<string, ParsedFile>;
+  /**
+   * Out-of-core scope index (disk-backed scope seal). When set AND `GITNEXUS_DISK_SCOPE_INDEX` is
+   * enabled, the per-language `scopeTree` is sealed to a disk-backed store at
+   * this path after resolve (before emit), and the heavy `Scope.bindings`
+   * payload is dropped from heap — lowering the per-language peak (kernel:
+   * ~20→~12 GB) so the analysis fits on smaller-RAM machines. Same storage path
+   * as the ParsedFile store; a sibling `scope-index-store/` dir.
+   */
+  readonly scopeIndexStorePath?: string;
+  /**
+   * Optional additive diagnostics sink. Resolver passes call this when they
+   * intentionally suppress an edge; the graph remains unchanged.
+   */
+  readonly recordResolutionOutcome?: ResolutionOutcomeRecorder;
+  /**
+   * Optional progress callback for UI updates during long-running scope
+   * resolution. Called periodically during the extract loop and at each
+   * sub-phase boundary (finalize, resolve, emit).
+   *
+   * @param subPhase  Current sub-phase name for display
+   * @param current   Files processed so far (during extract) or total files (at phase boundaries)
+   * @param total     Total files in this language
+   */
+  readonly onProgress?: (subPhase: ScopeResolutionSubPhase, current: number, total: number) => void;
 }
 
 interface RunScopeResolutionStats {
   readonly filesProcessed: number;
   readonly filesSkipped: number;
+  /** Files still missing a ParsedFile after the main-thread fallback. */
+  readonly scopeExtractionFailedPaths: readonly string[];
   readonly importsEmitted: number;
   readonly resolve: ResolveStats;
   readonly referenceEdgesEmitted: number;
   readonly referenceSkipped: number;
+  /**
+   * Property-dispatch keys dropped for exceeding the fan-out cap. Non-zero
+   * means member calls through those keys got NO synthesized CALLS — the
+   * #2437 false-safe gap for exactly those keys (names are in the warn log).
+   */
+  readonly propertyDispatchSkippedKeys: number;
+  /** Cross-file value references resolved through finalized import bindings. */
+  readonly importedValueRefEdges: number;
+  /**
+   * ACCESSES edges recovered by property NAME (A1/A5) — the last-resort pass
+   * for receivers no precise pass could type.
+   */
+  readonly uniqueNamePropertyEdges: number;
+  /**
+   * Read/write sites left unresolved because two or more `Property` defs share
+   * the name, so a unique-name match would have been a coin flip. This is the
+   * population a receiver-typing improvement would convert into precise edges.
+   */
+  readonly uniqueNamePropertyAmbiguous: number;
+  /**
+   * Of `uniqueNamePropertyEdges`, how many the name carried several definitions
+   * for and same-file or direct-import evidence narrowed to one. Strict
+   * workspace uniqueness refused every one of these (R2).
+   */
+  readonly uniqueNamePropertyNarrowed: number;
+  /**
+   * The distinct field names behind `uniqueNamePropertyAmbiguous`, capped. A
+   * count says a coverage gap exists; the names say WHICH fields are
+   * unanswerable, so the gap is actionable rather than merely measured.
+   */
+  readonly uniqueNamePropertyAmbiguousNames: readonly string[];
+  /**
+   * Read/write sites whose name IS defined in the workspace but only in another
+   * LANGUAGE, so per-language inference declined. Separate from
+   * `uniqueNamePropertyAmbiguous` because the remedy differs: ambiguity wants
+   * better receiver typing, this wants an anchor in the reading language (R3-1).
+   */
+  readonly uniqueNamePropertyCrossLanguage: number;
+  /** Those names with the languages their definitions actually live in. */
+  readonly uniqueNamePropertyCrossLanguageNames: readonly {
+    readonly name: string;
+    readonly languages: string[];
+  }[];
+  readonly resolutionOutcomes: readonly ResolutionOutcome[];
+  /**
+   * Interfaces whose structural-satisfaction check could not be completed for
+   * at least one candidate type (#2873). NOT the same as "no implementors" —
+   * these are questions the analyzer could not answer, and they are reported so
+   * `impact` can hedge a zero instead of asserting one. Empty for every
+   * language whose resolver has no `detectInterfaceImplementations` hook.
+   */
+  readonly undecidedSatisfaction: readonly UndecidedSatisfaction[];
+  /**
+   * Per-function taint summaries harvested in the pdg window (#2084 M4 U1).
+   * Empty unless `input.pdg === true` and the language has a registered taint
+   * model. Keyed by resolved `Function`/`Method` node id; the cross-function
+   * fixpoint phase composes them over the complete `CALLS` graph.
+   */
+  readonly functionSummaries: readonly FunctionSummary[];
+  /**
+   * Per-function RETURN-VALUE ASCENT summaries harvested in the pdg window
+   * (PDG FU-C, U-C2). Empty unless `input.pdg === true`. Keyed by resolved
+   * `Function`/`Method`/`Constructor` node id; the whole-program CALL_SUMMARY
+   * emit phase materialises one self-loop edge per entry once the call graph is
+   * known. Unlike {@link functionSummaries} this needs NO taint model — it is
+   * pure data-dependence — so it is harvested for every `--pdg` language.
+   */
+  readonly callSummaries: readonly CallSummary[];
 }
 
 export function runScopeResolution(
@@ -88,7 +822,21 @@ export function runScopeResolution(
   provider: ScopeResolver,
 ): RunScopeResolutionStats {
   const { graph, files } = input;
+  const callableFlowOnly = provider.scopeResolutionEdgeMode === 'callable-flow-only';
   const onWarn = input.onWarn ?? (() => {});
+  const resolutionOutcomes: ResolutionOutcome[] = [];
+  const referenceBindings =
+    input.onResolved === undefined ? undefined : new Map<ReferenceSite, SourceBindingResolution>();
+  const recordSourceBinding: SourceBindingRecorder | undefined =
+    referenceBindings === undefined
+      ? undefined
+      : (site, binding) => {
+          referenceBindings.set(site, binding);
+        };
+  const undecidedSatisfaction: UndecidedSatisfaction[] = [];
+  const recordResolutionOutcome: ResolutionOutcomeRecorder = (outcome) => {
+    resolutionOutcomes.push(outcome);
+  };
   const PROF = process.env.PROF_SCOPE_RESOLUTION === '1';
   const tStart = PROF ? process.hrtime.bigint() : 0n;
   let fileContents: Map<string, string> | undefined;
@@ -102,25 +850,144 @@ export function runScopeResolution(
 
   // ── Phase 1: extract each file → ParsedFile ────────────────────────────
   const parsedFiles: ParsedFile[] = [];
+  const scopeExtractionFailedPaths: string[] = [];
   let filesSkipped = 0;
   const treeCache = input.treeCache;
-  for (const file of files) {
-    const cachedTree = treeCache?.get(file.path);
-    const parsed = extractParsedFile(
-      provider.languageProvider,
-      file.content,
-      file.path,
-      onWarn,
-      cachedTree,
-    );
+  const preExtracted = input.preExtractedParsedFiles;
+  let preExtractedHits = 0;
+  const progressInterval = files.length > 0 ? Math.max(1, Math.floor(files.length / 50)) : 1;
+  input.onProgress?.('extracting', 0, files.length);
+  logHeapProbe('sr-extract-start', `lang=${provider.language} files=${files.length}`);
+  for (let fileIdx = 0; fileIdx < files.length; fileIdx++) {
+    const file = files[fileIdx];
+    let parsed: ParsedFile | undefined;
+    // Fast path: a worker (during the parse phase) already produced a
+    // ParsedFile for this file via `extractParsedFile`. Reuse it
+    // directly — skips a tree-sitter re-parse on the main thread.
+    let reusedPreExtracted = false;
+    if (preExtracted !== undefined) {
+      parsed = preExtracted.get(file.path);
+      if (parsed !== undefined) {
+        preExtractedHits++;
+        reusedPreExtracted = true;
+      }
+    }
     if (parsed === undefined) {
-      filesSkipped++;
-      continue;
+      const cachedTree = treeCache?.get(file.path);
+      let extractionWarned = false;
+      parsed = extractParsedFile(
+        provider.languageProvider,
+        file.content,
+        file.path,
+        (warning) => {
+          extractionWarned = true;
+          onWarn(warning);
+        },
+        cachedTree,
+      );
+      if (parsed === undefined) {
+        filesSkipped++;
+        if (extractionWarned) scopeExtractionFailedPaths.push(file.path);
+        continue;
+      }
+      const captureSideChannel = provider.languageProvider.collectCaptureSideChannel?.(file.path);
+      if (captureSideChannel !== undefined) parsed = { ...parsed, captureSideChannel };
+      if (input.pdg === true && provider.languageProvider.collectSourceCfgs) {
+        const warnCfg = (message: string): void => {
+          logger.warn(message);
+          input.onWarn?.(message);
+        };
+        try {
+          const { cfgs, skipped } = provider.languageProvider.collectSourceCfgs(
+            file.content,
+            file.path,
+            input.pdgMaxFunctionLines ?? DEFAULT_PDG_MAX_FUNCTION_LINES,
+          );
+          if (cfgs.length) parsed = { ...parsed, cfgSideChannel: cfgs };
+          if (skipped.tooManyLines || skipped.tooDeeplyNested || skipped.buildError) {
+            warnCfg(
+              `[cfg] ${file.path}: skipped source regions (tooManyLines=${skipped.tooManyLines}, ` +
+                `tooDeeplyNested=${skipped.tooDeeplyNested}, buildError=${skipped.buildError})`,
+            );
+          }
+        } catch (error) {
+          warnCfg(`[cfg] ${file.path}: source CFG extraction failed: ${String(error)}`);
+        }
+      }
+    }
+    // Worker-boundary restore: a pre-extracted ParsedFile was produced by
+    // `extractParsedFile` running INSIDE a worker, so any capture-time
+    // module-level side-channel state (`emitScopeCaptures` side effects that
+    // are NOT serialized onto the ParsedFile's scopes/defs — C++ ADL/namespace
+    // marks) was populated in the worker process and is missing here. The
+    // worker stashed a plain-data snapshot on `parsed.captureSideChannel` (via
+    // `collectCaptureSideChannel`); write it back into the module maps now,
+    // BEFORE populateOwners consumes the resolved ranges. NO re-parse — that is
+    // the #1983 fix. The fresh-extract leg above already populated those marks
+    // in this process, so it skips the restore. See
+    // `ScopeResolver.applyCaptureSideChannel`.
+    if (reusedPreExtracted && provider.applyCaptureSideChannel !== undefined) {
+      provider.applyCaptureSideChannel(parsed);
     }
     provider.populateOwners(parsed);
     parsedFiles.push(parsed);
+    if ((fileIdx + 1) % progressInterval === 0 || fileIdx === files.length - 1) {
+      input.onProgress?.('extracting', fileIdx + 1, files.length);
+      logHeapProbe(
+        'sr-extract-progress',
+        `lang=${provider.language} idx=${fileIdx + 1}/${files.length} parsedFiles=${parsedFiles.length} preExtractedHits=${preExtractedHits}`,
+      );
+    }
   }
-  provider.populateWorkspaceOwners?.(parsedFiles, { fileContents: getFileContents() });
+  if (PROF && preExtracted !== undefined) {
+    logger.warn(`[scope-resolution prof] pre-extracted hits: ${preExtractedHits}/${files.length}`);
+  }
+  logHeapProbe(
+    'sr-extract-end',
+    `lang=${provider.language} parsedFiles=${parsedFiles.length} preExtractedHits=${preExtractedHits} skipped=${filesSkipped}`,
+  );
+  provider.populateWorkspaceOwners?.(parsedFiles, {
+    fileContents: getFileContents(),
+    resolutionConfig: input.resolutionConfig,
+  });
+  provider.populateWorkspaceReferences?.(parsedFiles, {
+    fileContents: getFileContents(),
+    treeCache,
+    resolutionConfig: input.resolutionConfig,
+  });
+
+  // A callable-flow-only provider has no reason to build the whole-graph
+  // lookup or finalize ordinary references when none of its files emitted a
+  // callable fact. This keeps the opt-in path proportional to source scanning
+  // for repositories that use the provider but no first-class callables.
+  if (
+    callableFlowOnly &&
+    input.pdg !== true &&
+    input.onResolved === undefined &&
+    !parsedFiles.some((parsed) => (parsed.callableFlowSites?.length ?? 0) > 0)
+  ) {
+    return {
+      filesProcessed: parsedFiles.length,
+      filesSkipped,
+      scopeExtractionFailedPaths,
+      importsEmitted: 0,
+      resolve: { sitesProcessed: 0, referencesEmitted: 0, unresolved: 0 },
+      referenceEdgesEmitted: 0,
+      referenceSkipped: 0,
+      propertyDispatchSkippedKeys: 0,
+      importedValueRefEdges: 0,
+      uniqueNamePropertyEdges: 0,
+      uniqueNamePropertyAmbiguous: 0,
+      uniqueNamePropertyNarrowed: 0,
+      uniqueNamePropertyAmbiguousNames: [],
+      uniqueNamePropertyCrossLanguage: 0,
+      uniqueNamePropertyCrossLanguageNames: [],
+      resolutionOutcomes,
+      undecidedSatisfaction,
+      functionSummaries: [],
+      callSummaries: [],
+    };
+  }
 
   // Reconcile scope-resolution's ownership view into the SemanticModel.
   // See `reconcile-ownership.ts` for the full rationale (Contract
@@ -140,59 +1007,237 @@ export function runScopeResolution(
     return {
       filesProcessed: 0,
       filesSkipped,
+      scopeExtractionFailedPaths,
       importsEmitted: 0,
       resolve: { sitesProcessed: 0, referencesEmitted: 0, unresolved: 0 },
       referenceEdgesEmitted: 0,
       referenceSkipped: 0,
+      propertyDispatchSkippedKeys: 0,
+      importedValueRefEdges: 0,
+      uniqueNamePropertyEdges: 0,
+      uniqueNamePropertyAmbiguous: 0,
+      uniqueNamePropertyNarrowed: 0,
+      uniqueNamePropertyAmbiguousNames: [],
+      uniqueNamePropertyCrossLanguage: 0,
+      uniqueNamePropertyCrossLanguageNames: [],
+      resolutionOutcomes,
+      undecidedSatisfaction,
+      functionSummaries: [],
+      callSummaries: [],
     };
   }
 
   const tExtract = PROF ? process.hrtime.bigint() : 0n;
 
   // ── Phase 2: finalize → ScopeResolutionIndexes ─────────────────────────
+  input.onProgress?.('analyzing types', files.length, files.length);
   const allFilePaths = new Set(parsedFiles.map((f) => f.filePath));
-  const nodeLookup = buildGraphNodeLookup(graph);
-  const mroByClassDefId = provider.buildMro(graph, parsedFiles, nodeLookup);
+  logHeapProbe('sr-pre-nodeLookup', `lang=${provider.language}`);
+  const nodeLookup = input.prebuiltNodeLookup ?? buildGraphNodeLookup(graph);
+  logHeapProbe('sr-post-nodeLookup', `lang=${provider.language}`);
 
   const resolutionConfig = input.resolutionConfig;
+  const resolveImportBinding = provider.resolveImportBinding;
+  if (resolveImportBinding) {
+    for (let i = 0; i < parsedFiles.length; i++) {
+      const parsed = parsedFiles[i];
+      parsedFiles[i] = {
+        ...parsed,
+        parsedImports: parsed.parsedImports.map((parsedImport) => {
+          return resolveImportBinding(
+            parsedImport,
+            () => {
+              const targets = provider.resolveImportTarget(
+                parsedImport.targetRaw ?? '',
+                parsed.filePath,
+                allFilePaths,
+                resolutionConfig,
+                { parsedFiles, parsedImport },
+              );
+              return typeof targets === 'string' ? [targets] : (targets ?? []);
+            },
+            (filePath) => getFileContents().get(filePath),
+          );
+        }),
+      };
+    }
+  }
+  const filterWildcardNames = provider.filterWildcardNames;
   const finalized = finalizeScopeModel(parsedFiles, {
+    moduleExports: provider.moduleExports,
     hooks: {
-      resolveImportTarget: (targetRaw, fromFile) =>
-        provider.resolveImportTarget(targetRaw, fromFile, allFilePaths, resolutionConfig),
+      ownedMembersBindAtModuleScope: provider.ownedMembersBindAtModuleScope,
+      importsBindAtLexicalScope: provider.importsBindAtLexicalScope === true,
+      // `GITNEXUS_DISABLE_IMPORT_GROUPS=1` restores one edge per imported file,
+      // for comparing the two storage forms on the same build.
+      groupsWildcardTargets:
+        provider.groupsWildcardImportTargets === true &&
+        !parseTruthyEnv(process.env.GITNEXUS_DISABLE_IMPORT_GROUPS),
+      resolveImportTarget: (targetRaw, fromFile, _workspaceIndex, parsedImport) =>
+        provider.resolveImportTarget(targetRaw, fromFile, allFilePaths, resolutionConfig, {
+          parsedFiles,
+          parsedImport,
+        }),
+      isNamespaceImport: (parsedImport, targetFile, fromFile) =>
+        provider.isNamespaceImport?.(parsedImport, targetFile, fromFile) ?? false,
       expandsWildcardTo: (targetModuleScope) =>
         provider.expandsWildcardTo?.(targetModuleScope, parsedFiles) ?? [],
+      filterWildcardNames:
+        filterWildcardNames === undefined
+          ? undefined
+          : (targetModuleScope, names) =>
+              filterWildcardNames(targetModuleScope, names, parsedFiles),
       mergeBindings: (existing, incoming, scopeId) =>
         provider.mergeBindings(existing, incoming, scopeId),
+      mergeBindingsAreAssociative: provider.mergeBindingsAreAssociative,
+      wildcardCollisionIsAmbiguous: provider.exclusiveWildcardReexports === true,
+      namedImportsBindTopLevelOnly: provider.namedImportsBindTopLevelOnly === true,
+      wildcardReexportExcludedNames: provider.wildcardReexportExcludedNames,
     },
   });
-
-  // Replace the empty MethodDispatchIndex that finalizeScopeModel
-  // builds by design with the populated one derived from the
-  // language's MRO. Spread produces a fresh `ScopeResolutionIndexes`
-  // instead of mutating the finalized result through an `as` cast —
-  // downstream passes get an object whose readonly guarantees match
-  // the type system.
-  const indexes = {
-    ...finalized,
-    methodDispatch: buildPopulatedMethodDispatch(mroByClassDefId),
+  // Import-visible namespaces are bindings: publish them before the first pass
+  // that reads one (inheritance resolution below).
+  provider.populateImportNamespaces?.(parsedFiles, finalized);
+  if (referenceBindings !== undefined) {
+    for (const site of finalized.referenceSites)
+      referenceBindings.set(site, {
+        status: 'unresolved',
+        targetDefIds: [],
+        basis: 'unresolved',
+      });
+  }
+  logHeapProbe('sr-post-finalize', `lang=${provider.language}`);
+  // `export *` collisions the shared finalize refused to bind (WS1 C2). Recorded
+  // as outcomes so the refusal is auditable next to the name-fallback census —
+  // a silently unresolved importer is indistinguishable from a resolver gap.
+  for (const refused of finalized.stats.ambiguousWildcardExports) {
+    recordResolutionOutcome({
+      kind: 'reexport-ambiguous',
+      candidateIds: refused.candidateDefIds,
+      phase: 'finalize',
+      filePath: refused.filePath,
+      name: refused.name,
+    });
+  }
+  // One store and ONE writer rule for heritage instantiations (#2912), shared by
+  // the pre-pass below and by the language hook further down — a heritage shape
+  // the pre-pass cannot express (Rust `impl T for S`, Dart `implements`) records
+  // through the same sink. FIRST writer wins: a repeated (sub, super) pair is a
+  // partial declaration or a re-listed base, and letting a later entry overwrite
+  // the first would make dispatch depend on file order.
+  const heritageTypeArguments = new Map<string, readonly string[]>();
+  const recordHeritageTypeArguments: HeritageTypeArgumentSink = (
+    subtypeGraphId,
+    supertypeGraphId,
+    typeArguments,
+  ) => {
+    if (typeArguments.length === 0) return;
+    const key = heritageTypeArgumentsKey(subtypeGraphId, supertypeGraphId);
+    if (!heritageTypeArguments.has(key)) heritageTypeArguments.set(key, typeArguments);
   };
+  const unresolvedInheritanceByClass = new Set<string>();
+  const preEmittedInheritanceSites = callableFlowOnly
+    ? new Set<string>()
+    : preEmitInheritanceEdges(
+        graph,
+        finalized,
+        nodeLookup,
+        recordHeritageTypeArguments,
+        unresolvedInheritanceByClass,
+        provider.resolveImplicitInheritanceBase,
+        recordSourceBinding,
+      );
+  // Call-based heritage hook (e.g., Ruby include/extend/prepend) — emits
+  // IMPLEMENTS edges that `preEmitInheritanceEdges` cannot produce because
+  // the heritage declarations are syntactic method calls, not grammar-level
+  // heritage clauses. Must run BEFORE `buildMro` so MRO construction sees
+  // the freshly-emitted IMPLEMENTS edges.
+  if (!callableFlowOnly) {
+    provider.emitHeritageEdges?.(
+      graph,
+      parsedFiles,
+      nodeLookup,
+      finalized,
+      recordHeritageTypeArguments,
+    );
+  }
+  // Implicit IMPORTS-edge hook — for languages whose files have compiler-
+  // implicit cross-file visibility (no syntactic import statement). The
+  // finalized-ImportEdge pipeline (`emitImportEdges`) cannot produce these
+  // because there is no `ImportEdge` to materialize. Idempotent.
+  if (!callableFlowOnly) {
+    provider.emitImplicitImportEdges?.(graph, parsedFiles, nodeLookup, resolutionConfig);
+  }
+  // Rebuild the node lookup after heritage-edge emission. Languages like
+  // Ruby create Property graph nodes inside `emitHeritageEdges`; those
+  // nodes must be visible to downstream passes (`emitReceiverBoundCalls`
+  // resolves write-access targets via `resolveDefGraphId` which consults
+  // `nodeLookup`). Without this rebuild, Property nodes added by the
+  // heritage hook are invisible and ACCESSES edges silently fail to emit.
+  const postHeritageNodeLookup =
+    !callableFlowOnly && provider.emitHeritageEdges !== undefined
+      ? buildGraphNodeLookup(graph)
+      : nodeLookup;
+  if (!callableFlowOnly) {
+    undecidedSatisfaction.push(
+      ...emitDetectedInterfaceImplementations(
+        graph,
+        parsedFiles,
+        postHeritageNodeLookup,
+        provider,
+        finalized,
+        readonlyModel,
+      ),
+    );
+  }
+  const mroByClassDefId = provider.buildMro(graph, parsedFiles, postHeritageNodeLookup);
+  const extendsOnlyMroByClassDefId = provider.buildExtendsOnlyMro?.(
+    graph,
+    parsedFiles,
+    postHeritageNodeLookup,
+  );
 
   // Build the workspace resolution index ONCE — scope-valued lookups
   // (`classScopeByDefId`, `moduleScopeByFile`) that `SemanticModel`
   // cannot carry. Must run AFTER `populateOwners` (so owned defs are
   // attributed correctly) and AFTER finalize (so module-scope
   // bindings are available).
-  const workspaceIndex = buildWorkspaceResolutionIndex(parsedFiles);
+  // Pass the scopeTree so the index's class/module Scope lookups are id-backed
+  // views that delegate to it (out-of-core scope index) — the index pins no Scope objects, so the
+  // disk seal can reclaim them. Byte-identical: the view returns the same Scope
+  // the resident tree holds (or a value-identical revived one in disk mode).
+  const methodDispatch = buildPopulatedMethodDispatch(mroByClassDefId, extendsOnlyMroByClassDefId);
+  const workspaceIndex = buildWorkspaceResolutionIndex(parsedFiles, finalized.scopeTree, {
+    stripTypePreservingDecoration: provider.stripTypePreservingDecoration,
+    namespaceExports: provider.namespaceExportsFromModuleExports
+      ? provider.moduleExports
+      : undefined,
+  });
+  logHeapProbe('sr-post-workspaceIndex', `lang=${provider.language}`);
 
-  // Cross-file implicit-namespace visibility (C#). Must run before
-  // propagateImportedReturnTypes so the latter pass sees siblings'
-  // class bindings when chasing return-type chains across files.
-  // The hook writes to `bindingAugmentations` only; finalized
-  // `indexes.bindings` remains immutable post-finalize (I8).
+  // Replace the empty MethodDispatchIndex that finalizeScopeModel
+  // builds by design with the populated one derived from the
+  // language's MRO, and install the provider's namespace exports. Spread
+  // produces a fresh `ScopeResolutionIndexes` instead of mutating the
+  // finalized result through an `as` cast — every member is written here,
+  // once, and downstream passes get an object whose readonly guarantees
+  // match the type system.
+  const indexes: ScopeResolutionIndexes = {
+    ...finalized,
+    methodDispatch,
+    ...(workspaceIndex.namespaceExportsByFile === undefined
+      ? {}
+      : { namespaceExportsByFile: workspaceIndex.namespaceExportsByFile }),
+  };
+
+  // Complete implicit namespace visibility and refine provider-owned type facts
+  // before return propagation. New bindings use bindingAugmentations; existing
+  // scope typeBindings may be refined. indexes.bindings stays immutable (I8).
   if (provider.populateNamespaceSiblings !== undefined) {
     provider.populateNamespaceSiblings(parsedFiles, indexes, {
       fileContents: getFileContents(),
       treeCache,
+      resolutionConfig,
     });
   }
 
@@ -202,7 +1247,7 @@ export function runScopeResolution(
   // propagateImportedReturnTypes so the SCC-ordered pass sees the
   // mirrored bindings.
   if (provider.mirrorNamespaceTypeBindings !== undefined) {
-    provider.mirrorNamespaceTypeBindings(parsedFiles, indexes, workspaceIndex);
+    provider.mirrorNamespaceTypeBindings(parsedFiles, indexes, workspaceIndex, resolutionConfig);
   }
 
   // Cross-file return-type propagation (Contract Invariant I3 timing:
@@ -211,9 +1256,20 @@ export function runScopeResolution(
   // with chain-follow per importer; quadratic regressions show up
   // here, not in finalize).
   if (provider.propagatesReturnTypesAcrossImports !== false) {
-    propagateImportedReturnTypes(parsedFiles, indexes, workspaceIndex);
+    propagateImportedReturnTypes(
+      parsedFiles,
+      indexes,
+      workspaceIndex,
+      provider.resolveQualifiedCallee,
+      allFilePaths,
+      provider.elementTypeOf,
+      provider.followsInstanceCallResultTypes === true
+        ? (owner, name) => input.model.methods.lookupAllByOwner(owner, name)
+        : undefined,
+    );
   }
 
+  const tRangeBindStart = PROF ? process.hrtime.bigint() : 0n;
   if (provider.populateRangeBindings !== undefined) {
     provider.populateRangeBindings(parsedFiles, indexes, {
       fileContents: getFileContents(),
@@ -230,52 +1286,1064 @@ export function runScopeResolution(
   // VALIDATE_SEMANTIC_MODEL=1.
   validateBindingsImmutability(indexes, onWarn);
 
+  const selectedCalls =
+    provider.receiverCallSite === undefined
+      ? undefined
+      : new Map<string, SymbolDefinition | null>();
+  const pendingCallReceivers = selectedCalls === undefined ? undefined : new Map<string, string>();
+  const callResultProducers =
+    selectedCalls === undefined ? undefined : new Map<string, CallResultAssignmentSite>();
+  const assignmentsByProducer = new Map<string, CallResultAssignmentSite[]>();
+  if (callResultProducers !== undefined) {
+    for (const parsed of parsedFiles) {
+      for (const assignment of parsed.callResultAssignmentSites ?? []) {
+        callResultProducers.set(
+          callResultBindingKey(assignment.inScope, assignment.lhs),
+          assignment,
+        );
+        const key = selectedCallKey(parsed.filePath, assignment.callSite);
+        let assignments = assignmentsByProducer.get(key);
+        if (assignments === undefined) assignmentsByProducer.set(key, (assignments = []));
+        assignments.push(assignment);
+      }
+    }
+  }
+  const onSelectedCall =
+    selectedCalls === undefined
+      ? undefined
+      : (key: string, definition: SymbolDefinition | null): void => {
+          for (const assignment of assignmentsByProducer.get(key) ?? []) {
+            applySelectedCallResultBinding(assignment, indexes, workspaceIndex, definition);
+          }
+        };
+  if (!callableFlowOnly && selectedCalls !== undefined) {
+    // Clear guessed assignment returns before Registry.lookup can cache a
+    // wrong downstream member. Exact primaries restore them after emission.
+    applyPreciseCallResultBindings(
+      parsedFiles,
+      indexes,
+      workspaceIndex,
+      createCalleeIdAccumulator(),
+      postHeritageNodeLookup,
+      readonlyModel,
+      provider.hoistedTypeBindingsRequireOwner === true,
+      selectedCalls,
+    );
+  }
+
   // ── Phase 3: resolve references via Registry.lookup ────────────────────
+  input.onProgress?.('resolving references', files.length, files.length);
   const registryProviders: RegistryProviders = {
     arityCompatibility: provider.arityCompatibility,
   };
+  const memberVisibleToQualifier = provider.isNamespaceMemberVisible;
   const { referenceIndex, stats: resolveStats } = resolveReferenceSites({
     scopes: indexes,
     providers: registryProviders,
+    isNamespaceMemberVisible:
+      memberVisibleToQualifier === undefined
+        ? undefined
+        : (member) => memberVisibleToQualifier({ member }),
+    recordSourceBinding:
+      recordSourceBinding === undefined
+        ? undefined
+        : (site, binding) => {
+            // Inheritance already passed through its qualified/provider-aware seam.
+            if (site.kind !== 'inherits') recordSourceBinding(site, binding);
+          },
+    ownedMembersByOwner: (ownerDefId, memberName) =>
+      lookupOwnedMembersByOwner(readonlyModel, ownerDefId, memberName),
   });
   const tResolve = PROF ? process.hrtime.bigint() : 0n;
+  logHeapProbe('sr-post-resolve', `lang=${provider.language}`);
+
+  const emitStarted = Date.now();
+  const probeEmit = (stage: string, detail = ''): void => {
+    if (!isDebugHeapEnabled()) return;
+    logHeapProbe(
+      `sr-emit-${stage}`,
+      `lang=${provider.language} elapsed_ms=${Date.now() - emitStarted}` +
+        ` nodes=${graph.nodeCount} edges=${graph.relationshipCount} ${detail}`,
+    );
+  };
+  if (isDebugHeapEnabled()) {
+    probeEmit(
+      'start',
+      `references=${indexes.referenceSites.length}` +
+        ` callableFacts=${parsedFiles.reduce((total, parsed) => total + (parsed.callableFlowSites?.length ?? 0), 0)}`,
+    );
+  }
+
+  // Value defs bound at MODULE LEVEL. A read of a block-local `const` must not
+  // mint an edge — that would retain the inert locals `pruneLocalSymbols` drops.
+  //
+  // Built HERE, above the out-of-core seal, and deliberately from `parsedFiles`
+  // rather than `emitParsedFiles`. The seal below replaces the latter with a
+  // scope-STRIPPED copy, so building this after it walked `scopes: []` for every
+  // file and produced an empty set — which the filter then reads as "no def is
+  // module-level" and drops EVERY `Const`/`Variable`/`Static` ACCESSES edge in
+  // the repo, in all languages, on the one path (`GITNEXUS_DISK_SCOPE_INDEX=1`)
+  // taken by the largest repos. Nothing failed and nothing logged; the edges
+  // were simply absent, which is the confident-empty answer this PR exists to
+  // remove.
+  //
+  // ── The question is "is this def FUNCTION-LOCAL?", so ask exactly that ──
+  //
+  // This was first written as an ALLOWLIST of module-scope value defs, and that
+  // shape carried a defect that only shows outside JavaScript. A value def is
+  // not partitioned into {module-level, block-local}; there is a third home —
+  // a CLASS body. Java/C# fields and Python class attributes live there, and an
+  // allowlist keyed on "module level" excludes all of them by construction.
+  // Worse, the guard written to make that safe could not fire: the set is armed
+  // whenever a Module scope is FOUND, and Java has module scopes while having no
+  // module-level values at all, so for Java it armed permanently empty.
+  //
+  // Inverting it removes the whole class. A BLOCKLIST of defs positively
+  // identified as function-local fails safe: anything the walk does not
+  // recognise — a Java field, a Python class attribute, a language whose scopes
+  // could not be inspected at all — is emitted rather than dropped. That also
+  // retires `moduleScopesInspected`; there is nothing left to arm, because an
+  // empty blocklist and an uninspected one mean the same thing and both mean
+  // "emit". The failure mode moves from "silently deletes a whole edge class"
+  // to "retains an inert local", which is the direction this work wants.
+  //
+  // Built HERE, above the out-of-core seal, and deliberately from `parsedFiles`
+  // rather than `emitParsedFiles`. The seal below replaces the latter with a
+  // scope-STRIPPED copy, so building this after it walked `scopes: []` for every
+  // file and produced an empty set. Under the old allowlist that read as "no def
+  // is module-level" and dropped EVERY `Const`/`Variable`/`Static` ACCESSES edge
+  // in the repo on the one path (`GITNEXUS_DISK_SCOPE_INDEX=1`) taken by the
+  // largest repos. Under the blocklist the same mistake would merely stop
+  // filtering — still wrong, still worth the ordering, no longer catastrophic.
+  //
+  // A scope is function-local when its chain to the root passes through a
+  // `Function`. `Block`/`Expression`/`Object` alone are not enough: a bare block
+  // at module level still holds module-level values, and a `Namespace` nested in
+  // a function IS local, which the chain walk gets right for free.
+  const functionLocalValueDefIds = new Set<string>();
+  for (const parsed of parsedFiles) {
+    const scopeById = new Map(parsed.scopes.map((sc) => [sc.id, sc]));
+    for (const scope of parsed.scopes) {
+      let cursor: typeof scope | undefined = scope;
+      let insideFunction = false;
+      while (cursor !== undefined) {
+        if (cursor.kind === 'Function') {
+          insideFunction = true;
+          break;
+        }
+        cursor = cursor.parent === null ? undefined : scopeById.get(cursor.parent);
+      }
+      if (!insideFunction) continue;
+      for (const [, refs] of scope.bindings) {
+        for (const ref of refs) {
+          if (isValueDefinitionLabel(ref.def.type)) {
+            functionLocalValueDefIds.add(ref.def.nodeId);
+          }
+        }
+      }
+    }
+  }
+
+  probeEmit('locals-end', `localValues=${functionLocalValueDefIds.size}`);
+  // ── Out-of-core scope seal boundary ─────────────────────────────────────
+  // Pass-A (finalize + propagate + resolve) is done; all whole-language reads
+  // of `Scope.bindings` are behind us. Emit reaches scopes ONLY via
+  // `scopeTree.getScope` (a point lookup), so seal the TransitionalScopeTree to
+  // disk now and drop the resident scopes. The scopes are pinned from THREE
+  // sides: (1) the model's frozen `scopeTree` — released by `seal()` nulling its
+  // resident backing from the inside; (2) `input.preExtractedParsedFiles` (held
+  // by the caller for its own post-run release) — released here since run.ts is
+  // its last reader after extract; (3) this function's `parsedFiles` — replaced
+  // by a scope-stripped copy that keeps only what emit reads (referenceSites /
+  // filePath / localDefs). All three released → the heavy payload is collectible.
+  let emitParsedFiles: readonly ParsedFile[] = parsedFiles;
+  if (
+    input.scopeIndexStorePath !== undefined &&
+    parseTruthyEnv(process.env.GITNEXUS_DISK_SCOPE_INDEX) &&
+    indexes.scopeTree instanceof TransitionalScopeTree
+  ) {
+    logHeapProbe('sr-seal-pre', `lang=${provider.language}`);
+    indexes.scopeTree.seal(input.scopeIndexStorePath);
+    emitParsedFiles = parsedFiles.map((p) => ({ ...p, scopes: [] }));
+    parsedFiles.length = 0;
+    if (preExtracted !== undefined) (preExtracted as Map<string, ParsedFile>).clear();
+    forceGc();
+    logHeapProbe('sr-seal-post', `lang=${provider.language}`);
+  }
 
   // ── Phase 4: emit graph edges (LOAD-BEARING ORDER — see I1) ────────────
-  const handledSites = new Set<string>();
-  const receiverExtras = emitReceiverBoundCalls(
-    graph,
-    indexes,
-    parsedFiles,
-    nodeLookup,
-    handledSites,
-    provider,
-    workspaceIndex,
-    readonlyModel,
+  input.onProgress?.('linking symbols', files.length, files.length);
+  const handledSites = new Set<string>(preEmittedInheritanceSites);
+  const deferredIndirectCollection = collectDeferredIndirectCollection(emitParsedFiles, indexes);
+  const deferredIndirectSites = deferredIndirectCollection.sites;
+  probeEmit(
+    'indirect-collection-end',
+    `deferred=${deferredIndirectSites.size} signatures=${deferredIndirectCollection.callSignaturesBySite.size}`,
   );
-  const freeCallExtras = emitFreeCallFallback(
-    graph,
-    indexes,
-    parsedFiles,
-    nodeLookup,
-    referenceIndex,
-    handledSites,
-    readonlyModel,
-    workspaceIndex,
-    { allowGlobalFallback: provider.allowGlobalFreeCallFallback === true },
+  const callableArgumentSites = new Set<string>();
+  const callResultAssignmentSites = new Set<string>();
+  for (const parsed of emitParsedFiles) {
+    for (const site of parsed.callResultAssignmentSites ?? []) {
+      callResultAssignmentSites.add(callableFlowSiteKey(parsed.filePath, site.callSite));
+    }
+  }
+  if (input.pdg !== true && deferredIndirectSites.size > 0) {
+    for (const parsed of emitParsedFiles) {
+      for (const site of parsed.callableFlowSites ?? []) {
+        if (site.kind === 'argument') {
+          callableArgumentSites.add(callableFlowSiteKey(parsed.filePath, site.callSite));
+        }
+      }
+    }
+  }
+  // Resolved-callee-id accumulator (#2227 U2 + callable-value-flow). Created
+  // for PDG OR when indirect-call facts need direct targets for actual→formal
+  // propagation. Populated below at every CALLS emit path before dedup; the CFG
+  // join still consumes it only inside the `input.pdg` block.
+  const calleeIdAccumulator: CalleeIdAccumulator | undefined =
+    input.pdg === true ||
+    deferredIndirectSites.size > 0 ||
+    callResultAssignmentSites.size > 0 ||
+    provider.receiverCallSite !== undefined
+      ? createCalleeIdAccumulator(
+          input.pdg === true
+            ? undefined
+            : (filePath, line, col) => {
+                const key = `${filePath}:${line}:${col}`;
+                return callableArgumentSites.has(key) || callResultAssignmentSites.has(key);
+              },
+        )
+      : undefined;
+  const receiverBound = callableFlowOnly
+    ? {
+        emitted: 0,
+        dispatchFanoutSkipped: 0,
+        dispatchFanoutSkippedNames: [] as readonly string[],
+      }
+    : emitReceiverBoundCalls(
+        graph,
+        indexes,
+        emitParsedFiles,
+        postHeritageNodeLookup,
+        handledSites,
+        provider,
+        workspaceIndex,
+        readonlyModel,
+        {
+          recordResolutionOutcome,
+          recordSourceBinding,
+          selectedCalls,
+          onSelectedCall,
+          pendingCallReceivers,
+          callResultProducers,
+          allFilePaths,
+          calleeIdSink: calleeIdAccumulator,
+          // The pass's sources of positive EXTERNAL evidence for a dropped
+          // receiver (`console.log`, `document.body`, `import os`). The first is
+          // the same hook, same spelling as the `emitFreeCallFallback` wiring
+          // below; the other two are read by nothing but the origin label.
+          isBuiltInName: provider.languageProvider.isBuiltInName,
+          externalReceiverNames: provider.languageProvider.externalReceiverNames,
+          isExternalModuleSpecifier: provider.languageProvider.isExternalModuleSpecifier,
+          // What each heritage clause instantiated its base with, so the
+          // interface-dispatch fan-out can refuse an incompatible instantiation
+          // (#2912). Empty under `callableFlowOnly`, which emits no dispatch.
+          heritageTypeArguments,
+          unresolvedInheritanceByClass,
+        },
+      );
+  probeEmit('receiver-end', `handled=${handledSites.size} emitted=${receiverBound.emitted}`);
+  let receiverExtras = receiverBound.emitted;
+  if (receiverBound.dispatchFanoutSkipped > 0) {
+    // Never drop dispatch coverage silently (#2829) — same contract as the
+    // property-dispatch cap below. An interface member over the cap loses real
+    // implementors, so `impact()` on those implementations under-reports; an
+    // operator has to be able to see WHICH member lost them.
+    logger.warn(
+      {
+        lang: provider.language,
+        dispatchFanoutSkipped: receiverBound.dispatchFanoutSkipped,
+        dispatchFanoutSkippedNames: receiverBound.dispatchFanoutSkippedNames,
+        fanoutCap: MAX_INTERFACE_DISPATCH_FANOUT,
+      },
+      'interface-dispatch: members over the fan-out cap dropped implementors (their CALLS edges were not emitted)',
+    );
+  }
+  const unresolvedReceiverExtras =
+    !callableFlowOnly && provider.emitUnresolvedReceiverEdges !== undefined
+      ? provider.emitUnresolvedReceiverEdges(
+          graph,
+          indexes,
+          emitParsedFiles,
+          postHeritageNodeLookup,
+          handledSites,
+          readonlyModel,
+        )
+      : 0;
+  const freeCallExtras = callableFlowOnly
+    ? 0
+    : emitFreeCallFallback(
+        graph,
+        indexes,
+        emitParsedFiles,
+        postHeritageNodeLookup,
+        referenceIndex,
+        handledSites,
+        readonlyModel,
+        workspaceIndex,
+        {
+          allowGlobalFallback: provider.allowGlobalFreeCallFallback === true,
+          language: provider.language,
+          isGlobalNameFallbackPlausible: provider.isGlobalNameFallbackPlausible,
+          resolutionConfig,
+          sourceTextOf:
+            provider.isGlobalNameFallbackPlausible !== undefined
+              ? (filePath: string) => getFileContents().get(filePath)
+              : undefined,
+          constructorCallTargetsClass: provider.constructorCallTargetsClass === true,
+          markConstructionSites: provider.markConstructionSites === true,
+          bareCallConstructs: provider.constructionSyntax?.bare === true,
+          isFileLocalDef: provider.isFileLocalDef,
+          isBuiltInName: provider.languageProvider.isBuiltInName,
+          freeCallsRequireInstanceOwnership: provider.freeCallsRequireInstanceOwnership === true,
+          implicitThisWalksMro: provider.implicitThisWalksMro === true,
+          isCallableVisibleFromCaller: provider.isCallableVisibleFromCaller,
+          isNamespaceMemberVisible: provider.isNamespaceMemberVisible,
+          resolveAdlCandidates: provider.resolveAdlCandidates,
+          resolveOrdinaryCallables: provider.resolveOrdinaryCallables,
+          resolveQualifiedFreeCall: provider.resolveQualifiedFreeCall,
+          resolveUnqualifiedCall: provider.resolveUnqualifiedCall,
+          selectedCalls,
+          onSelectedCall,
+          conversionRankFn: provider.conversionRankFn,
+          conversionOnlyArgTypePrefixes: provider.conversionOnlyArgTypePrefixes,
+          constraintCompatibility: provider.constraintCompatibility,
+          recordResolutionOutcome,
+          recordSourceBinding,
+          calleeIdSink: calleeIdAccumulator,
+          skipSites: deferredIndirectSites,
+        },
+      );
+  probeEmit('free-calls-end', `handled=${handledSites.size} emitted=${freeCallExtras}`);
+  const replayedCallResultBindings =
+    callableFlowOnly || calleeIdAccumulator === undefined || selectedCalls !== undefined
+      ? 0
+      : applyPreciseCallResultBindings(
+          emitParsedFiles,
+          indexes,
+          workspaceIndex,
+          calleeIdAccumulator,
+          postHeritageNodeLookup,
+          readonlyModel,
+          provider.hoistedTypeBindingsRequireOwner === true,
+          selectedCalls,
+        );
+  if (replayedCallResultBindings > 0 || selectedCalls !== undefined) {
+    const handledBeforeReplay = new Set(handledSites);
+    const replayedReceiverBound = emitReceiverBoundCalls(
+      graph,
+      indexes,
+      emitParsedFiles,
+      postHeritageNodeLookup,
+      handledSites,
+      provider,
+      workspaceIndex,
+      readonlyModel,
+      {
+        calleeIdSink: calleeIdAccumulator,
+        recordSourceBinding,
+        recordResolutionOutcome: selectedCalls === undefined ? undefined : recordResolutionOutcome,
+        selectedCalls,
+        onSelectedCall,
+        pendingCallReceivers,
+        callResultProducers,
+        isBuiltInName: provider.languageProvider.isBuiltInName,
+        externalReceiverNames: provider.languageProvider.externalReceiverNames,
+        isExternalModuleSpecifier: provider.languageProvider.isExternalModuleSpecifier,
+        allFilePaths,
+        heritageTypeArguments,
+        unresolvedInheritanceByClass,
+      },
+    );
+    receiverExtras += replayedReceiverBound.emitted;
+    if (replayedReceiverBound.dispatchFanoutSkipped > 0) {
+      logger.warn(
+        {
+          lang: provider.language,
+          dispatchFanoutSkipped: replayedReceiverBound.dispatchFanoutSkipped,
+          dispatchFanoutSkippedNames: replayedReceiverBound.dispatchFanoutSkippedNames,
+          fanoutCap: MAX_INTERFACE_DISPATCH_FANOUT,
+          replay: true,
+        },
+        'interface-dispatch: members over the fan-out cap dropped implementors (their CALLS edges were not emitted)',
+      );
+    }
+    const resolvedOnReplay = new Set<string>();
+    for (const key of handledSites) {
+      if (!handledBeforeReplay.has(key)) resolvedOnReplay.add(key);
+    }
+    if (resolvedOnReplay.size > 0 || selectedCalls !== undefined) {
+      // Replay can retry an unresolved site. Keep its latest diagnostic once,
+      // and compact in one pass so withdrawing many drops stays linear.
+      const receiverDropPositions = new Map<string, number>();
+      let kept = 0;
+      for (const outcome of resolutionOutcomes) {
+        if (outcome.kind === 'suppressed' && outcome.reason === 'receiver-unresolved') {
+          const resolved =
+            selectedCalls === undefined
+              ? resolvedOnReplay.has(callableFlowSiteKey(outcome.filePath, outcome.range))
+              : selectedCalls.get(selectedCallKey(outcome.filePath, outcome.range)) != null;
+          if (resolved) continue;
+          if (outcome.siteKind !== undefined) {
+            const key = answeredSiteKey(
+              outcome.filePath,
+              outcome.range,
+              outcome.siteKind,
+              outcome.name,
+            );
+            const previous = receiverDropPositions.get(key);
+            if (previous !== undefined) {
+              resolutionOutcomes[previous] = outcome;
+              continue;
+            }
+            receiverDropPositions.set(key, kept);
+          }
+        }
+        resolutionOutcomes[kept++] = outcome;
+      }
+      resolutionOutcomes.length = kept;
+    }
+  }
+  for (const [key, handledKey] of pendingCallReceivers ?? []) {
+    selectedCalls?.set(key, null);
+    handledSites.add(handledKey);
+  }
+  // Receiver/free-call passes have finished reading this set. Extend it for
+  // the remaining passes instead of retaining three whole-program copies.
+  const referenceSkipSites = handledSites;
+  probeEmit(
+    'replay-end',
+    `handled=${handledSites.size} replayedBindings=${replayedCallResultBindings}`,
   );
-  const { emitted, skipped } = emitReferencesViaLookup(
-    graph,
-    indexes,
-    referenceIndex,
-    nodeLookup,
-    handledSites,
-  );
-  const importsEmitted = emitImportEdges(
-    graph,
-    indexes.imports,
-    indexes.scopeTree,
-    provider.importEdgeReason,
-  );
+  for (const key of deferredIndirectSites) referenceSkipSites.add(key);
+  const { emitted, skipped } = callableFlowOnly
+    ? { emitted: 0, skipped: 0 }
+    : emitReferencesViaLookup(
+        graph,
+        indexes,
+        referenceIndex,
+        postHeritageNodeLookup,
+        referenceSkipSites,
+        calleeIdAccumulator,
+        // A blocklist, so it needs no arming: empty means "nothing identified as
+        // function-local", which is also what an uninspected repo means, and
+        // both correctly emit. See the build site above for why the earlier
+        // allowlist could not be made safe this way.
+        functionLocalValueDefIds,
+        { markConstructionSites: provider.markConstructionSites === true },
+      );
+  // Last-resort property resolution by workspace-unique name (A1/A5). Runs
+  // after every precise pass and only sees what they left behind, so a
+  // scope-resolved target always wins. Sites the generic bridge already
+  // resolved are excluded explicitly: `graph.addRelationship` is
+  // first-write-wins per edge id, which stops a DUPLICATE but not a second
+  // edge to a DIFFERENT target, and second-guessing a resolved receiver is
+  // exactly the wrong-edge-in-the-safety-gate case this must not create.
+  const uniqueNameSkipSites = referenceSkipSites;
+  probeEmit('references-end', `emitted=${emitted} skipped=${skipped}`);
+  for (const [fromScope, refs] of referenceIndex.bySourceScope) {
+    const fromFilePath = indexes.scopeTree.getScope(fromScope)?.filePath;
+    if (fromFilePath === undefined) continue;
+    for (const ref of refs) {
+      uniqueNameSkipSites.add(callableFlowSiteKey(fromFilePath, ref.atRange));
+    }
+  }
+  // Gated on the language's own field-name-fallback policy. A statically-typed
+  // language sets `fieldFallbackOnMethodLookup: false` precisely because
+  // matching a member by name over-connects when a real type system could have
+  // answered exactly; inferring an ACCESSES edge by name is the same claim, so
+  // it must obey the same opt-out rather than route around it.
+  // Cross-file value references (A2): the read/write counterpart to
+  // `emitFreeCallFallback`. Runs BEFORE unique-name inference so a precise
+  // import-resolved target always wins over a name guess.
+  const importedValueRefs = callableFlowOnly
+    ? { emitted: 0 }
+    : emitImportedValueReferences(
+        graph,
+        indexes,
+        emitParsedFiles,
+        postHeritageNodeLookup,
+        uniqueNameSkipSites,
+        recordSourceBinding,
+      );
+
+  // A language that opts out of name fallback still gets DETECTION. Skipping
+  // the pass outright also skipped its reporting, so a TypeScript read whose
+  // only anchor is JavaScript answered the same silent empty as the JS-read /
+  // TS-anchor case R3-1 was filed about — the identical defect, mirrored.
+  // `reportOnly` counts without emitting: no edge, no inference, no change to
+  // what the opt-out protects.
+  // PRECISE first (R3-5). A call result's return shape names WHICH producer a
+  // receiver holds, so it answers exactly the case name inference must refuse:
+  // several functions returning the same field name. Sites it resolves are
+  // added to the skip set, so the fallback below never second-guesses them.
+  const sharedPropertyIndex = input.prebuiltPropertyNameIndex ?? buildPropertyNameIndex(graph);
+  probeEmit('imported-values-end', `skipSites=${uniqueNameSkipSites.size}`);
+  const answeredAfterReceiverPass = new Set<string>();
+  const returnShapeMembers = callableFlowOnly
+    ? { emitted: 0, memberNotOnShape: 0 }
+    : emitReturnShapeMemberAccesses(
+        graph,
+        indexes,
+        emitParsedFiles,
+        postHeritageNodeLookup,
+        uniqueNameSkipSites,
+        sharedPropertyIndex,
+        uniqueNameSkipSites,
+        answeredAfterReceiverPass,
+      );
+
+  const nameFallbackDisabled = provider.fieldFallbackOnMethodLookup === false;
+  const uniqueNameProperties = callableFlowOnly
+    ? {
+        emitted: 0,
+        ambiguous: 0,
+        narrowed: 0,
+        ambiguousNames: [],
+        crossLanguageOnly: 0,
+        crossLanguageOnlyNames: [],
+      }
+    : emitUniqueNamePropertyAccesses(
+        graph,
+        indexes,
+        emitParsedFiles,
+        postHeritageNodeLookup,
+        uniqueNameSkipSites,
+        finalized,
+        sharedPropertyIndex,
+        nameFallbackDisabled,
+        answeredAfterReceiverPass,
+      );
+  withdrawAnsweredReceiverDrops(resolutionOutcomes, answeredAfterReceiverPass);
+  probeEmit('properties-end', `outcomes=${resolutionOutcomes.length}`);
+
+  // value-ref registrations (#2437): USES edges at the registration sites
+  // plus field-based dispatch — synthesized CALLS from member-call sites to
+  // functions registered under the same property key. This runs after the
+  // ordinary precise passes but before callable-value-flow: property-dispatched
+  // wrapper calls must populate the callee accumulator before actual→formal
+  // propagation. `graph.addRelationship` remains first-write-wins, so precise
+  // edges already emitted for a site retain ownership.
+  const propertyDispatch = callableFlowOnly
+    ? {
+        usesEmitted: 0,
+        callsEmitted: 0,
+        skippedKeys: 0,
+        skippedKeyNames: [] as readonly string[],
+      }
+    : emitPropertyDispatchCalls(
+        graph,
+        indexes,
+        emitParsedFiles,
+        postHeritageNodeLookup,
+        readonlyModel,
+        calleeIdAccumulator,
+        // Same provider hook the receiver-bound pass consults for a namespace
+        // member (Case 1). Without it a hub module's re-exported callable
+        // resolves when CALLED and declines when REGISTERED.
+        provider.namespaceExportsIncludeImportedNames === true,
+        {
+          receiverPaths: provider.namespaceReceiverPaths,
+          bindingIdentity: provider.namespaceBindingIdentity,
+          skipEnclosingClasses: provider.namespaceSkipsEnclosingClasses,
+          moduleFileExists: (filePath) => indexes.moduleScopes.get(filePath) !== undefined,
+        },
+        recordSourceBinding,
+      );
+  if (propertyDispatch.skippedKeys > 0) {
+    // Never drop dispatch coverage silently: a hook table larger than the
+    // fan-out cap means member calls through those keys get no synthesized
+    // CALLS — the #2437 false-safe gap reappears for exactly those keys.
+    logger.warn(
+      {
+        lang: provider.language,
+        skippedKeys: propertyDispatch.skippedKeys,
+        skippedKeyNames: propertyDispatch.skippedKeyNames,
+        fanoutCap: MAX_PROPERTY_DISPATCH_FANOUT,
+      },
+      'property-dispatch: keys over the fan-out cap were dropped (no CALLS synthesized for them)',
+    );
+  }
+  probeEmit('property-dispatch-end');
+  const callableValueFlow =
+    calleeIdAccumulator === undefined
+      ? {
+          emitted: 0,
+          resolvedInvokes: 0,
+          ambiguousInvokes: 0,
+          unmatchedInvokes: 0,
+          iterations: 0,
+        }
+      : emitCallableValueFlow({
+          graph,
+          scopes: indexes,
+          parsedFiles: emitParsedFiles,
+          nodeLookup: postHeritageNodeLookup,
+          calleeIds: calleeIdAccumulator,
+          language: provider.language,
+          collapseByCallerTarget: provider.collapseMemberCallsByCallerTarget === true,
+          isCallableValueTarget: provider.isCallableValueTarget,
+          hasFileLocalCallableLinkage: provider.hasFileLocalCallableLinkage,
+          qualifiedTypeLookupSpelling: provider.qualifiedTypeLookupSpelling,
+          isNamespaceMemberVisible: provider.isNamespaceMemberVisible,
+          deferredIndirectSites,
+          callSignaturesBySite: deferredIndirectCollection.callSignaturesBySite,
+          onWarn: (warning) =>
+            logger.warn(
+              warning,
+              'callable-value-flow: candidate set exceeded the cap; no partial CALLS emitted',
+            ),
+        });
+  probeEmit('callable-flow-end', `iterations=${callableValueFlow.iterations}`);
+  const onDemandImportTargets = provider.onDemandImportTargets;
+  const importSources =
+    onDemandImportTargets === undefined
+      ? undefined
+      : new Map(emitParsedFiles.map((parsed) => [parsed.filePath, parsed]));
+  const importsEmitted = callableFlowOnly
+    ? 0
+    : emitImportEdges(
+        graph,
+        indexes.imports,
+        indexes.scopeTree,
+        provider.importEdgeReason,
+        onDemandImportTargets === undefined
+          ? undefined
+          : (sourceFile) => {
+              const parsed = importSources?.get(sourceFile);
+              return parsed === undefined ? undefined : onDemandImportTargets(parsed, indexes);
+            },
+      );
+  probeEmit('imports-end', `emitted=${importsEmitted}`);
+
+  // Language-specific supplementary edges (e.g. Vue template-derived
+  // BINDS_EVENT_HANDLER / EMITS_EVENT / CALLS / ACCESSES edges).
+  // Runs last so the full graph — including import edges — is visible.
+  if (
+    (!callableFlowOnly || recordSourceBinding !== undefined) &&
+    provider.emitPostResolutionEdges !== undefined
+  ) {
+    provider.emitPostResolutionEdges(graph, emitParsedFiles, postHeritageNodeLookup, indexes, {
+      fileContents: getFileContents(),
+      resolutionConfig,
+      recordSourceBinding,
+    });
+  }
+  probeEmit('provider-end');
+
+  // ── CFG/PDG emission (#2081 M1, opt-in via `--pdg`) ──────────────────────
+  // Emit BasicBlock nodes + CFG edges from each ParsedFile's worker-built
+  // `cfgSideChannel`, HERE — the last point inside scope-resolution where the
+  // ParsedFiles are still loaded (`emitParsedFiles` carries the channel; the
+  // disk store is cleared right after this orchestrator returns, see phase.ts).
+  // A post-`mro` phase would read empty data (KTD1). Off by default ⇒ zero
+  // BasicBlock/CFG nodes/edges and a byte-identical graph.
+  // Accumulated M2 reaching-defs time (solve + dedup + REACHING_DEF emit),
+  // reported as the PROF `pdg=` segment. It is a SUBSET of `emit=` — the M1
+  // CFG emit and the M2 solve interleave per file, so a separate checkpoint
+  // pair can't bracket them; without this accumulator the M2 cost would
+  // silently disappear into `emit=` and field regressions would be invisible.
+  let pdgMs = 0;
+  // M4 (#2084 U1): per-function taint summaries harvested in the pdg window,
+  // returned on the stats for the cross-function fixpoint phase. Function-scoped
+  // so the return (below the pdg block) can read it; empty on non-pdg runs.
+  const harvestedSummaries: FunctionSummary[] = [];
+  let summaryUnresolved = 0;
+  // FU-C (U-C2): per-function RETURN-VALUE ASCENT summaries harvested in the
+  // pdg window for the whole-program CALL_SUMMARY emit phase. Function-scoped
+  // (read by the return below the pdg block); empty on non-pdg runs.
+  const harvestedCallSummaries: CallSummary[] = [];
+  let callSummaryUnresolved = 0;
+  // M3 (#2083 U4): accumulated taint time (match + taint-side solve +
+  // propagate + TAINTED/SANITIZES emit), a sibling of `pdgMs` for the same
+  // reason — it interleaves per file inside `emit=`, so only an accumulator
+  // can bracket it. Printed as the PROF `taint=` segment.
+  let taintMs = 0;
+  if (input.pdg === true) {
+    // Streaming target (#2202): when a sink is provided, BasicBlock nodes +
+    // intra-file PDG edges are routed to CSV-on-disk through it instead of
+    // accumulating in `graph`. The function-node index below is still built
+    // from the real `graph` (Function/Method nodes live there, never the sink).
+    const pdgTarget: KnowledgeGraph = input.pdgEmitSink ?? graph;
+    let cfgBlocks = 0;
+    let cfgEdges = 0;
+    let cfgDroppedEdges = 0;
+    let rdEdges = 0;
+    let rdDropped = 0;
+    let rdFacts = 0;
+    let rdTruncated = 0;
+    let cdgEdges = 0;
+    let cdgDropped = 0;
+    let cdgSkippedUnsound = 0;
+    // ── M3 taint setup (#2083 U4) ────────────────────────────────────────
+    // Explicit model-registration seam (idempotent, cheap) — the registry
+    // stays empty on non-pdg runs, preserving default-run parity. The
+    // registry is keyed by SupportedLanguages enum values, and
+    // ScopeResolver.language is registered under those same constants -
+    // the join is direct equality, with no mapping table. A language without a
+    // registered spec (go, ruby, ...) skips taint entirely: no work, no warn spam
+    // (KTD8).
+    registerBuiltinTaintModels();
+    const taintSpec = getSourceSinkConfig(provider.language);
+    // Taint-side solver fact cap: the SAME derivation emitFileReachingDefs
+    // uses for the RD projection (edge cap × headroom factor, 0 ⇒ unlimited),
+    // so taint coverage and RD coverage truncate together — a function is
+    // never a taint coverage gap while its RD projection computed, and the
+    // RD layer's per-function truncation warn already names it.
+    const rdEdgeCap =
+      input.pdgMaxReachingDefEdgesPerFunction ?? DEFAULT_PDG_MAX_REACHING_DEF_EDGES_PER_FUNCTION;
+    const taintLimits: TaintEmitLimits = {
+      maxFindingsPerFunction:
+        input.pdgMaxTaintFindingsPerFunction ?? DEFAULT_PDG_MAX_TAINT_FINDINGS_PER_FUNCTION,
+      maxHops: input.pdgMaxTaintHops ?? DEFAULT_PDG_MAX_TAINT_HOPS,
+      maxFacts: rdEdgeCap > 0 ? rdEdgeCap * REACHING_DEF_FACTS_PER_EDGE_CAP : 0,
+    };
+    // Cross-file aggregate of EVERY TaintEmitResult counter (the M2 emit
+    // result shipped with two fields dropped on the floor — R4 forbids that
+    // here; gaps/drops feed the unconditional warn below, volume feeds the
+    // per-language debug line).
+    const taintTotals = {
+      analyzed: 0,
+      noMatch: 0,
+      unsafeSites: 0,
+      gapTruncated: 0,
+      gapOverflow: 0,
+      gapNoFacts: 0,
+      findings: 0,
+      kills: 0,
+      dropped: 0,
+      hopsTruncated: 0,
+      guardFunctions: 0,
+      guardFallbacks: 0,
+      guardVisits: 0,
+      gapExamples: [] as string[],
+      dropExamples: [] as string[],
+    };
+    // M4 (#2084 U1): per-function summary harvest. The functionish-node index
+    // is built ONCE (whole-graph scan) and reused across every file; summaries
+    // accumulate here and ride out on the stats for the cross-function fixpoint
+    // phase. Only built when the language has a registered taint model.
+    // Built whenever pdg is on (NOT gated on taintSpec): the FU-C call-summary
+    // harvest needs it for EVERY language (it is pure data-dependence, no taint
+    // model), and the taint summary harvest reuses it when taintSpec is present.
+    const fnNodeIndex = input.prebuiltFunctionNodeIndex ?? buildFunctionNodeIndex(graph);
+    for (const pf of emitParsedFiles) {
+      const cfgs = pf.cfgSideChannel;
+      // Defensive: cfgSideChannel is opaque (`unknown`) and crosses the cache /
+      // durable store. A stale or wrong-shape value (e.g. a pre-SCHEMA_BUMP
+      // shard that slipped the version gate) must skip emission, not throw a
+      // TypeError mid-graph-build and abort scope-resolution for the language.
+      if (!Array.isArray(cfgs) || cfgs.length === 0) continue;
+      // Cross-pass per-file dedup (#2202): when streaming, a file whose PDG
+      // already streamed in a prior language pass (e.g. a `.ts` module pulled
+      // into the Vue context pass) would re-emit identical ids from the same
+      // cfgSideChannel — the dedup-free streaming sink would double the rows.
+      // Skip it here; the in-memory-graph path needs no skip (its Map dedups).
+      if (input.pdgEmittedFiles !== undefined) {
+        if (input.pdgEmittedFiles.has(pf.filePath)) continue;
+        input.pdgEmittedFiles.add(pf.filePath);
+      }
+      try {
+        // Per-element emit-safety filter (mirrors the parsedfile-store
+        // reviver's POLICY: valid elements in a mixed array still emit; junk
+        // is warned and skipped). isEmitSafeCfg lives in cfg/emit.ts next to
+        // the id templating it defends — see its doc for why anchor-field and
+        // endpoint-membership checks are load-bearing. Runs INSIDE the try so
+        // even a predicate-time throw (e.g. a hostile getter) is isolated.
+        const wellFormed = (cfgs as readonly (FunctionCfg | undefined | null)[]).filter(
+          isEmitSafeCfg,
+        );
+        if (wellFormed.length < cfgs.length) {
+          logger.warn(
+            `[cfg] ${pf.filePath}: skipped ${cfgs.length - wellFormed.length} malformed ` +
+              `cfgSideChannel element(s) (bad shape, missing id-anchor fields, or edge ` +
+              `endpoints matching no block) — CFG for those functions omitted`,
+          );
+        }
+        if (wellFormed.length === 0) continue;
+        // U3 hook (#2227): the resolved-callee-id map for this file is
+        // `calleeIdAccumulator?.get(pf.filePath)` — joined here by exact
+        // call-site position to emit `BasicBlock.calleeIds`. Captured above at
+        // the three CALLS emit paths (U2); wired into `emitFileCfgs` by U3.
+        const emitted = emitFileCfgs(
+          pdgTarget,
+          wellFormed,
+          input.pdgMaxEdgesPerFunction ?? DEFAULT_MAX_CFG_EDGES_PER_FUNCTION,
+          // Log cap-overflow drops UNCONDITIONALLY (not via input.onWarn, which is
+          // gated behind the semantic-model validator and silent in production) so
+          // the per-function edge cap never truncates the CFG silently (R6/KTD6).
+          (message) => logger.warn(message),
+          // U3 (#2227): the resolved-callee-id map for this file (captured at the
+          // three CALLS emit paths in U2), joined by exact call-site position to
+          // emit `BasicBlock.calleeIds`. Callable-flow may also have allocated
+          // the accumulator in a normal run, but this join remains PDG-only.
+          calleeIdAccumulator?.get(pf.filePath),
+        );
+        cfgBlocks += emitted.blocks;
+        cfgEdges += emitted.edges;
+        cfgDroppedEdges += emitted.droppedEdges;
+        // R6 (#2227 tri-review-2): release this file's captured id map now that
+        // emitFileCfgs has consumed it — the CALLS passes fully precede this loop
+        // and each file is read exactly once, so this bounds the accumulator to one
+        // file's call sites instead of holding the whole repo's for the phase.
+        calleeIdAccumulator?.delete(pf.filePath);
+
+        // M2 (#2082 U4): reaching definitions over the same validated CFGs.
+        // In-memory facts are computed per function and dropped after the
+        // bounded (defBlock, useBlock, binding) projection is persisted —
+        // M3 recomputes via the same pure solver in-phase (KTD8). Timing is
+        // PROF-gated like every other checkpoint here (zero cost when off).
+        // U12: one memoized RD solver per file, shared by the RD-emit + call-
+        // summary + taint + summary passes, so the per-function fixpoint runs once
+        // per (limits) bucket instead of 3–4× (#2227 tri-review). File-scoped: it
+        // is re-created each iteration, so its per-function facts drop with the file.
+        const rdSolve = createMemoizedReachingDefs();
+        const refine = createMemoizedRefinement((result) => {
+          if (result.guards.status === 'computed') taintTotals.guardFunctions++;
+          if (result.guards.status === 'fallback') taintTotals.guardFallbacks++;
+          taintTotals.guardVisits += result.guards.visits;
+        });
+        const t0 = PROF ? performance.now() : 0;
+        const rd = emitFileReachingDefs(
+          pdgTarget,
+          wellFormed,
+          input.pdgMaxReachingDefEdgesPerFunction ??
+            DEFAULT_PDG_MAX_REACHING_DEF_EDGES_PER_FUNCTION,
+          (message) => logger.warn(message), // unconditional — R7, both layers
+          rdSolve,
+        );
+        if (PROF) pdgMs += performance.now() - t0;
+        rdEdges += rd.edges;
+        rdDropped += rd.droppedEdges;
+        rdFacts += rd.facts;
+        rdTruncated += rd.truncatedFunctions;
+
+        // M5 (#2085 U5): control dependence over the SAME validated CFGs.
+        // Independent of taint — runs for every `--pdg` language (post-dom +
+        // Ferrante are language-agnostic, no source/sink model needed). Pure
+        // compute; the bounded (controller, dependent, label) projection is
+        // persisted and its time folds into the `pdg=` PROF segment next to RD.
+        const tCdg = PROF ? performance.now() : 0;
+        const cdg = emitFileCdg(
+          pdgTarget,
+          wellFormed,
+          input.pdgMaxCdgEdgesPerFunction ?? DEFAULT_PDG_MAX_CDG_EDGES_PER_FUNCTION,
+          (message) => logger.warn(message), // unconditional — R6, no silent truncation
+        );
+        if (PROF) pdgMs += performance.now() - tCdg;
+        cdgEdges += cdg.edges;
+        cdgDropped += cdg.droppedEdges;
+        cdgSkippedUnsound += cdg.skippedUnsoundFunctions;
+
+        // FU-C (U-C2): RETURN-VALUE ASCENT summaries over the SAME validated
+        // CFGs, inside the SAME per-file try. Independent of taint — runs for
+        // EVERY `--pdg` language (pure data-dependence, no source/sink model).
+        // Reuses the same RD fact cap the RD/taint solves use (coverage parity).
+        const callHarvest = harvestFileCallSummaries(
+          fnNodeIndex,
+          wellFormed,
+          taintLimits.maxFacts && taintLimits.maxFacts > 0
+            ? taintLimits.maxFacts
+            : DEFAULT_PDG_MAX_REACHING_DEF_FACTS_PER_FUNCTION,
+          rdSolve,
+        );
+        harvestedCallSummaries.push(...callHarvest.summaries);
+        callSummaryUnresolved += callHarvest.unresolved;
+
+        // M3 (#2083 U4): taint over the SAME validated CFGs, inside the SAME
+        // per-file try (a taint throw costs this file's taint layer only —
+        // its CFG/REACHING_DEF edges above are already in the graph). Skipped
+        // entirely when the language has no registered model.
+        if (taintSpec !== undefined) {
+          const t1 = PROF ? performance.now() : 0;
+          // The disk seal strips ParsedFile.scopes. Restore only this file's
+          // lexical context for both taint consumers, then release it with this
+          // iteration. Passing the stripped file silently blocks every sink;
+          // an imports-only fallback would instead lose local shadow barriers.
+          let taintParsed = pf;
+          if (pf.scopes.length === 0) {
+            const scopes: Scope[] = [];
+            const pending = [pf.moduleScope];
+            for (let i = 0; i < pending.length; i++) {
+              const scope = indexes.scopeTree.getScope(pending[i]);
+              if (scope === undefined) continue;
+              scopes.push(scope);
+              for (const child of indexes.scopeTree.getChildren(scope.id)) pending.push(child);
+            }
+            taintParsed = { ...pf, scopes };
+          }
+          const taint = emitFileTaint(
+            pdgTarget,
+            wellFormed,
+            pf.parsedImports,
+            taintSpec,
+            taintLimits,
+            (message) => logger.warn(message), // unconditional — R4/R6
+            rdSolve,
+            taintParsed,
+            refine,
+          );
+          if (PROF) taintMs += performance.now() - t1;
+          taintTotals.analyzed += taint.functionsAnalyzed;
+          taintTotals.noMatch += taint.functionsSkippedNoMatch;
+          taintTotals.unsafeSites += taint.functionsSkippedUnsafeSites;
+          taintTotals.gapTruncated += taint.functionsCoverageGap.truncated;
+          taintTotals.gapOverflow += taint.functionsCoverageGap.overflow;
+          taintTotals.gapNoFacts += taint.functionsCoverageGap['no-facts'];
+          taintTotals.findings += taint.findingsEmitted;
+          taintTotals.kills += taint.killsEmitted;
+          taintTotals.dropped += taint.findingsDropped;
+          taintTotals.hopsTruncated += taint.hopsTruncatedFindings;
+          for (const ex of taint.coverageGapExamples) {
+            if (taintTotals.gapExamples.length < 5) taintTotals.gapExamples.push(ex);
+          }
+          for (const ex of taint.droppedExamples) {
+            if (taintTotals.dropExamples.length < 5) taintTotals.dropExamples.push(ex);
+          }
+
+          // M4 (#2084 U1): harvest per-function summaries over the SAME
+          // emit-safe CFGs, inside the SAME per-file try. Pure aside from the
+          // read-only node-index lookup; the cross-function fixpoint phase
+          // consumes `harvestedSummaries` once the whole call graph is built.
+          if (fnNodeIndex !== undefined) {
+            const harvest = harvestFileSummaries(
+              fnNodeIndex,
+              wellFormed,
+              pf.parsedImports,
+              taintSpec,
+              // Same fact cap the taint-side RD solve uses (coverage parity).
+              taintLimits.maxFacts && taintLimits.maxFacts > 0
+                ? taintLimits.maxFacts
+                : DEFAULT_PDG_MAX_REACHING_DEF_FACTS_PER_FUNCTION,
+              rdSolve,
+              taintParsed,
+              refine,
+            );
+            harvestedSummaries.push(...harvest.summaries);
+            summaryUnresolved += harvest.unresolved;
+          }
+        }
+      } catch (err) {
+        if (err instanceof GraphReferenceIntegrityError) throw err;
+        // Last-resort isolation, mirroring the worker-side per-file try/catch:
+        // a shape the predicate misses must cost this one file's CFG, not
+        // abort the language's whole scope-resolution pass mid-graph-build.
+        // NOTE a mid-emit throw can leave this file's already-inserted
+        // BasicBlock nodes in the graph (addNode is not transactional) —
+        // orphaned but inert; the predicate keeps every JSON-representable
+        // bad shape from reaching this path at all.
+        logger.warn(
+          `[cfg] ${pf.filePath}: CFG emission failed (${err instanceof Error ? err.message : String(err)}) — ` +
+            `this file's CFG is partial or absent`,
+        );
+      }
+    }
+    if (cfgBlocks > 0) {
+      logger.debug(
+        `[scope-resolution] CFG emit (lang=${provider.language}): ` +
+          `${cfgBlocks} BasicBlock nodes, ${cfgEdges} CFG edges` +
+          (cfgDroppedEdges > 0 ? `, ${cfgDroppedEdges} edges dropped (per-function cap)` : '') +
+          `; ${rdEdges} REACHING_DEF edges (${rdFacts} facts)` +
+          (rdDropped > 0 ? `, ${rdDropped} REACHING_DEF edges dropped (per-function cap)` : '') +
+          (rdTruncated > 0 ? `, ${rdTruncated} function(s) hit the fact limit` : '') +
+          `; ${cdgEdges} CDG edges` +
+          (cdgDropped > 0 ? `, ${cdgDropped} CDG edges dropped (per-function cap)` : '') +
+          (cdgSkippedUnsound > 0
+            ? `, ${cdgSkippedUnsound} function(s) CDG-skipped (EXIT not reachable from all blocks)`
+            : '') +
+          // M3 volume telemetry — only for languages with a registered model.
+          (taintSpec !== undefined
+            ? `; taint: ${taintTotals.findings} TAINTED, ${taintTotals.kills} SANITIZES ` +
+              `(${taintTotals.analyzed} function(s) analyzed, ` +
+              `${taintTotals.noMatch} skipped: no source/sink match` +
+              `; guards: ${taintTotals.guardFunctions} analyzed, ${taintTotals.guardFallbacks} fallback, ${taintTotals.guardVisits} visits` +
+              (taintTotals.hopsTruncated > 0
+                ? `, ${taintTotals.hopsTruncated} finding(s) with truncated hop paths`
+                : '') +
+              `)`
+            : ''),
+      );
+    }
+    // R8 (#2195): CDG soundness skips surface UNCONDITIONALLY (parity with the
+    // taint/RD gap warns) — not buried in the logger.debug stats line above. A
+    // function whose EXIT is not reverse-reachable from every block gets NO
+    // control dependence (an unmodeled non-terminating / multi-terminal CFG
+    // shape the synthetic-escape pass could not bridge). Withholding CDG
+    // silently would let a language's control dependence erode unnoticed; CFG
+    // and REACHING_DEF do not depend on post-dominance and are unaffected.
+    if (cdgSkippedUnsound > 0) {
+      logger.warn(
+        `[cfg] lang=${provider.language}: ${cdgSkippedUnsound} function(s) had control ` +
+          `dependence skipped (EXIT not reverse-reachable from all blocks); ` +
+          `CFG and REACHING_DEF are unaffected`,
+      );
+    }
+    // R4: taint coverage gaps and cap drops surface UNCONDITIONALLY (never
+    // logger.debug, never input.onWarn) at the per-language aggregate, with
+    // counts and up to 5 example functions. Per-function warns above cover
+    // the rare/actionable cases (unsafe sites, cap drops); solver-status gaps
+    // were already per-function-warned by the RD layer (same solver, same
+    // fact cap), so this aggregate is their single taint-side surface.
+    if (taintSpec !== undefined) {
+      const gapCount =
+        taintTotals.unsafeSites +
+        taintTotals.gapTruncated +
+        taintTotals.gapOverflow +
+        taintTotals.gapNoFacts;
+      if (gapCount > 0 || taintTotals.dropped > 0) {
+        const parts: string[] = [];
+        if (gapCount > 0) {
+          parts.push(
+            `${gapCount} function(s) skipped for taint ` +
+              `(${taintTotals.gapTruncated} fact-limit, ${taintTotals.gapOverflow} overflow, ` +
+              `${taintTotals.gapNoFacts} no-facts, ${taintTotals.unsafeSites} malformed sites)` +
+              (taintTotals.gapExamples.length > 0
+                ? ` — e.g. ${taintTotals.gapExamples.join(', ')}`
+                : ''),
+          );
+        }
+        if (taintTotals.dropped > 0) {
+          parts.push(
+            `${taintTotals.dropped} finding(s) dropped by the per-function cap` +
+              (taintTotals.dropExamples.length > 0
+                ? ` — e.g. ${taintTotals.dropExamples.join(', ')}`
+                : ''),
+          );
+        }
+        logger.warn(`[taint] lang=${provider.language}: ${parts.join('; ')}`);
+      }
+    }
+    // M4 (#2084 U1): summary harvest volume + anchor-resolution diagnostics.
+    if (harvestedSummaries.length > 0 || summaryUnresolved > 0) {
+      logger.debug(
+        `[taint-summary] lang=${provider.language}: ${harvestedSummaries.length} function ` +
+          `summary/summaries harvested` +
+          (summaryUnresolved > 0
+            ? `, ${summaryUnresolved} CFG anchor(s) unresolved (same-line collision or missing node)`
+            : ''),
+      );
+    }
+    // FU-C (U-C2): call-summary harvest volume + anchor-resolution diagnostics.
+    if (harvestedCallSummaries.length > 0 || callSummaryUnresolved > 0) {
+      logger.debug(
+        `[call-summary] lang=${provider.language}: ${harvestedCallSummaries.length} function ` +
+          `return-ascent summary/summaries harvested` +
+          (callSummaryUnresolved > 0
+            ? `, ${callSummaryUnresolved} CFG anchor(s) unresolved (same-line collision or missing node)`
+            : ''),
+      );
+    }
+  }
 
   if (PROF) {
     const tEnd = process.hrtime.bigint();
@@ -284,19 +2352,52 @@ export function runScopeResolution(
       `[scope-resolution prof] extract=${ns(tStart, tExtract).toFixed(0)}ms` +
         ` finalize=${ns(tExtract, tFinalize).toFixed(0)}ms` +
         ` propagate=${ns(tFinalize, tPropagate).toFixed(0)}ms` +
+        ` rangeBind=${ns(tRangeBindStart, tPropagate).toFixed(1)}ms` +
         ` resolve=${ns(tPropagate, tResolve).toFixed(0)}ms` +
         ` emit=${ns(tResolve, tEnd).toFixed(0)}ms` +
+        // pdg ⊆ emit: the M2 reaching-defs share of the emit bucket (#2082 U4).
+        // taint ⊆ emit likewise: the M3 match+solve+propagate+emit share (#2083 U4).
+        (input.pdg === true ? ` pdg=${pdgMs.toFixed(0)}ms taint=${taintMs.toFixed(0)}ms` : '') +
         ` total=${ns(tStart, tEnd).toFixed(0)}ms` +
         ` (${parsedFiles.length} files)`,
     );
   }
 
+  logHeapProbe('sr-end', `lang=${provider.language} parsedFiles=${parsedFiles.length}`);
+
+  for (const outcome of resolutionOutcomes) input.recordResolutionOutcome?.(outcome);
+  input.onResolved?.({
+    parsedFiles,
+    indexes,
+    referenceBindings: referenceBindings!,
+  });
+
   return {
     filesProcessed: parsedFiles.length,
     filesSkipped,
+    scopeExtractionFailedPaths,
     importsEmitted,
     resolve: resolveStats,
-    referenceEdgesEmitted: emitted + receiverExtras + freeCallExtras,
+    referenceEdgesEmitted:
+      emitted +
+      receiverExtras +
+      unresolvedReceiverExtras +
+      freeCallExtras +
+      callableValueFlow.emitted +
+      propertyDispatch.usesEmitted +
+      propertyDispatch.callsEmitted,
     referenceSkipped: skipped,
+    propertyDispatchSkippedKeys: propertyDispatch.skippedKeys,
+    importedValueRefEdges: importedValueRefs.emitted,
+    uniqueNamePropertyEdges: uniqueNameProperties.emitted,
+    uniqueNamePropertyAmbiguous: uniqueNameProperties.ambiguous,
+    uniqueNamePropertyNarrowed: uniqueNameProperties.narrowed,
+    uniqueNamePropertyAmbiguousNames: uniqueNameProperties.ambiguousNames,
+    uniqueNamePropertyCrossLanguage: uniqueNameProperties.crossLanguageOnly,
+    uniqueNamePropertyCrossLanguageNames: uniqueNameProperties.crossLanguageOnlyNames,
+    resolutionOutcomes,
+    undecidedSatisfaction,
+    functionSummaries: harvestedSummaries,
+    callSummaries: harvestedCallSummaries,
   };
 }

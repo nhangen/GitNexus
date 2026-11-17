@@ -8,11 +8,12 @@
 import Parser from 'tree-sitter';
 import Python from 'tree-sitter-python';
 
-const PYTHON_SCOPE_QUERY = `
+export const PYTHON_SCOPE_QUERY = `
 ;; Scopes
 (module) @scope.module
 (class_definition) @scope.class
 (function_definition) @scope.function
+(lambda) @scope.function
 
 ;; Declarations
 (class_definition
@@ -20,6 +21,15 @@ const PYTHON_SCOPE_QUERY = `
 
 (function_definition
   name: (identifier) @declaration.name) @declaration.function
+
+;; Lambda bindings (\`f = lambda x: x\`). The \`@declaration.function\` anchor
+;; sits on the INNER lambda so its range aligns with \`(lambda) @scope.function\`
+;; above; otherwise the def is owned by the module scope and calls inside the
+;; lambda lose caller attribution. Mirrors the TypeScript arrow patterns (#2687).
+(expression_statement
+  (assignment
+    left: (identifier) @declaration.name
+    right: (lambda) @declaration.function))
 
 (assignment
   left: (identifier) @declaration.name) @declaration.variable
@@ -92,6 +102,38 @@ const PYTHON_SCOPE_QUERY = `
 (assignment
   left: (identifier) @type-binding.name
   right: (identifier) @type-binding.type) @type-binding.alias
+
+;; A nullable alternative preserves the non-None arm's inferred type. Keep
+;; these patterns limited to a literal None arm: two value-producing arms do
+;; not establish one receiver type.
+(assignment
+  left: (identifier) @type-binding.name @call-result-assignment.lhs
+  right: (conditional_expression
+    (call function: (identifier) @type-binding.type) @call-result-assignment.call
+    (_)
+    (none))) @type-binding.constructor
+
+(assignment
+  left: (identifier) @type-binding.name @call-result-assignment.lhs
+  right: (conditional_expression
+    (none)
+    (_)
+    (call function: (identifier) @type-binding.type) @call-result-assignment.call)) @type-binding.constructor
+
+(assignment
+  left: (identifier) @type-binding.name @call-result-assignment.lhs
+  right: (boolean_operator
+    left: (call function: (identifier) @type-binding.type) @call-result-assignment.call
+    operator: "or"
+    right: (none))) @type-binding.constructor
+
+;; \`None or call()\` always evaluates to the call.
+(assignment
+  left: (identifier) @type-binding.name @call-result-assignment.lhs
+  right: (boolean_operator
+    left: (none)
+    operator: "or"
+    right: (call function: (identifier) @type-binding.type) @call-result-assignment.call)) @type-binding.constructor
 
 ;; For-loop iterable of an already-typed variable:
 ;;   def f(users: list[User]):
@@ -234,6 +276,22 @@ const PYTHON_SCOPE_QUERY = `
   name: (identifier) @type-binding.name
   return_type: (type) @type-binding.type) @type-binding.return
 
+;; Decorators — simple @decorator
+(decorator
+  (identifier) @reference.name) @reference.call.free
+
+;; Decorators — @obj.decorator (single attribute, identifier receiver)
+(decorator
+  (attribute
+    object: (identifier) @reference.receiver
+    attribute: (identifier) @reference.name)) @reference.call.member
+
+;; Decorators — @a.b.decorator (nested attributes)
+(decorator
+  (attribute
+    object: (attribute) @reference.receiver
+    attribute: (identifier) @reference.name)) @reference.call.member
+
 ;; References — calls
 (call
   function: (identifier) @reference.name) @reference.call.free
@@ -243,14 +301,51 @@ const PYTHON_SCOPE_QUERY = `
     object: (_) @reference.receiver
     attribute: (identifier) @reference.name)) @reference.call.member
 
-;; References — attribute writes: \`obj.name = "x"\` emits a write
-;; ACCESSES edge from the enclosing function to the field on obj's
-;; class. The receiver-bound emit pass resolves obj → its class and
-;; \`name\` → the field def via the existing typeref-receiver path.
+;; Attribute reads and targets. The provider classifies the AST context,
+;; including annotation-only targets and augmented assignments.
+(attribute
+  object: (_) @reference.receiver
+  attribute: (identifier) @reference.name) @reference.read.member
+
+(binary_operator
+  (identifier) @reference.name @reference.read.identifier)
+
+(comparison_operator
+  (identifier) @reference.name @reference.read.identifier)
+
+(boolean_operator
+  (identifier) @reference.name @reference.read.identifier)
+
+(return_statement
+  (identifier) @reference.name @reference.read.identifier)
+
 (assignment
-  left: (attribute
-    object: (_) @reference.receiver
-    attribute: (identifier) @reference.name)) @reference.write.member
+  right: (identifier) @reference.name @reference.read.identifier)
+
+(default_parameter
+  value: (identifier) @reference.name @reference.read.identifier)
+
+(typed_default_parameter
+  value: (identifier) @reference.name @reference.read.identifier)
+
+;; Anchor arguments under a call: class base lists use argument_list too.
+(call
+  arguments: (argument_list
+    (identifier) @reference.name @reference.read.identifier))
+
+(call
+  arguments: (argument_list
+    (keyword_argument
+      value: (identifier) @reference.name @reference.read.identifier)))
+
+(call
+  arguments: (argument_list
+    (identifier) @reference.name @reference.value-ref))
+
+(call
+  arguments: (argument_list
+    (keyword_argument
+      value: (identifier) @reference.name @reference.value-ref)))
 `;
 
 let _parser: Parser | null = null;

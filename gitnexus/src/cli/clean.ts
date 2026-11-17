@@ -6,57 +6,402 @@
  */
 
 import fs from 'fs/promises';
+import path from 'path';
 import { logger } from '../core/logger.js';
 import {
+  findRegistryEntryByRepoPath,
   findRepo,
   unregisterRepo,
   listRegisteredRepos,
-  assertSafeStoragePath,
-  UnsafeStoragePathError,
+  getStoragePaths,
+  type RegistryEntry,
 } from '../storage/repo-manager.js';
+import { requireDeletableStoragePath, StorageDeletionError } from '../storage/storage-resolver.js';
+import { formatSlotSize, formatStaleSlotLine } from './stale-branch-format.js';
+import { listLocalHeads } from '../storage/git.js';
+import {
+  isContainedBranchDir,
+  isDeleteCandidate,
+  listStaleBranchSlots,
+  removeBranchSlot,
+  staleListingBlock,
+  type StaleBranchSlot,
+} from '../storage/stale-branch-slots.js';
+import {
+  cleanParkedLbugSidecars,
+  inspectLbugSidecars,
+  listParkedLbugSidecars,
+} from '../core/lbug/sidecar-recovery.js';
+import { t } from './i18n/index.js';
+import { getGlobalDir } from '../storage/global-dir.js';
+import { BRANCHES_DIR, branchSlug } from '../storage/branch-index.js';
+import { STORES_DIR } from '../storage/shared-store.js';
+import {
+  findLegacyLocalIndex,
+  reclaimAfterSlotRemoval,
+  reclaimSharedStore,
+  removeLegacyLocalIndex,
+  removeCheckoutStorage,
+  type ReclaimResult,
+} from '../storage/shared-store-lifecycle.js';
 
-export const cleanCommand = async (options?: { force?: boolean; all?: boolean }) => {
-  // --all flag: clean all indexed repos
-  if (options?.all) {
-    if (!options?.force) {
-      const entries = await listRegisteredRepos();
-      if (entries.length === 0) {
-        console.log('No indexed repositories found.');
-        return;
-      }
-      console.log(`This will delete GitNexus indexes for ${entries.length} repo(s):`);
-      for (const entry of entries) {
-        console.log(`  - ${entry.name} (${entry.path})`);
-      }
-      console.log('\nRun with --force to confirm deletion.');
+type OwnedCwdStorage = {
+  repo: NonNullable<Awaited<ReturnType<typeof findRepo>>>;
+  entry: RegistryEntry | undefined;
+  storagePath: string;
+};
+
+const resolveOwnedCwdStorage = async (refusePrefix: string): Promise<OwnedCwdStorage | null> => {
+  const repo = await findRepo(process.cwd());
+  if (!repo) {
+    console.log(t('clean.notFoundHere'));
+    return null;
+  }
+  try {
+    const [entries, storagePath] = await Promise.all([
+      listRegisteredRepos(),
+      requireDeletableStoragePath({
+        path: repo.repoPath,
+        storagePath: repo.storagePath,
+      }),
+    ]);
+    return {
+      repo,
+      entry: findRegistryEntryByRepoPath(entries, repo.repoPath),
+      storagePath,
+    };
+  } catch (err) {
+    if (err instanceof StorageDeletionError) {
+      logger.error(`${refusePrefix}${err.message}`);
+      return null;
+    }
+    throw err;
+  }
+};
+
+const printStaleSlotLines = (message: string, slots: readonly StaleBranchSlot[]): void => {
+  console.log(message);
+  for (const slot of slots) {
+    console.log(`  - ${formatStaleSlotLine(slot)}`);
+  }
+};
+
+const cleanStaleBranchSlots = async (force: boolean): Promise<void> => {
+  const owned = await resolveOwnedCwdStorage('Refusing to clean leftover branch indexes: ');
+  if (!owned) return;
+  const { repo, entry, storagePath } = owned;
+  const slots = await listStaleBranchSlots({
+    repoPath: repo.repoPath,
+    storagePath,
+    branches: entry?.branches,
+    includeSize: !force,
+  });
+  const listingBlock = staleListingBlock(slots);
+  if (listingBlock === 'heads-unavailable') {
+    printStaleSlotLines(
+      t('clean.stale.headsUnavailable'),
+      slots.filter((row) => row.reason === 'heads-unavailable'),
+    );
+    return;
+  }
+  if (listingBlock === 'listing-failed') {
+    console.log(t('clean.stale.listingFailed'));
+    return;
+  }
+  const candidates = slots.filter(isDeleteCandidate);
+  const probeFailed = slots.filter((slot) => slot.reason === 'probe-failed');
+  if (candidates.length === 0) {
+    if (probeFailed.length > 0) {
+      printStaleSlotLines(t('clean.stale.probeFailed'), probeFailed);
+      return;
+    }
+    console.log(t('clean.stale.none'));
+    return;
+  }
+  if (!force) {
+    printStaleSlotLines(t('clean.stale.preview', { count: candidates.length }), candidates);
+    if (probeFailed.length > 0) {
+      printStaleSlotLines(t('clean.stale.probeFailed'), probeFailed);
+    }
+    console.log(`\n${t('common.runForceConfirm')}`);
+    return;
+  }
+  let deletedAny = false;
+  for (const slot of candidates) {
+    const heads = listLocalHeads(repo.repoPath);
+    if (heads === null) {
+      console.log(
+        deletedAny ? t('clean.stale.remainingSkipped') : t('clean.stale.headsUnavailable'),
+      );
+      return;
+    }
+    if (heads.includes(slot.branch)) {
+      console.log(t('clean.stale.skippedLive', { branch: slot.branch }));
+      continue;
+    }
+    const result = await removeBranchSlot({
+      repoPath: repo.repoPath,
+      storagePath,
+      branch: slot.branch,
+      dir: slot.dir,
+    });
+    if (!result.ok) {
+      console.log(t('clean.stale.failed', { branch: slot.branch }));
+      logger.error({ err: result.error }, 'Failed to delete leftover branch index:');
+      continue;
+    }
+    deletedAny = true;
+    console.log(t('clean.stale.deleted', { branch: slot.branch }));
+  }
+  if (probeFailed.length > 0) {
+    printStaleSlotLines(t('clean.stale.probeFailed'), probeFailed);
+  }
+};
+
+const reportReclaim = (result: ReclaimResult | null): void => {
+  if (!result) return;
+  if (result.removed.length > 0) {
+    console.log(t('clean.shared.reclaimed', { count: result.removed.length }));
+  }
+  if (result.kept.length > 0) console.log(t('clean.shared.kept', { count: result.kept.length }));
+};
+
+/** `clean --gc`: collect every shared store under GITNEXUS_HOME (#3352). */
+const collectSharedStores = async (force: boolean): Promise<void> => {
+  const storesDir = path.join(getGlobalDir(), STORES_DIR);
+  // Only a missing stores root means "nothing to collect"; an unreadable one
+  // must fail loudly rather than report success.
+  const names = await fs.readdir(storesDir).catch((err: NodeJS.ErrnoException) => {
+    if (err.code === 'ENOENT') return [] as string[];
+    throw err;
+  });
+  // Stray files (`.DS_Store`) are not stores, and a symlink is not followed:
+  // reclaim deletes under the root it is given. A store another collector
+  // removed meanwhile is simply gone. The lstat skips a stray link; it is not
+  // a race guard, since stores/ belongs to the user running clean and anyone
+  // able to swap an entry there can already delete the store itself.
+  const roots: string[] = [];
+  for (const name of names) {
+    const root = path.join(storesDir, name);
+    const stat = await fs.lstat(root).catch((err: NodeJS.ErrnoException) => {
+      if (err.code === 'ENOENT') return null;
+      throw err;
+    });
+    if (stat?.isDirectory()) roots.push(root);
+  }
+  if (roots.length === 0) {
+    console.log(t('clean.gc.none'));
+    return;
+  }
+  for (const root of roots) {
+    // Without --force this is a preview: same selection, nothing deleted.
+    const result = await reclaimSharedStore(root, { gc: true, dryRun: !force });
+    console.log(
+      t(force ? 'clean.gc.store' : 'clean.gc.preview', {
+        path: root,
+        members: result.droppedMembers.length,
+        graphs: result.removed.length,
+      }),
+    );
+    if (result.keptMembers.length > 0) {
+      console.log(t('clean.gc.keptMembers', { count: result.keptMembers.length }));
+    }
+    if (result.kept.length > 0) console.log(t('clean.shared.kept', { count: result.kept.length }));
+    if (result.storeRemoved) console.log(t('clean.shared.storeRemoved', { path: root }));
+  }
+  if (!force) console.log(`\n${t('common.runForceConfirm')}`);
+};
+
+export const cleanCommand = async (options?: {
+  force?: boolean;
+  all?: boolean;
+  lbugSidecars?: boolean;
+  stale?: boolean;
+  branch?: string;
+  gc?: boolean;
+  localIndex?: boolean;
+}) => {
+  if (options?.gc) {
+    await collectSharedStores(options.force === true);
+    return;
+  }
+
+  // --local-index: delete a pre-adoption index left in <checkout>/.gitnexus
+  // after the checkout moved into a shared store (#3352). Keeps the pointer.
+  if (options?.localIndex) {
+    const repo = await findRepo(process.cwd());
+    if (!repo) {
+      console.log(t('clean.notFoundHere'));
+      return;
+    }
+    const legacy = await findLegacyLocalIndex(repo.repoPath, repo.storagePath);
+    if (!legacy) {
+      console.log(t('clean.localIndex.none'));
+      return;
+    }
+    if (!options.force) {
+      console.log(
+        t('clean.localIndex.preview', { path: legacy.dir, size: formatSlotSize(legacy.bytes) }),
+      );
+      console.log(`\n${t('common.runForceConfirm')}`);
+      return;
+    }
+    await removeLegacyLocalIndex(repo.repoPath, repo.storagePath);
+    console.log(
+      t('clean.localIndex.deleted', { path: legacy.dir, size: formatSlotSize(legacy.bytes) }),
+    );
+    return;
+  }
+
+  // --stale: reclaim leftover per-branch slots whose recorded branch is not
+  // a live local head (#3331). Exclusive arm before --branch.
+  if (options?.stale) {
+    await cleanStaleBranchSlots(options.force === true);
+    return;
+  }
+
+  // --branch <name>: remove a single non-primary branch's index (#2106 R7).
+  // Resolve against the RECORDED branches[] summary (never by slugging the
+  // user's raw input, which can disagree with the index-time-sanitized label).
+  if (options?.branch) {
+    const owned = await resolveOwnedCwdStorage('Refusing to clean branch index: ');
+    if (!owned) return;
+    const { repo, entry, storagePath } = owned;
+    const summary = entry?.branches?.find((b) => b.branch === options.branch);
+    if (!summary) {
+      console.log(t('clean.branchNotIndexed', { branch: options.branch }));
+      return;
+    }
+    // Cleanup targets the owned slot, even when its graph pointer is damaged.
+    const branchDir = path.join(storagePath, BRANCHES_DIR, branchSlug(summary.branch));
+    if (!isContainedBranchDir(storagePath, branchDir)) {
+      logger.error(
+        `Refusing to clean branch index outside the validated storage slot: ${branchDir}`,
+      );
+      return;
+    }
+    if (!options.force) {
+      console.log(t('clean.deleteBranch', { branch: summary.branch, path: branchDir }));
+      console.log(`\n${t('common.runForceConfirm')}`);
+      return;
+    }
+    const result = await removeBranchSlot({
+      repoPath: repo.repoPath,
+      storagePath,
+      branch: summary.branch,
+      dir: branchDir,
+    });
+    if (!result.ok) {
+      logger.error({ err: result.error }, 'Failed to delete branch index:');
+      return;
+    }
+    console.log(t('clean.deletedBranch', { branch: summary.branch }));
+    return;
+  }
+
+  if (options?.lbugSidecars) {
+    const cwd = process.cwd();
+    const repo = await findRepo(cwd);
+
+    if (!repo) {
+      console.log(t('clean.notFoundHere'));
       return;
     }
 
+    let storagePath: string;
+    try {
+      storagePath = await requireDeletableStoragePath({
+        path: repo.repoPath,
+        storagePath: repo.storagePath,
+      });
+    } catch (err) {
+      if (err instanceof StorageDeletionError) {
+        logger.error(`Refusing to clean sidecars: ${err.message}`);
+        return;
+      }
+      throw err;
+    }
+    const { lbugPath } = getStoragePaths(repo.repoPath, undefined, storagePath);
+    const state = await inspectLbugSidecars(lbugPath);
+    // Single roster authority (this shipping review, FIX 5): the aggregate
+    // covers both parked-sidecar families — the timestamped missing-shadow
+    // WAL quarantines AND the fixed-name `.dirty-recovery` parks (`.next`
+    // residues included) left by a dirty-flag recovery rebuild (#2409). The
+    // previous inline concatenations here were how the `.next` residue
+    // stayed invisible to this surface.
+    const quarantined = await listParkedLbugSidecars(lbugPath);
+
+    console.log(t('clean.lbugSidecars.state', { state: state.kind }));
+    if (quarantined.length === 0) {
+      console.log(t('clean.lbugSidecars.none'));
+      return;
+    }
+
+    if (!options.force) {
+      console.log(t('clean.lbugSidecars.preview', { count: quarantined.length }));
+      for (const file of quarantined) {
+        console.log(`  - ${file}`);
+      }
+      console.log(`\n${t('common.runForceConfirm')}`);
+      return;
+    }
+
+    const { deleted, failed } = await cleanParkedLbugSidecars(lbugPath);
+    console.log(t('clean.lbugSidecars.deleted', { count: deleted.length }));
+    // A locked parked file no longer crashes the clean mid-command (FIX 5)
+    // — the rest were deleted above; report what remains and why.
+    if (failed.length > 0) {
+      console.log(t('clean.lbugSidecars.failed', { count: failed.length }));
+      for (const file of failed) {
+        console.log(`  - ${file}`);
+      }
+    }
+    return;
+  }
+
+  // --all flag: clean all indexed repos
+  if (options?.all) {
     const entries = await listRegisteredRepos();
+    if (!options?.force) {
+      const deletableEntries = [];
+      for (const entry of entries) {
+        try {
+          await requireDeletableStoragePath(entry);
+          deletableEntries.push(entry);
+        } catch (err) {
+          if (err instanceof StorageDeletionError) {
+            logger.error(`Refusing to preview ${entry.name}: ${err.message}`);
+            continue;
+          }
+          throw err;
+        }
+      }
+      if (deletableEntries.length === 0) {
+        console.log(t('common.notIndexed'));
+        return;
+      }
+      console.log(t('clean.deleteAll', { count: deletableEntries.length }));
+      for (const entry of deletableEntries) {
+        console.log(`  - ${entry.name} (${entry.path})`);
+      }
+      console.log(`\n${t('common.runForceConfirm')}`);
+      return;
+    }
+
     for (const entry of entries) {
-      // Safety guard (#1003 review — @magyargergo): same rationale as
-      // remove.ts. `~/.gitnexus/registry.json` is user-writable, so a
-      // corrupted or hand-edited entry could point storagePath at the
-      // repo root, an empty string, or anywhere else — and
-      // fs.rm(recursive: true) on any of those would be catastrophic.
-      // Skip poisoned entries without touching disk, but keep going
-      // through the rest of the registry (preserves the existing
-      // per-repo error-tolerance semantics of `clean --all`).
       try {
-        assertSafeStoragePath(entry);
+        const storagePath = await requireDeletableStoragePath(entry);
+        // A shared slot is unregistered before it is deleted: its lock file
+        // lives inside it, so it must go last. A failed delete throws with the
+        // `clean --gc --force` recovery (shared-store-clean.test.ts).
+        await removeCheckoutStorage(storagePath, () => unregisterRepo(entry.path), entry.path);
+        console.log(t('clean.deletedRepo', { name: entry.name, storagePath }));
+        reportReclaim(await reclaimAfterSlotRemoval(storagePath));
       } catch (err) {
-        if (err instanceof UnsafeStoragePathError) {
+        if (err instanceof StorageDeletionError) {
           logger.error(`Refusing to clean ${entry.name}: ${err.message}`);
           continue;
         }
-        throw err;
-      }
-
-      try {
-        await fs.rm(entry.storagePath, { recursive: true, force: true });
-        await unregisterRepo(entry.path);
-        console.log(`Deleted: ${entry.name} (${entry.storagePath})`);
-      } catch (err) {
         logger.error({ err }, `Failed to delete ${entry.name}:`);
       }
     }
@@ -68,23 +413,36 @@ export const cleanCommand = async (options?: { force?: boolean; all?: boolean })
   const repo = await findRepo(cwd);
 
   if (!repo) {
-    console.log('No indexed repository found in this directory.');
+    console.log(t('clean.notFoundHere'));
     return;
   }
 
   const repoName = repo.repoPath.split(/[/\\]/).pop() || repo.repoPath;
+  let storagePath: string;
+  try {
+    storagePath = await requireDeletableStoragePath({
+      path: repo.repoPath,
+      storagePath: repo.storagePath,
+    });
+  } catch (err) {
+    if (err instanceof StorageDeletionError) {
+      logger.error(`Refusing to clean ${repoName}: ${err.message}`);
+      return;
+    }
+    throw err;
+  }
 
   if (!options?.force) {
-    console.log(`This will delete the GitNexus index for: ${repoName}`);
-    console.log(`   Path: ${repo.storagePath}`);
-    console.log('\nRun with --force to confirm deletion.');
+    console.log(t('clean.deleteCurrent', { repoName }));
+    console.log(`   ${t('common.path')}: ${storagePath}`);
+    console.log(`\n${t('common.runForceConfirm')}`);
     return;
   }
 
   try {
-    await fs.rm(repo.storagePath, { recursive: true, force: true });
-    await unregisterRepo(repo.repoPath);
-    console.log(`Deleted: ${repo.storagePath}`);
+    await removeCheckoutStorage(storagePath, () => unregisterRepo(repo.repoPath), repo.repoPath);
+    console.log(t('common.deleted', { target: storagePath }));
+    reportReclaim(await reclaimAfterSlotRemoval(storagePath));
   } catch (err) {
     logger.error({ err }, 'Failed to delete:');
   }

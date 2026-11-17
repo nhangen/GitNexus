@@ -1,0 +1,157 @@
+// Devcontainer for GitNexus. It pre-installs Claude Code, the OpenAI Codex
+// CLI, and the Cursor CLI, plus the Node.js native build chain. It works on
+// macOS, Linux, Windows via WSL2, and Windows native. Host prerequisites:
+// Docker and Node.js on PATH. All workspace and configuration mounts use
+// Linux-native Docker volumes. See .devcontainer/README.md.
+//
+// For first-time setup, auth flows, and troubleshooting, see
+// .devcontainer/README.md.
+{
+  "name": "GitNexus AI CLI Devcontainer",
+
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".",
+    "args": {
+      // Bun: pinned by version. Installed by the official bun.sh/install
+      // script, which accepts the release tag as its first positional arg
+      // (`bash -s bun-vX.Y.Z`). UNLIKE Cursor, the install path runs an
+      // unverified remote script — chosen at request time for simplicity.
+      // To bump: pick a tag from github.com/oven-sh/bun/releases and update
+      // this value.
+      "BUN_VERSION": "1.3.14",
+      "TZ": "${localEnv:TZ:UTC}"
+    }
+  },
+
+  // Runs on the HOST before every start. Stages the checkout and snapshots
+  // through the Docker copy API; no host directory is mounted in any container.
+  "initializeCommand": [
+    "node",
+    ".devcontainer/initialize-volumes.cjs",
+    "${devcontainerId}",
+    "source"
+  ],
+
+  "features": {
+    "ghcr.io/devcontainers/features/github-cli:1": {}
+  },
+
+  "remoteUser": "node",
+  "updateRemoteUserUID": true,
+  // Reap orphaned subprocesses from CLI workers and test runs.
+  "init": true,
+  // Disable the automatic workspace mount. Declare it in mounts below so the
+  // Dev Containers CLI substitutes devcontainerId before passing it to Docker.
+  "workspaceMount": "",
+  "workspaceFolder": "/workspace",
+
+  // Existing writable config, session, dependency and cache volumes retain
+  // their names. /host and identity directories are read-only Linux snapshots.
+  // Snapshot credentials seed missing files only; container logins persist.
+  // Session volumes overlay config volumes so resetting config preserves history.
+  "mounts": [
+    "source=gitnexus-source-${devcontainerId},target=/workspace,type=volume,volume-nocopy",
+    "source=gitnexus-seed-${devcontainerId},target=/seed,type=volume",
+    "source=claude-config-${devcontainerId},target=/home/node/.claude,type=volume",
+    "source=codex-config-${devcontainerId},target=/home/node/.codex,type=volume",
+    "source=cursor-config-${devcontainerId},target=/home/node/.cursor,type=volume",
+    "source=gh-config-${devcontainerId},target=/home/node/.config/gh,type=volume",
+    "source=claude-mem-${devcontainerId},target=/home/node/.claude-mem,type=volume",
+    "source=${localWorkspaceFolderBasename}-claude-sessions-${devcontainerId},target=/home/node/.claude/projects,type=volume",
+    "source=${localWorkspaceFolderBasename}-codex-sessions-${devcontainerId},target=/home/node/.codex/sessions,type=volume",
+    "source=${localWorkspaceFolderBasename}-cursor-sessions-${devcontainerId},target=/home/node/.cursor/chats,type=volume",
+    "source=${localWorkspaceFolderBasename}-cursor-projects-${devcontainerId},target=/home/node/.cursor/projects,type=volume",
+    "source=commandhistory-${devcontainerId},target=/commandhistory,type=volume",
+    "source=npm-cache-${devcontainerId},target=/home/node/.npm,type=volume",
+    "source=gitnexus-store-${devcontainerId},target=/home/node/.gitnexus,type=volume",
+    "source=${localWorkspaceFolderBasename}-root-node-modules-${devcontainerId},target=/workspace/node_modules,type=volume",
+    "source=${localWorkspaceFolderBasename}-gitnexus-node-modules-${devcontainerId},target=/workspace/gitnexus/node_modules,type=volume",
+    "source=${localWorkspaceFolderBasename}-gitnexus-web-node-modules-${devcontainerId},target=/workspace/gitnexus-web/node_modules,type=volume",
+    "source=${localWorkspaceFolderBasename}-gitnexus-shared-node-modules-${devcontainerId},target=/workspace/gitnexus-shared/node_modules,type=volume",
+    "source=gitnexus-host-snapshot-${devcontainerId},target=/host,type=volume,readonly,volume-nocopy",
+    "source=gitnexus-ssh-snapshot-${devcontainerId},target=/home/node/.ssh,type=volume,readonly,volume-nocopy",
+    "source=gitnexus-docker-snapshot-${devcontainerId},target=/home/node/.docker,type=volume,readonly,volume-nocopy",
+    "source=gitnexus-aws-snapshot-${devcontainerId},target=/home/node/.aws,type=volume,readonly,volume-nocopy",
+    "source=gitnexus-azure-snapshot-${devcontainerId},target=/home/node/.azure,type=volume,readonly,volume-nocopy",
+    "source=gitnexus-git-snapshot-${devcontainerId},target=/home/node/.config/git,type=volume,readonly,volume-nocopy"
+  ],
+
+  // API keys are not injected as empty environment variables. Log in inside
+  // the container or export a key in its shell. Claude uses its default home.
+  "containerEnv": {
+    "CODEX_HOME": "/home/node/.codex",
+    "HISTFILE": "/commandhistory/.zsh_history",
+    "GITNEXUS_HOME": "/home/node/.gitnexus"
+  },
+
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "anthropic.claude-code",
+        "dbaeumer.vscode-eslint",
+        "esbenp.prettier-vscode",
+        "eamodio.gitlens"
+      ],
+      "settings": {
+        "editor.formatOnSave": true,
+        "editor.defaultFormatter": "esbenp.prettier-vscode",
+        "editor.codeActionsOnSave": {
+          "source.fixAll.eslint": "explicit"
+        },
+        "files.eol": "\n",
+        // Generated indexes and sibling worktrees can dwarf the source tree.
+        // These exclusions affect VS Code only; Vite and test watchers keep
+        // their own configuration.
+        "files.watcherExclude": {
+          "**/node_modules/**": true,
+          "**/.gitnexus/**": true,
+          "**/.worktrees/**": true,
+          "**/.claude/worktrees/**": true,
+          "**/dist/**": true,
+          "**/coverage/**": true
+        },
+        "search.exclude": {
+          "**/node_modules": true,
+          "**/.gitnexus": true,
+          "**/.worktrees": true,
+          "**/.claude/worktrees": true,
+          "**/dist": true,
+          "**/coverage": true
+        },
+        "git.autoRepositoryDetection": "openEditors",
+        "terminal.integrated.defaultProfile.linux": "zsh",
+        "terminal.integrated.profiles.linux": {
+          "bash": { "path": "bash", "icon": "terminal-bash" },
+          "zsh": { "path": "zsh" }
+        }
+      }
+    }
+  },
+
+  // Do not remap port 4747 (gitnexus serve). gitnexus-web hardcodes
+  // http://localhost:4747 as its default backend URL.
+  "forwardPorts": [5173, 4747, 4173],
+  "portsAttributes": {
+    "5173": {
+      "label": "Vite dev (gitnexus-web)",
+      "onAutoForward": "notify"
+    },
+    "4747": {
+      "label": "gitnexus serve HTTP API",
+      "onAutoForward": "notify",
+      "requireLocalPort": true
+    },
+    "4173": {
+      "label": "Static web (Vite preview)",
+      "onAutoForward": "silent"
+    }
+  },
+
+  // Runs once per container creation: commits the complete staged checkout into
+  // the empty source volume, then repairs ownership before dependency
+  // installation. initializeCommand copies this script into /seed each start.
+  "onCreateCommand": "sudo -n node /seed/seed-workspace.cjs --prepare /workspace /seed",
+  "updateContentCommand": "bash .devcontainer/install-deps.sh",
+  "postCreateCommand": "bash .devcontainer/post-create.sh"
+}

@@ -18,6 +18,31 @@ function makeCtx(): PipelineContext {
 }
 
 describe('runPipeline', () => {
+  it('honors cancellation between native phases without entering the next phase', async () => {
+    const controller = new AbortController();
+    const ctx: PipelineContext = { ...makeCtx(), options: { signal: controller.signal } };
+    const entered: string[] = [];
+    const phases: PipelinePhase[] = [
+      {
+        name: 'parse',
+        deps: [],
+        async execute() {
+          entered.push('parse');
+          controller.abort(new Error('cancelled after parse'));
+        },
+      },
+      {
+        name: 'emit',
+        deps: ['parse'],
+        async execute() {
+          entered.push('emit');
+        },
+      },
+    ];
+    await expect(runPipeline(phases, ctx)).rejects.toThrow('cancelled after parse');
+    expect(entered).toEqual(['parse']);
+  });
+
   it('executes phases in dependency order', async () => {
     const order: string[] = [];
 
@@ -397,6 +422,78 @@ describe('runPipeline', () => {
     };
 
     await runPipeline([phaseA, phaseB, phaseC], makeCtx());
+  });
+});
+
+describe('runPipeline with seeded results (#3016 deferred derived phases)', () => {
+  const seeded = (name: string, output: unknown): ReadonlyMap<string, PhaseResult<unknown>> =>
+    new Map([[name, { phaseName: name, output, durationMs: 0 }]]);
+
+  it('satisfies a dependency from the seed instead of demanding the phase', async () => {
+    const later: PipelinePhase<string> = {
+      name: 'later',
+      deps: ['earlier'],
+      async execute(_ctx, deps) {
+        return `${getPhaseOutput<string>(deps, 'earlier')}+later`;
+      },
+    };
+
+    const results = await runPipeline([later], makeCtx(), seeded('earlier', 'earlierOutput'));
+
+    expect(getPhaseOutput<string>(results, 'later')).toBe('earlierOutput+later');
+  });
+
+  it('returns the seeded results alongside the newly run ones', async () => {
+    const later: PipelinePhase<string> = {
+      name: 'later',
+      deps: ['earlier'],
+      execute: async () => 'x',
+    };
+
+    const results = await runPipeline([later], makeCtx(), seeded('earlier', 'earlierOutput'));
+
+    expect([...results.keys()].sort()).toEqual(['earlier', 'later']);
+  });
+
+  it('does not re-run a seeded phase', async () => {
+    let ran = 0;
+    const earlier: PipelinePhase<string> = {
+      name: 'earlier',
+      deps: [],
+      async execute() {
+        ran++;
+        return 'fresh';
+      },
+    };
+
+    await runPipeline([earlier], makeCtx(), seeded('earlier', 'seeded'));
+
+    // The seed already carries this phase's output, so the runner must treat it
+    // as a duplicate registration rather than silently executing it twice.
+    expect(ran).toBe(0);
+  });
+
+  it('still rejects a dependency that is neither registered nor seeded', async () => {
+    const later: PipelinePhase<string> = {
+      name: 'later',
+      deps: ['missing'],
+      execute: async () => 'x',
+    };
+
+    await expect(runPipeline([later], makeCtx(), seeded('earlier', 'e'))).rejects.toThrow(
+      /depends on 'missing', which is not registered/,
+    );
+  });
+
+  it('rejects duplicate phase names even when one copy is also seeded', async () => {
+    const dup: PipelinePhase = {
+      name: 'earlier',
+      deps: [],
+      async execute() {},
+    };
+    await expect(runPipeline([dup, dup], makeCtx(), seeded('earlier', 'seed'))).rejects.toThrow(
+      /Duplicate phase name/,
+    );
   });
 });
 

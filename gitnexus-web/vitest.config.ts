@@ -7,7 +7,7 @@ const _require = createRequire(import.meta.url);
 const gitnexusPkg = _require('../gitnexus/package.json');
 
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react({ jsxRuntime: 'automatic' })],
   define: {
     __REQUIRED_NODE_VERSION__: JSON.stringify(gitnexusPkg.engines.node.replace(/[>=^~\s]/g, '')),
   },
@@ -18,14 +18,13 @@ export default defineConfig({
         __dirname,
         'node_modules/@anthropic-ai/sdk/lib/transform-json-schema.mjs',
       ),
-      mermaid: path.resolve(__dirname, 'node_modules/mermaid/dist/mermaid.esm.min.mjs'),
     },
   },
   test: {
     globals: true,
     environment: 'jsdom',
     setupFiles: ['./test/setup.ts'],
-    include: ['test/**/*.test.{ts,tsx}'],
+    include: ['test/**/*.test.{ts,tsx}', 'src/**/*.test.{ts,tsx}'],
     testTimeout: 15000,
     coverage: {
       provider: 'v8',

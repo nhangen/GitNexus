@@ -23,14 +23,14 @@ describe('syncGroup', () => {
     packages: {},
     detect: {
       http: true,
+      graphql: false,
       grpc: false,
       thrift: false,
       topics: false,
-      shared_libs: false,
-      embedding_fallback: false,
+      includes: false,
       workspace_deps: false,
     },
-    matching: { bm25_threshold: 0.7, embedding_threshold: 0.65, max_candidates_per_step: 3 },
+    matching: {},
   });
 
   it('returns SyncResult with contracts and cross-links', async () => {
@@ -71,6 +71,108 @@ describe('syncGroup', () => {
     expect(result.crossLinks[0].matchType).toBe('exact');
     expect(result.crossLinks[0].confidence).toBe(1.0);
     expect(result.unmatched).toHaveLength(0);
+  });
+
+  it('exact-matches GraphQL root fields across repositories', async () => {
+    const config = makeConfig({ api: 'api-repo', web: 'web-repo' });
+    const contracts: StoredContract[] = [
+      {
+        ...makeContract('graphql::query::widget', 'provider', 'api'),
+        type: 'graphql',
+      },
+      {
+        ...makeContract('graphql::query::widget', 'consumer', 'web'),
+        type: 'graphql',
+      },
+    ];
+
+    const result = await syncGroup(config, {
+      extractorOverride: async () => contracts,
+      skipWrite: true,
+    });
+
+    expect(result.crossLinks).toEqual([
+      expect.objectContaining({
+        type: 'graphql',
+        contractId: 'graphql::query::widget',
+        matchType: 'exact',
+      }),
+    ]);
+  });
+  it('marks a cross-link degraded when the PROVIDER endpoint carries no resolved symbolUid', async () => {
+    // A provider whose symbol never resolved (empty symbolUid — e.g. a
+    // source-scan provider in a repo without graph symbols) still proves the
+    // service boundary, but cross-impact fan-out cannot anchor the link.
+    // isUnresolvedEndpoint is evaluated at the persistence boundary so exact,
+    // wildcard and manifest origins are covered by one truth point.
+    const config = makeConfig({ 'app/backend': 'backend-repo', 'app/frontend': 'frontend-repo' });
+    const mk = (role: 'provider' | 'consumer', uid: string): StoredContract => ({
+      contractId: 'http::GET::/api/users',
+      type: 'http',
+      role,
+      symbolUid: uid,
+      symbolRef: { filePath: `src/${role}.ts`, name: `fn-${role}` },
+      symbolName: `fn-${role}`,
+      confidence: 0.8,
+      meta: {},
+      repo: role === 'provider' ? 'app/backend' : 'app/frontend',
+    });
+
+    const degraded = await syncGroup(config, {
+      extractorOverride: async () => [mk('provider', ''), mk('consumer', 'uid-2')],
+      skipWrite: true,
+    });
+    expect(degraded.crossLinks).toHaveLength(1);
+    expect(degraded.crossLinks[0].degraded).toBe(true);
+    expect(degraded.degradedLinks).toBe(1);
+
+    // Control: a resolved provider keeps the flag absent (not false) so the
+    // field stays "carried only when meaningful" in contracts.json.
+    const resolved = await syncGroup(config, {
+      extractorOverride: async () => [mk('provider', 'uid-1'), mk('consumer', 'uid-2')],
+      skipWrite: true,
+    });
+    expect(resolved.crossLinks).toHaveLength(1);
+    expect('degraded' in resolved.crossLinks[0]).toBe(false);
+    expect(resolved.degradedLinks).toBe(0);
+  });
+
+  it('does NOT mark a manifest synthetic-UID link degraded — the manifest:: uid anchors fan-out', async () => {
+    // Manifest endpoints fall back to a deterministic
+    // `manifest::<repo>::<contractId>` uid exactly when the graph holds no
+    // symbol for them (dangling repo, or a string-dispatch provider with no
+    // symbol at all). Their `symbolRef.filePath` is empty by construction —
+    // which trips isUnresolvedEndpoint's field checks — but cross-impact
+    // anchors the crossing anyway (#2722: preserved with `fanout_status:
+    // 'not_attempted'` instead of cross=0). So the degraded flag ("cannot
+    // anchor a fan-out") must stay off: types.ts pins it as "distinct from
+    // manifest::… synthetic UIDs", which have their own downstream channel.
+    const links: GroupManifestLink[] = [
+      {
+        from: 'app/consumer',
+        to: 'app/dangling', // not in config.repos → unresolved → synthetic uid
+        type: 'http',
+        contract: 'GET::/api/orders',
+        role: 'consumer',
+      },
+    ];
+    const config: GroupConfig = { ...makeConfig({ 'app/consumer': 'consumer-repo' }), links };
+
+    const result = await syncGroup(config, {
+      extractorOverride: async () => [],
+      skipWrite: true,
+    });
+
+    expect(result.crossLinks).toHaveLength(1);
+    expect(result.crossLinks[0].matchType).toBe('manifest');
+    expect(result.crossLinks[0].to.symbolUid).toBe(
+      'manifest::app/dangling::http::GET::/api/orders',
+    );
+    // The empty filePath is what makes this a regression guard: without the
+    // manifest:: exemption in isUnresolvedEndpoint the flag fires on it.
+    expect(result.crossLinks[0].to.symbolRef.filePath).toBe('');
+    expect('degraded' in result.crossLinks[0]).toBe(false);
+    expect(result.degradedLinks).toBe(0);
   });
 
   it('reports missing repos', async () => {
@@ -166,20 +268,19 @@ describe('syncGroup', () => {
     expect(result).toBeDefined();
   });
 
-  it('test_syncGroup_closes_only_opened_pools', async () => {
+  it('test_syncGroup_does_not_force_close_pools (release-not-close, #2191 review)', async () => {
+    // Post windowed-resolution refactor, syncGroup releases its eviction leases
+    // and lets the pool's LRU reclaim repos — it does NOT call closeLbug. This
+    // avoids tearing down a pool entry a concurrent MCP reader may share.
     const config = makeConfig({
       'app/backend': 'backend-repo',
       'app/frontend': 'frontend-repo',
     });
 
-    const closedIds: string[] = [];
-
     const { vi } = await import('vitest');
     const poolAdapter = await import('../../../src/core/lbug/pool-adapter.js');
     const initSpy = vi.spyOn(poolAdapter, 'initLbug').mockResolvedValue(undefined);
-    const closeSpy = vi.spyOn(poolAdapter, 'closeLbug').mockImplementation(async (id?: string) => {
-      if (id) closedIds.push(id);
-    });
+    const closeSpy = vi.spyOn(poolAdapter, 'closeLbug').mockResolvedValue(undefined);
 
     try {
       await syncGroup(config, {
@@ -192,19 +293,8 @@ describe('syncGroup', () => {
         skipWrite: true,
       }).catch(() => {});
 
-      // closeLbug must have been called at least once with specific pool ids
-      expect(closeSpy.mock.calls.length).toBeGreaterThan(0);
-      expect(closedIds).toContain('app-backend');
-      expect(closedIds).toContain('app-frontend');
-
-      // Every call must have a truthy string id
-      for (const id of closedIds) {
-        expect(id).toBeTruthy();
-        expect(typeof id).toBe('string');
-      }
-      // No blanket close (no-arg or empty-string or undefined)
-      const blanketCalls = closeSpy.mock.calls.filter((args) => args.length === 0 || !args[0]);
-      expect(blanketCalls).toHaveLength(0);
+      // No closeLbug — repos are left evictable for the LRU to reclaim.
+      expect(closeSpy.mock.calls.length).toBe(0);
     } finally {
       initSpy.mockRestore();
       closeSpy.mockRestore();
@@ -234,11 +324,10 @@ describe('syncGroup', () => {
         grpc: false,
         thrift: false,
         topics: false,
-        shared_libs: false,
-        embedding_fallback: false,
+        includes: false,
         workspace_deps: false,
       },
-      matching: { bm25_threshold: 0.7, embedding_threshold: 0.65, max_candidates_per_step: 3 },
+      matching: {},
     };
 
     const result = await syncGroup(config, {
@@ -534,7 +623,9 @@ service OrderService {
         },
       });
       expect(initSpy).toHaveBeenCalledWith('billing-repo', path.join(storageDir, 'lbug'));
-      expect(closeSpy).toHaveBeenCalledWith('billing-repo');
+      // syncGroup no longer force-closes pools (release-not-close, #2191 review);
+      // repos are left evictable for the LRU. Assert no teardown call here.
+      expect(closeSpy).not.toHaveBeenCalled();
     } finally {
       initSpy.mockRestore();
       closeSpy.mockRestore();
@@ -686,11 +777,10 @@ service OrderService {
         grpc: false,
         thrift: false,
         topics: false,
-        shared_libs: false,
-        embedding_fallback: false,
+        includes: false,
         workspace_deps: false,
       },
-      matching: { bm25_threshold: 0.7, embedding_threshold: 0.65, max_candidates_per_step: 3 },
+      matching: {},
     };
 
     const cap = _captureLogger();
@@ -756,11 +846,10 @@ service OrderService {
           grpc: false,
           thrift: false,
           topics: false,
-          shared_libs: false,
-          embedding_fallback: false,
+          includes: false,
           workspace_deps: workspaceDeps,
         },
-        matching: { bm25_threshold: 0.7, embedding_threshold: 0.65, max_candidates_per_step: 3 },
+        matching: {},
       };
     }
 
@@ -822,6 +911,86 @@ service OrderService {
       expect(manifestLinks[0].contractId).toBe('custom::mathlex::Expression');
       expect(manifestLinks[0].from.repo).toBe('engine/thales');
       expect(manifestLinks[0].to.repo).toBe('parser/mathlex');
+    });
+
+    it('builds Maven manifest links when independent repositories share a parent POM', async () => {
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gitnexus-sync-ws-maven-parent-'));
+
+      const parentCoordinates = `<parent>
+        <groupId>com.example</groupId>
+        <artifactId>parent</artifactId>
+        <version>1</version>
+      </parent>`;
+      const childPom = (artifactId: string, dependency = '') => `<project>
+        ${parentCoordinates}
+        <artifactId>${artifactId}</artifactId>
+        <dependencies>${dependency}</dependencies>
+      </project>`;
+      const sharedDependency =
+        '<dependency><groupId>com.example</groupId><artifactId>shared-lib</artifactId></dependency>';
+
+      writeFileSync(
+        'parent/pom.xml',
+        '<project><groupId>com.example</groupId><artifactId>parent</artifactId><packaging>pom</packaging></project>',
+      );
+      writeFileSync('shared-lib/pom.xml', childPom('shared-lib'));
+      writeFileSync('service-a/pom.xml', childPom('service-a', sharedDependency));
+      writeFileSync(
+        'service-a/src/main/java/com/example/service/a/App.java',
+        'package com.example.service.a;\nimport com.example.shared.lib.SharedType;\npublic class App {}\n',
+      );
+      writeFileSync('service-b/pom.xml', childPom('service-b', sharedDependency));
+      writeFileSync(
+        'service-b/src/main/kotlin/com/example/service/b/App.kt',
+        'package com.example.service.b\nimport com.example.shared.lib.SharedType\nclass App\n',
+      );
+
+      const repoPaths = ['parent', 'shared-lib', 'service-a', 'service-b'];
+      const mockEntries: RegistryEntry[] = repoPaths.map((repoPath) => ({
+        name: repoPath,
+        path: path.join(tmpDir, repoPath),
+        storagePath: path.join(tmpDir, repoPath, '.gitnexus'),
+        indexedAt: '',
+        lastCommit: '',
+      }));
+
+      const repoManager = await import('../../../src/storage/repo-manager.js');
+      vi.spyOn(repoManager, 'readRegistry').mockResolvedValue(mockEntries);
+
+      const config = makeWsConfig(
+        {
+          parent: 'parent',
+          'libs/shared-lib': 'shared-lib',
+          'services/service-a': 'service-a',
+          'services/service-b': 'service-b',
+        },
+        true,
+      );
+
+      const result = await syncGroup(config, {
+        extractorOverride: async () => [],
+        skipWrite: true,
+      });
+
+      const manifestLinks = result.crossLinks.filter((link) => link.matchType === 'manifest');
+      expect(
+        manifestLinks.map((link) => ({
+          from: link.from.repo,
+          to: link.to.repo,
+          contractId: link.contractId,
+        })),
+      ).toEqual([
+        {
+          from: 'services/service-a',
+          to: 'libs/shared-lib',
+          contractId: 'custom::shared-lib::SharedType',
+        },
+        {
+          from: 'services/service-b',
+          to: 'libs/shared-lib',
+          contractId: 'custom::shared-lib::SharedType',
+        },
+      ]);
     });
 
     it('workspace_deps: false skips workspace extraction entirely', async () => {
@@ -913,11 +1082,10 @@ service OrderService {
           grpc: false,
           thrift: false,
           topics: false,
-          shared_libs: false,
-          embedding_fallback: false,
+          includes: false,
           workspace_deps: true,
         },
-        matching: { bm25_threshold: 0.7, embedding_threshold: 0.65, max_candidates_per_step: 3 },
+        matching: {},
       };
 
       const result = await syncGroup(config, {
@@ -979,6 +1147,430 @@ service OrderService {
       );
       expect(nodeLink).toBeDefined();
     });
+  });
+
+  it('manifest symbol resolution runs before closeLbug (issue #1802)', async () => {
+    const links: GroupManifestLink[] = [
+      {
+        from: 'svc/orders',
+        to: 'svc/payments',
+        type: 'http',
+        contract: 'GET::/api/checkout',
+        role: 'consumer',
+      },
+    ];
+
+    const config: GroupConfig = {
+      version: 1,
+      name: 'test',
+      description: '',
+      repos: { 'svc/orders': 'orders-repo', 'svc/payments': 'payments-repo' },
+      links,
+      packages: {},
+      detect: {
+        http: true,
+        grpc: false,
+        thrift: false,
+        topics: false,
+        includes: false,
+        workspace_deps: false,
+      },
+      matching: {},
+    };
+
+    const poolAdapter = await import('../../../src/core/lbug/pool-adapter.js');
+
+    let closeLbugCalled = false;
+    let manifestResolvedWhilePoolOpen = false;
+
+    const initSpy = vi.spyOn(poolAdapter, 'initLbug').mockResolvedValue(undefined);
+    const closeSpy = vi.spyOn(poolAdapter, 'closeLbug').mockImplementation(async () => {
+      closeLbugCalled = true;
+    });
+    const execSpy = vi
+      .spyOn(poolAdapter, 'executeParameterized')
+      .mockImplementation(
+        async (_poolId: string, query: string, _params: Record<string, unknown>) => {
+          if (query.includes('HANDLES_ROUTE')) {
+            manifestResolvedWhilePoolOpen = !closeLbugCalled;
+          }
+          return [
+            { uid: 'real-uid-checkout', name: 'CheckoutHandler', filePath: 'src/checkout.ts' },
+          ];
+        },
+      );
+
+    try {
+      const result = await syncGroup(config, {
+        resolveRepoHandle: async (_name, groupPath) => ({
+          id: groupPath.replace(/\//g, '-'),
+          path: groupPath,
+          repoPath: '/tmp/' + groupPath,
+          storagePath: '/tmp/' + groupPath + '/.gitnexus',
+        }),
+        skipWrite: true,
+      });
+
+      // Manifest symbol resolution runs against live (leased) pools.
+      expect(manifestResolvedWhilePoolOpen).toBe(true);
+
+      // The manifest cross-link must use the real UID from the DB, not synthetic
+      // — the #2189 fix, now via windowed resolution (the svc/orders↔svc/payments
+      // link forms one window whose repos are re-inited + leased for resolution).
+      const manifestLinks = result.crossLinks.filter((cl) => cl.matchType === 'manifest');
+      expect(manifestLinks).toHaveLength(1);
+      expect(manifestLinks[0].to.symbolUid).toBe('real-uid-checkout');
+      expect(manifestLinks[0].to.symbolUid).not.toContain('manifest::');
+
+      // syncGroup no longer force-closes pools (release-not-close, #2191 review).
+      expect(closeLbugCalled).toBe(false);
+      expect(closeSpy).not.toHaveBeenCalled();
+    } finally {
+      initSpy.mockRestore();
+      closeSpy.mockRestore();
+      execSpy.mockRestore();
+    }
+  });
+
+  it('a manifest link does not spread to another repo exposing the same route (#1188)', async () => {
+    const importRoute = (repo: string, name: string): StoredContract => ({
+      contractId: 'http::POST::/import',
+      type: 'http',
+      role: 'provider',
+      symbolUid: `uid-${name}`,
+      symbolRef: { filePath: `src/${name}.ts`, name },
+      symbolName: name,
+      confidence: 0.9,
+      meta: { method: 'POST', path: '/import' },
+      repo,
+    });
+    const config: GroupConfig = {
+      ...makeConfig({
+        'backend/gen-question': 'gen-question',
+        'backend/learning': 'learning',
+        'backend/user-service': 'user-service',
+      }),
+      links: [
+        {
+          from: 'backend/gen-question',
+          to: 'backend/learning',
+          type: 'http',
+          contract: 'POST::/import',
+          role: 'consumer',
+        },
+      ],
+    };
+
+    const result = await syncGroup(config, {
+      extractorOverride: async () => [
+        importRoute('backend/learning', 'importLessons'),
+        importRoute('backend/user-service', 'importUsers'),
+      ],
+      skipWrite: true,
+    });
+
+    expect(
+      result.crossLinks.map((l) => [l.matchType, l.from.repo, l.to.repo, l.to.symbolRef.name]),
+    ).toEqual([
+      ['manifest', 'backend/gen-question', 'backend/learning', 'POST::/import'],
+      ['exact', 'backend/gen-question', 'backend/learning', 'importLessons'],
+    ]);
+    // The declared provider only steers matching; the registry keeps its shape.
+    const consumer = result.contracts.find((c) => c.role === 'consumer');
+    expect(consumer?.meta).toEqual({ source: 'manifest' });
+  });
+
+  it('a service-wildcard manifest link matches only the repo it names (#1188)', async () => {
+    // The wildcard pass runs on what the exact pass left over, so the declared
+    // repo has to survive from one pass to the next.
+    const login = (repo: string): StoredContract => ({
+      contractId: 'grpc::auth.AuthService/Login',
+      type: 'grpc',
+      role: 'provider',
+      symbolUid: `uid-login-${repo}`,
+      symbolRef: { filePath: 'src/auth.ts', name: 'Login' },
+      symbolName: 'Login',
+      confidence: 0.9,
+      meta: {},
+      repo,
+    });
+    const config: GroupConfig = {
+      ...makeConfig({ orders: 'orders', auth: 'auth', 'legacy-auth': 'legacy-auth' }),
+      links: [
+        {
+          from: 'orders',
+          to: 'auth',
+          type: 'grpc',
+          contract: 'auth.AuthService/*',
+          role: 'consumer',
+        },
+      ],
+    };
+
+    const result = await syncGroup(config, {
+      extractorOverride: async () => [login('auth'), login('legacy-auth')],
+      skipWrite: true,
+    });
+
+    expect(
+      result.crossLinks.filter((l) => l.matchType === 'wildcard').map((l) => l.to.repo),
+    ).toEqual(['auth']);
+  });
+
+  it('an unmatched manifest consumer is reported without the declared provider repo (#1188)', async () => {
+    const config: GroupConfig = {
+      ...makeConfig({ orders: 'orders', auth: 'auth' }),
+      links: [
+        {
+          from: 'orders',
+          to: 'auth',
+          type: 'grpc',
+          contract: 'auth.AuthService/*',
+          role: 'consumer',
+        },
+      ],
+    };
+
+    const result = await syncGroup(config, {
+      extractorOverride: async () => [],
+      skipWrite: true,
+    });
+
+    expect(result.unmatched.filter((c) => c.role === 'consumer').map((c) => c.meta)).toEqual([
+      { source: 'manifest' },
+    ]);
+  });
+
+  it('extractorOverride no-DB path still produces synthetic manifest UIDs', async () => {
+    const links: GroupManifestLink[] = [
+      {
+        from: 'svc/orders',
+        to: 'svc/payments',
+        type: 'http',
+        contract: 'GET::/api/checkout',
+        role: 'consumer',
+      },
+    ];
+
+    const config: GroupConfig = {
+      version: 1,
+      name: 'test',
+      description: '',
+      repos: { 'svc/orders': 'orders-repo', 'svc/payments': 'payments-repo' },
+      links,
+      packages: {},
+      detect: {
+        http: true,
+        grpc: false,
+        thrift: false,
+        topics: false,
+        includes: false,
+        workspace_deps: false,
+      },
+      matching: {},
+    };
+
+    const result = await syncGroup(config, {
+      extractorOverride: async () => [],
+      skipWrite: true,
+    });
+
+    const manifestLinks = result.crossLinks.filter((cl) => cl.matchType === 'manifest');
+    expect(manifestLinks).toHaveLength(1);
+    expect(manifestLinks[0].from.symbolUid).toBe('manifest::svc/orders::http::GET::/api/checkout');
+    expect(manifestLinks[0].to.symbolUid).toBe('manifest::svc/payments::http::GET::/api/checkout');
+  });
+});
+
+// Lifecycle wiring for issue #2189: syncGroup must pin every repo it
+// initializes (so a group larger than MAX_POOL_SIZE survives deferred
+// manifest/workspace resolution) and release those pins on completion AND on
+// error. The eviction-survival MECHANISM itself is proven against real
+// evictLRU in test/unit/lbug-pool-pinning.test.ts; these tests prove the sync
+// loop drives that mechanism correctly. (A full end-to-end proof through the
+// real pool — real symbolUid instead of synthetic after >5 repos — would
+// require a real or fully-native-mocked LadybugDB stack; mechanism + wiring
+// coverage stands in for it here.)
+describe('syncGroup windowed manifest resolution (issue #2189 / PR #2191 review)', () => {
+  const groupConfig = (count: number, links: GroupManifestLink[] = []): GroupConfig => {
+    const repos: Record<string, string> = {};
+    for (let i = 1; i <= count; i++) repos[`app/repo-${i}`] = `repo-${i}`;
+    return {
+      version: 1,
+      name: 'test',
+      description: '',
+      repos,
+      links,
+      packages: {},
+      detect: {
+        http: true,
+        grpc: false,
+        thrift: false,
+        topics: false,
+        includes: false,
+        workspace_deps: false,
+      },
+      matching: {},
+    };
+  };
+
+  const okHandle = async (_name: string, groupPath: string): Promise<RepoHandle> => ({
+    id: groupPath.replace(/\//g, '-'),
+    path: groupPath,
+    repoPath: '/tmp/' + groupPath,
+    storagePath: '/tmp/' + groupPath + '/.gitnexus',
+  });
+
+  const httpLink = (from: string, to: string): GroupManifestLink => ({
+    from,
+    to,
+    type: 'http',
+    contract: 'GET::/api/x',
+    role: 'consumer',
+  });
+
+  // pinRepo now returns a release disposer; the spy returns a tracked spy fn so
+  // tests can assert every acquired lease was released.
+  const setupPoolSpies = async () => {
+    const poolAdapter = await import('../../../src/core/lbug/pool-adapter.js');
+    const releaseSpies: Array<ReturnType<typeof vi.fn>> = [];
+    const initSpy = vi.spyOn(poolAdapter, 'initLbug').mockResolvedValue(undefined);
+    const execSpy = vi.spyOn(poolAdapter, 'executeParameterized').mockResolvedValue([]);
+    const pinSpy = vi.spyOn(poolAdapter, 'pinRepo').mockImplementation(() => {
+      const release = vi.fn();
+      releaseSpies.push(release);
+      return release;
+    });
+    const restore = () => {
+      initSpy.mockRestore();
+      execSpy.mockRestore();
+      pinSpy.mockRestore();
+    };
+    return { releaseSpies, initSpy, execSpy, pinSpy, restore };
+  };
+
+  it('pins only the repos referenced by manifest links, not the whole group', async () => {
+    const { pinSpy, restore } = await setupPoolSpies();
+    try {
+      await syncGroup(groupConfig(8, [httpLink('app/repo-1', 'app/repo-2')]), {
+        resolveRepoHandle: okHandle,
+        skipWrite: true,
+      });
+      const pinnedIds = pinSpy.mock.calls.map((c) => c[0]).sort();
+      // Only the windowed (link-referenced) repos are leased — bounded residency,
+      // not the whole 8-repo group.
+      expect(pinnedIds).toEqual(['app-repo-1', 'app-repo-2']);
+      expect(pinnedIds).not.toContain('app-repo-3');
+    } finally {
+      restore();
+    }
+  });
+
+  it('does not pin during the init loop when there are no manifest links', async () => {
+    const { pinSpy, restore } = await setupPoolSpies();
+    try {
+      await syncGroup(groupConfig(8, []), { resolveRepoHandle: okHandle, skipWrite: true });
+      // The init loop extracts contracts without pinning; with no links there
+      // are no resolution windows, so nothing is ever pinned.
+      expect(pinSpy.mock.calls.length).toBe(0);
+    } finally {
+      restore();
+    }
+  });
+
+  it('releases every window lease on successful completion', async () => {
+    const { releaseSpies, restore } = await setupPoolSpies();
+    try {
+      await syncGroup(
+        groupConfig(8, [
+          httpLink('app/repo-1', 'app/repo-2'),
+          httpLink('app/repo-7', 'app/repo-8'),
+        ]),
+        { resolveRepoHandle: okHandle, skipWrite: true },
+      );
+      expect(releaseSpies.length).toBeGreaterThan(0);
+      for (const release of releaseSpies) expect(release).toHaveBeenCalled();
+    } finally {
+      restore();
+    }
+  });
+
+  it('releases the window leases even when resolution throws mid-window', async () => {
+    const { ManifestExtractor } =
+      await import('../../../src/core/group/extractors/manifest-extractor.js');
+    const { releaseSpies, restore } = await setupPoolSpies();
+    const manifestSpy = vi
+      .spyOn(ManifestExtractor.prototype, 'extractFromManifest')
+      .mockRejectedValue(new Error('resolution boom'));
+    try {
+      await expect(
+        syncGroup(groupConfig(8, [httpLink('app/repo-1', 'app/repo-2')]), {
+          resolveRepoHandle: okHandle,
+          skipWrite: true,
+        }),
+      ).rejects.toThrow('resolution boom');
+      // The window's finally released its acquired leases despite the throw.
+      expect(releaseSpies.length).toBeGreaterThan(0);
+      for (const release of releaseSpies) expect(release).toHaveBeenCalled();
+    } finally {
+      restore();
+      manifestSpy.mockRestore();
+    }
+  });
+
+  it('does not pin a repo that fails to resolve (no pool handle)', async () => {
+    const { pinSpy, restore } = await setupPoolSpies();
+    try {
+      await syncGroup(groupConfig(3, [httpLink('app/repo-1', 'app/repo-2')]), {
+        resolveRepoHandle: async (_name, groupPath) =>
+          groupPath === 'app/repo-2' ? null : okHandle(_name, groupPath),
+        skipWrite: true,
+      });
+      const pinnedIds = pinSpy.mock.calls.map((c) => c[0]);
+      // repo-2 has no handle (resolve returned null) → not in knownRepos →
+      // never windowed, never leased; repo-1 (resolved) is.
+      expect(pinnedIds).toContain('app-repo-1');
+      expect(pinnedIds).not.toContain('app-repo-2');
+    } finally {
+      restore();
+    }
+  });
+
+  it('releases an already-acquired lease when a later init in the same window throws', async () => {
+    const poolAdapter = await import('../../../src/core/lbug/pool-adapter.js');
+    const releaseSpies: Array<ReturnType<typeof vi.fn>> = [];
+    // Throw on the SECOND init of app-repo-2 — the first is the init-loop
+    // extraction; the second is the window re-init. This isolates the failure
+    // to window setup, after app-repo-1's lease was already acquired.
+    const initCounts = new Map<string, number>();
+    const initSpy = vi.spyOn(poolAdapter, 'initLbug').mockImplementation(async (id: string) => {
+      const n = (initCounts.get(id) ?? 0) + 1;
+      initCounts.set(id, n);
+      if (id === 'app-repo-2' && n === 2) throw new Error('window init boom');
+      return true;
+    });
+    const execSpy = vi.spyOn(poolAdapter, 'executeParameterized').mockResolvedValue([]);
+    const pinSpy = vi.spyOn(poolAdapter, 'pinRepo').mockImplementation(() => {
+      const release = vi.fn();
+      releaseSpies.push(release);
+      return release;
+    });
+    try {
+      await expect(
+        syncGroup(groupConfig(2, [httpLink('app/repo-1', 'app/repo-2')]), {
+          resolveRepoHandle: okHandle,
+          skipWrite: true,
+        }),
+      ).rejects.toThrow('window init boom');
+      // Exactly one lease was acquired (app-repo-1) before app-repo-2's init
+      // threw, and the window finally released it — no leaked lease.
+      expect(releaseSpies.length).toBe(1);
+      expect(releaseSpies[0]).toHaveBeenCalled();
+    } finally {
+      initSpy.mockRestore();
+      execSpy.mockRestore();
+      pinSpy.mockRestore();
+    }
   });
 });
 

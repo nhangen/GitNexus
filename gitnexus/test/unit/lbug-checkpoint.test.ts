@@ -23,10 +23,20 @@ import { flushWAL } from '../../src/core/lbug/lbug-adapter.js';
 describe('flushWAL / safeClose — consolidation guard (#1376)', () => {
   let adapterSource: string;
 
+  // Strip comments before the structural assertions so they reflect CODE only.
+  // Otherwise a `conn.close()` / `db.close()` / `.query('CHECKPOINT')` token
+  // mentioned in a doc comment would falsely trip (or vacuously satisfy) a guard,
+  // coupling the test to comment wording — exactly the brittleness flagged in the
+  // #2264 review (a prior commit had to reword a comment just to keep this green).
+  const codeOnly = (src: string): string =>
+    src.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+
   beforeAll(async () => {
-    adapterSource = await fs.readFile(
-      path.join(__dirname, '..', '..', 'src', 'core', 'lbug', 'lbug-adapter.ts'),
-      'utf-8',
+    adapterSource = codeOnly(
+      await fs.readFile(
+        path.join(__dirname, '..', '..', 'src', 'core', 'lbug', 'lbug-adapter.ts'),
+        'utf-8',
+      ),
     );
   });
 
@@ -44,8 +54,9 @@ describe('flushWAL / safeClose — consolidation guard (#1376)', () => {
   });
 
   it('closeLbug delegates to safeClose instead of inlining conn.close/db.close', () => {
-    const closeLbugBody = adapterSource.slice(adapterSource.indexOf('export const closeLbug'));
-    expect(closeLbugBody).toMatch(/await safeClose\(\)/);
+    // Match `closeLbug =` precisely so we don't prefix-match `closeLbugBeforeExit`.
+    const closeLbugBody = adapterSource.slice(adapterSource.indexOf('export const closeLbug ='));
+    expect(closeLbugBody).toMatch(/await safeClose\(options\)/);
     // closeLbug must NOT contain its own conn.close() or db.close() — those
     // live exclusively inside safeClose now.
     const closeLbugBlock = closeLbugBody.slice(0, closeLbugBody.indexOf('export const', 1) >>> 0);
@@ -53,9 +64,45 @@ describe('flushWAL / safeClose — consolidation guard (#1376)', () => {
     expect(closeLbugBlock).not.toMatch(/db\.close\(\)/);
   });
 
-  it('flushWAL is the only place that issues conn.query(CHECKPOINT)', () => {
-    const matches = adapterSource.match(/conn\.query\('CHECKPOINT'\)/g) ?? [];
-    expect(matches.length).toBe(1);
+  it('exports closeLbugBeforeExit (CHECKPOINT-only, skips native close) (#2264)', () => {
+    expect(adapterSource).toMatch(/export const closeLbugBeforeExit/);
+    // closeLbugBeforeExit is declared immediately before closeLbug; its body must
+    // CHECKPOINT via flushWAL and NEVER do a native conn/db close (that's the
+    // whole point — it relies on a guaranteed process.exit).
+    const body = adapterSource.slice(
+      adapterSource.indexOf('export const closeLbugBeforeExit'),
+      adapterSource.indexOf('export const closeLbug ='),
+    );
+    expect(body).toMatch(/await flushWAL\(\)/);
+    expect(body).not.toMatch(/conn\.close\(\)/);
+    expect(body).not.toMatch(/db\.close\(\)/);
+  });
+
+  it('CHECKPOINT is issued only by flushWAL (best-effort) and tryFlushWAL (rethrows for the retry driver)', () => {
+    // Receiver-agnostic: since the connection-serialization refactor (#2264)
+    // both sites capture `const c = conn` and call `c.query('CHECKPOINT')`
+    // inside withConnLock, so match `.query('CHECKPOINT')` regardless of the
+    // receiver name rather than the literal `conn.query(...)`.
+    const matches = adapterSource.match(/\.query\('CHECKPOINT'\)/g) ?? [];
+    // Two authorized sites: `flushWAL` (swallows errors — used by
+    // `safeClose` and the server's best-effort flush) and `tryFlushWAL`
+    // (rethrows so the manual checkpoint driver in `wal-checkpoint-driver.ts`
+    // can apply its bounded retry). Any third occurrence is a regression —
+    // a CHECKPOINT outside these two helpers will be invisible to the
+    // retry/error policy.
+    expect(matches.length).toBe(2);
+  });
+
+  it('exports tryFlushWAL (CHECKPOINT-with-rethrow for the manual retry driver)', () => {
+    expect(adapterSource).toMatch(/export const tryFlushWAL/);
+  });
+
+  it('flushWAL drains and closes the CHECKPOINT result before returning', () => {
+    const flushBody = adapterSource.slice(
+      adapterSource.indexOf('export const flushWAL'),
+      adapterSource.indexOf('export const safeClose'),
+    );
+    expect(flushBody).toMatch(/await drainQueryResult\(checkpointResult\)/);
   });
 
   it('conn.close() only appears inside safeClose (with eslint-disable)', () => {

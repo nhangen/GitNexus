@@ -9,6 +9,7 @@ import type {
 } from '../../method-types.js';
 import { extractSimpleTypeName } from '../../type-extractors/shared.js';
 import type { SyntaxNode } from '../../utils/ast-helpers.js';
+import { memoizeDeclarationFact } from '../declaration-facts.js';
 
 // ---------------------------------------------------------------------------
 // Dart helpers
@@ -17,7 +18,6 @@ import type { SyntaxNode } from '../../utils/ast-helpers.js';
 /** Type node types that represent a return type in function/getter/setter signatures. */
 const TYPE_NODE_TYPES = new Set([
   'type_identifier',
-  'generic_type',
   'function_type',
   'nullable_type',
   'void_type',
@@ -33,6 +33,22 @@ const TYPE_NODE_TYPES = new Set([
  * method_signature itself.
  */
 function getInnerSignature(node: SyntaxNode): SyntaxNode | null {
+  // A bare signature node IS its own inner signature. The scope-resolution
+  // path passes top-level `function_signature` (and constructor/getter/setter
+  // signatures) directly, unlike the legacy method extractor which always
+  // hands in a `method_signature`/`declaration` wrapper — so the descent loop
+  // below never sees a bare signature on the legacy path and this early return
+  // leaves legacy behavior byte-identical.
+  if (
+    node.type === 'function_signature' ||
+    node.type === 'constructor_signature' ||
+    node.type === 'getter_signature' ||
+    node.type === 'setter_signature' ||
+    node.type === 'operator_signature' ||
+    node.type === 'factory_constructor_signature'
+  ) {
+    return node;
+  }
   for (let i = 0; i < node.namedChildCount; i++) {
     const child = node.namedChild(i);
     if (
@@ -183,6 +199,15 @@ function extractDartParameters(node: SyntaxNode): ParameterInfo[] {
 }
 
 /**
+ * Parameters of a bare `formal_parameter_list` — a closure's
+ * (`function_expression`), which carries the list as a direct child rather
+ * than inside a signature node, so `extractParameters` cannot reach it.
+ */
+export function extractDartFormalParameterList(listNode: SyntaxNode): ParameterInfo[] {
+  return extractParamsFromList(listNode, false);
+}
+
+/**
  * Extract ParameterInfo entries from a formal_parameter_list or optional_formal_parameters node.
  */
 function extractParamsFromList(listNode: SyntaxNode, isOptionalBlock: boolean): ParameterInfo[] {
@@ -219,6 +244,17 @@ function extractSingleParam(param: SyntaxNode, isOptionalBlock: boolean): Parame
     if (child && TYPE_NODE_TYPES.has(child.type)) {
       rawTypeName = child.text?.trim() ?? null;
       typeName = extractSimpleTypeName(child) ?? rawTypeName;
+      // The grammar represents `prefix.Type` as two type_identifier siblings.
+      // Keeping only the first would bind the parameter to the prefix itself.
+      const member = param.namedChild(i + 1);
+      if (
+        child.type === 'type_identifier' &&
+        member?.type === 'type_identifier' &&
+        child.nextSibling?.type === '.'
+      ) {
+        typeName = `${child.text}.${member.text}`;
+        rawTypeName = typeName;
+      }
       break;
     }
     // Also check type_identifier
@@ -241,7 +277,7 @@ function extractSingleParam(param: SyntaxNode, isOptionalBlock: boolean): Parame
   }
   // 2. In tree-sitter-dart, `required` may be an anonymous sibling token
   //    immediately preceding the formal_parameter inside optional_formal_parameters.
-  if (!hasRequired) {
+  if (isOptionalBlock && !hasRequired) {
     let prev = param.previousSibling;
     // Skip comma separators
     while (prev && !prev.isNamed && prev.text.trim() === ',') {
@@ -391,13 +427,18 @@ function extractDartAnnotations(node: SyntaxNode): string[] {
 
 export const dartMethodConfig: MethodExtractionConfig = {
   language: SupportedLanguages.Dart,
-  typeDeclarationNodes: ['class_definition', 'mixin_declaration', 'extension_declaration'],
+  typeDeclarationNodes: [
+    'class_definition',
+    'mixin_declaration',
+    'extension_declaration',
+    'extension_type_declaration',
+  ],
   methodNodeTypes: ['method_signature', 'declaration'],
   bodyNodeTypes: ['class_body', 'extension_body'],
 
-  extractName: extractDartName,
-  extractReturnType: extractDartReturnType,
-  extractParameters: extractDartParameters,
+  extractName: memoizeDeclarationFact(extractDartName, getInnerSignature),
+  extractReturnType: memoizeDeclarationFact(extractDartReturnType, getInnerSignature),
+  extractParameters: memoizeDeclarationFact(extractDartParameters, getInnerSignature),
   extractVisibility: extractDartVisibility,
 
   isStatic: isDartStatic,

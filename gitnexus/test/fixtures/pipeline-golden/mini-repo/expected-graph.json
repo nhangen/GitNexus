@@ -2,28 +2,31 @@
   "capture": "initial capture (U8, post-U1–U7)",
   "fixture": "mini-repo",
   "totalFileCount": 7,
-  "symbols": 37,
-  "relationships": 74,
+  "symbols": 51,
+  "relationships": 97,
   "processes": 4,
   "byType": {
     "Class": 1,
     "Community": 4,
-    "Const": 4,
     "File": 7,
     "Folder": 1,
     "Function": 12,
     "Interface": 3,
     "Method": 1,
-    "Process": 4
+    "Process": 4,
+    "Property": 18
   },
   "byRelType": {
+    "ACCESSES": 3,
     "CALLS": 9,
     "CONTAINS": 7,
-    "DEFINES": 21,
+    "DEFINES": 26,
     "HAS_METHOD": 1,
+    "HAS_PROPERTY": 8,
     "IMPORTS": 12,
     "MEMBER_OF": 12,
-    "STEP_IN_PROCESS": 12
+    "STEP_IN_PROCESS": 12,
+    "USES": 7
   },
-  "edgeDigest": "a418debec537cf959fe56fd1fbbbfb59a640398cdb3c61ce0bcb8056c1f45110"
+  "edgeDigest": "09cab45c82f54ee2ea8a02943d38960ac7f4d9fc25af75cdd5228f458d30630d"
 }

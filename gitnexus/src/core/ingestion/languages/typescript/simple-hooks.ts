@@ -13,6 +13,7 @@ import type {
   ScopeTree,
   TypeRef,
 } from 'gitnexus-shared';
+import { walkToScope } from '../../utils/scope-tree-walk.js';
 
 // ─── bindingScopeFor ──────────────────────────────────────────────────────
 
@@ -41,6 +42,10 @@ export function tsBindingScopeFor(
   innermost: Scope,
   tree: ScopeTree,
 ): ScopeId | null {
+  // A named function expression binds only inside itself. Anonymous callables
+  // explicitly suppress their binding through @declaration.binding-name.
+  if (decl['@callable.unbound'] !== undefined || decl['@class.expression'] !== undefined)
+    return innermost.id;
   // Method return type: hoist to Module (mirrors csharpBindingScopeFor).
   if (decl['@type-binding.return'] !== undefined) {
     return walkToScope(innermost, tree, 'Module');
@@ -52,6 +57,48 @@ export function tsBindingScopeFor(
   // @type-binding.parameter binding still fires for the constructor
   // scope; this one adds a second binding on the class.
   if (decl['@type-binding.parameter-property'] !== undefined) {
+    return walkToScope(innermost, tree, 'Class');
+  }
+
+  // JSDoc parameters are anchored on the whole function, unlike inline
+  // parameter annotations. They still belong to its body, not its parent.
+  if (decl['@type-binding.parameter'] !== undefined) {
+    return walkToScope(innermost, tree, 'Function');
+  }
+
+  // A for-of alias covers the whole loop. When that loop introduces a lexical
+  // block, its element type belongs beside the loop variable's name claim.
+  // Returning the owner explicitly prevents equal-range auto-hoisting.
+  const alias = decl['@type-binding.alias'];
+  if (
+    alias !== undefined &&
+    innermost.kind === 'Block' &&
+    alias.range.startLine === innermost.range.startLine &&
+    alias.range.startCol === innermost.range.startCol &&
+    alias.range.endLine === innermost.range.endLine &&
+    alias.range.endCol === innermost.range.endCol
+  )
+    return innermost.id;
+
+  // `this.p = new Outer()` binds the FIELD, not a method-local, so the binding
+  // belongs on the class the way an annotated field's does — that is the only
+  // place `typeOfMemberOnClass` reads. Left on the innermost scope it would sit
+  // on the method's own Function scope and never be found (#2807). Same shape
+  // as the parameter-property branch above.
+  //
+  // Gated on the marker the `this.<field> = new …` pattern emits, never on
+  // `@type-binding.constructor` at large: that capture also fires for
+  // `const o = new Outer()` inside a method, and hoisting THOSE to the class
+  // would take method locals out of their own scope and mistype them.
+  //
+  // This walk is UNCONDITIONAL by design, and stays correct only because the
+  // marker's producers are bounded: the query nests the pattern under
+  // `class_body → method_definition → statement_block`, and `emitTsScopeCaptures`
+  // drops the static-method case. So `this` here provably IS an instance of the
+  // class this lands on, and a Class ancestor always exists — no `walkToScope`
+  // null-fallback onto some unrelated innermost scope. Anything that widens the
+  // marker's producers has to re-establish both, or restore the guard here.
+  if (decl['@type-binding.this-field'] !== undefined) {
     return walkToScope(innermost, tree, 'Class');
   }
 
@@ -70,28 +117,6 @@ export function tsBindingScopeFor(
   return null;
 }
 
-/**
- * Walk up the scope chain to find the first scope whose `kind` matches
- * any of `kinds`. Returns the matching scope's id or `null` when no
- * ancestor matches (e.g., a return type binding emitted outside any
- * Module scope — shouldn't happen in well-formed input).
- */
-function walkToScope(
-  from: Scope,
-  tree: ScopeTree,
-  ...kinds: readonly Scope['kind'][]
-): ScopeId | null {
-  let cur: Scope | undefined = from;
-  const kindSet = new Set(kinds);
-  while (cur !== undefined) {
-    if (kindSet.has(cur.kind)) return cur.id;
-    const parentId: ScopeId | null = cur.parent ?? null;
-    if (parentId === null) break;
-    cur = tree.getScope(parentId);
-  }
-  return null;
-}
-
 /** `var x = 1;` vs `let x = 1;` / `const x = 1;`. The capture's text
  *  starts at the outer declaration's `startIndex` in source, which is
  *  the keyword's first character — no leading whitespace possible. */
@@ -106,18 +131,11 @@ function isVarDeclaration(captureText: string): boolean {
 // ─── importOwningScope ────────────────────────────────────────────────────
 
 /**
- * TypeScript imports are syntactically top-level: `import_statement` is
- * legal only inside `program` (the module root). `namespace X { … }`
- * bodies CAN contain imports (`internal_module`), in which case the
- * import scopes to the namespace. Dynamic `import()` calls appear
- * inside any scope but their runtime effect is still a module-level
- * resolution — we attach the `ParsedImport` to the innermost Module /
- * Namespace scope so the binding is visible through the full subtree.
- *
- * Returning `null` delegates to the central default, which walks to
- * the nearest enclosing `Module`/`Namespace`. That matches our rule,
- * so we only override when we explicitly need a non-default scope
- * (we don't).
+ * Static external imports belong to the module. Local require/await-import
+ * captures carry an explicit declaredAtScope from their binding declaration:
+ * var hoists to a function, while let/const remain in their lexical block.
+ * The extractor honors that explicit owner before consulting this hook.
+ * Returning null leaves other imports at their syntactic scope.
  */
 export function tsImportOwningScope(
   _imp: ParsedImport,

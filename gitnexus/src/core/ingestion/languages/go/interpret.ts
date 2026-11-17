@@ -14,7 +14,13 @@ export function interpretGoImport(captures: CaptureMatch): ParsedImport | null {
   }
   if (kind === 'namespace') {
     if (name === undefined) return null;
-    return { kind: 'namespace', localName: name, importedName: name, targetRaw: source };
+    return {
+      kind: 'namespace',
+      localName: name,
+      importedName: name,
+      targetRaw: source,
+      implicitLocalName: true,
+    };
   }
   return null;
 }
@@ -28,7 +34,14 @@ export function interpretGoTypeBinding(captures: CaptureMatch): ParsedTypeBindin
   let normalizedType: string;
   if (captures['@type-binding.self'] !== undefined) {
     source = 'self';
-    normalizedType = normalizeGoTypeName(type);
+    // Preserve pointer shape on receiver self-bindings (`*T` vs `T`).
+    // Method-owner enrichment consumes that raw shape to stamp `goReceiverKind`
+    // on each method. Since #2813 that stamp is metadata, NOT a filter:
+    // structural interface satisfaction counts pointer-receiver methods, because
+    // `*T`'s method set is what an interface-typed field actually holds. The
+    // preserved distinction is the hook a future value/pointer-aware model would
+    // read — do not reintroduce it as an exclusion.
+    normalizedType = type.trim();
   } else if (captures['@type-binding.constructor'] !== undefined) {
     source = 'constructor-inferred';
     normalizedType = normalizeGoTypeName(type);
@@ -76,13 +89,24 @@ export function interpretGoTypeBinding(captures: CaptureMatch): ParsedTypeBindin
   return { boundName: name, rawTypeName: normalizedType, source };
 }
 
+/** Shallow `map[K]V` spelling match — the key is anything up to the first `]`,
+ *  so a nested map key (`map[map[a]b]V`) is deliberately NOT recognised. Held
+ *  in one place so the capture-side normalizers and the resolver's element-type
+ *  hook cannot drift on what counts as a map spelling. */
+const GO_MAP_VALUE_RE = /^map\[[^\]]+\]\s*(.+)$/;
+
+/** `map[K]V` → `V`, trimmed. `undefined` when `text` is not a map spelling. */
+export function goMapValueType(text: string): string | undefined {
+  const match = GO_MAP_VALUE_RE.exec(text);
+  return match === null ? undefined : match[1].trim();
+}
+
 export function normalizeGoTypeName(text: string): string {
   let t = text.trim();
-  while (t.startsWith('*')) t = t.slice(1).trim();
-  if (t.startsWith('[]')) t = t.slice(2).trim();
-  const mapMatch = t.match(/^map\[[^\]]+\]\s*(.+)$/);
-  if (mapMatch) t = mapMatch[1].trim();
-  t = t.replace(/^(?:<-)?chan\s+/, '');
+  t = stripGoOuterTypePrefixes(t);
+  const mapValue = goMapValueType(t);
+  if (mapValue !== undefined) t = mapValue;
+  t = stripGoOuterTypePrefixes(t.replace(/^(?:<-)?chan(?:<-)?\s+/, ''));
   if (t.startsWith('func(')) {
     const retMatch = t.match(/^func\([^)]*\)\s*(.*)$/);
     if (retMatch) t = retMatch[1].trim();
@@ -108,11 +132,10 @@ export function normalizeGoReturnType(text: string): string {
     const closeIdx = t.indexOf(',');
     t = t.slice(1, closeIdx).trim();
   }
-  while (t.startsWith('*')) t = t.slice(1).trim();
-  if (t.startsWith('[]')) t = t.slice(2).trim();
-  const mapMatch = t.match(/^map\[[^\]]+\]\s*(.+)$/);
-  if (mapMatch) t = mapMatch[1].trim();
-  t = t.replace(/^(?:<-)?chan\s+/, '');
+  t = stripGoOuterTypePrefixes(t);
+  const mapValue = goMapValueType(t);
+  if (mapValue !== undefined) t = mapValue;
+  t = stripGoOuterTypePrefixes(t.replace(/^(?:<-)?chan(?:<-)?\s+/, ''));
   if (t.startsWith('func(')) {
     const retMatch = t.match(/^func\([^)]*\)\s*(.*)$/);
     if (retMatch) t = retMatch[1].trim();
@@ -120,5 +143,50 @@ export function normalizeGoReturnType(text: string): string {
   // Preserve dotted qualified names for cross-package resolution.
   const bracket = t.indexOf('[');
   if (bracket !== -1) t = t.slice(0, bracket);
+  return t;
+}
+
+/** `pkg.Type` and nothing else: one qualifier, both halves Go identifiers
+ *  (letters per the spec, so Unicode, not just ASCII). */
+const GO_QUALIFIED_TYPE_NAME_RE = /^[\p{L}_][\p{L}\p{Nd}_]*\.[\p{L}_][\p{L}\p{Nd}_]*$/u;
+
+/**
+ * Go's `ScopeResolver.qualifiedTypeLookupSpelling`: the `pkg.Type` a binding's
+ * written type names, or `undefined` when it names no package.
+ *
+ * `normalizeGoTypeName` cuts the qualifier at capture (`*models.User` →
+ * `User`), so `rawName` cannot tell `models.User` from `api.User`. The written
+ * spelling (`TypeRef.declaredSpelling`) still has it, and `normalizeGoReturnType`
+ * — the reduction return types already get — strips the same pointer, slice,
+ * map, channel and func wrappers while keeping it. A `rawName` that is already
+ * qualified (a return type) needs nothing from here.
+ */
+export function goQualifiedTypeLookupSpelling(typeRef: TypeRef): string | undefined {
+  const written = typeRef.declaredSpelling;
+  // No `.` in the written type means no qualifier to recover; most bindings
+  // take this exit before any wrapper stripping.
+  if (written === undefined || !written.includes('.') || typeRef.rawName.includes('.')) {
+    return undefined;
+  }
+  // `func() *models.User` leaves `*models.User` after the return is unwrapped.
+  const qualified = stripGoOuterTypePrefixes(normalizeGoReturnType(written));
+  // The spelling must name `rawName` itself, only qualified: that is the cut
+  // `normalizeGoTypeName` made. A binding whose type a chain step replaced
+  // (`u *models.User` landing on a package-level `User *auth.Principal`) keeps
+  // its own spelling but not its own `rawName`, and must not borrow either.
+  return GO_QUALIFIED_TYPE_NAME_RE.test(qualified) && qualified.endsWith(`.${typeRef.rawName}`)
+    ? qualified
+    : undefined;
+}
+
+function stripGoOuterTypePrefixes(text: string): string {
+  let t = text.trim();
+  let previous: string;
+  do {
+    previous = t;
+    while (t.startsWith('*')) t = t.slice(1).trim();
+    if (t.startsWith('[]')) t = t.slice(2).trim();
+    t = t.replace(/^\[[^\]]+\]\s*/, '');
+  } while (t !== previous);
   return t;
 }

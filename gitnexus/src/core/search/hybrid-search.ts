@@ -10,6 +10,8 @@
 
 import { searchFTSFromLbug, type BM25SearchResult } from './bm25-index.js';
 import type { SemanticSearchResult } from '../embeddings/types.js';
+import type { FtsDisabledReason } from './fts-policy.js';
+import { rethrowSymbolIdentityError } from '../lbug/query-result-integrity.js';
 
 /**
  * RRF constant - standard value used in the literature
@@ -50,9 +52,15 @@ export const mergeWithRRF = (
 ): HybridSearchResult[] => {
   const merged = new Map<string, HybridSearchResult>();
 
+  // Guard against undefined/null inputs (#1489) — when FTS is unavailable
+  // in the MCP process, bm25Results can arrive as undefined and the
+  // for-loop would throw "bm25Results is not iterable".
+  const safeBm25 = bm25Results ?? [];
+  const safeSemantic = semanticResults ?? [];
+
   // Process BM25 results
-  for (let i = 0; i < bm25Results.length; i++) {
-    const r = bm25Results[i];
+  for (let i = 0; i < safeBm25.length; i++) {
+    const r = safeBm25[i];
     const rrfScore = 1 / (RRF_K + i + 1); // i+1 because rank starts at 1
 
     merged.set(r.filePath, {
@@ -65,8 +73,8 @@ export const mergeWithRRF = (
   }
 
   // Process semantic results and merge
-  for (let i = 0; i < semanticResults.length; i++) {
-    const r = semanticResults[i];
+  for (let i = 0; i < safeSemantic.length; i++) {
+    const r = safeSemantic[i];
     const rrfScore = 1 / (RRF_K + i + 1);
 
     const existing = merged.get(r.filePath);
@@ -147,8 +155,13 @@ export const formatHybridResults = (results: HybridSearchResult[]): string => {
 
 /**
  * Execute BM25 + semantic search and merge with RRF.
- * Uses LadybugDB FTS for always-fresh BM25 results (no cached data).
+ * Uses LadybugDB FTS for fresh BM25 results (no cached data).
  * The semanticSearch function is injected to keep this module environment-agnostic.
+ *
+ * When FTS is unavailable (e.g. read-only MCP connection, missing indexes) or
+ * explicitly disabled for this index (`disabledReason`, #3091), falls back to
+ * semantic-only results instead of crashing (#1489). In the disabled case no
+ * BM25 query is issued at all.
  */
 export const hybridSearch = async (
   query: string,
@@ -159,9 +172,30 @@ export const hybridSearch = async (
     query: string,
     k?: number,
   ) => Promise<SemanticSearchResult[]>,
+  disabledReason?: FtsDisabledReason,
 ): Promise<HybridSearchResult[]> => {
-  // Use LadybugDB FTS for always-fresh BM25 results
-  const { results: bm25Results } = await searchFTSFromLbug(query, limit);
-  const semanticResults = await semanticSearch(executeQuery, query, limit);
-  return mergeWithRRF(bm25Results, semanticResults, limit);
+  // Use LadybugDB FTS for fresh BM25 results — skipped entirely when this
+  // index recorded an explicit FTS opt-out (`disabledReason`, #3091).
+  // If FTS fails (e.g. extension not loaded in MCP process), fall back to
+  // semantic-only search instead of crashing with "bm25Results is not iterable".
+  // Both lanes share the caller's database session. Drain the sibling before
+  // propagating corruption so it cannot query after that session is released.
+  const [keyword, semantic] = await Promise.allSettled([
+    (async (): Promise<BM25SearchResult[]> => {
+      try {
+        const ftsResponse = await searchFTSFromLbug(query, limit, undefined, disabledReason);
+        return ftsResponse?.results ?? [];
+      } catch (error) {
+        rethrowSymbolIdentityError(error);
+        return [];
+      }
+    })(),
+    semanticSearch(executeQuery, query, limit).catch((error) => {
+      rethrowSymbolIdentityError(error);
+      return [];
+    }),
+  ]);
+  if (keyword.status === 'rejected') throw keyword.reason;
+  if (semantic.status === 'rejected') throw semantic.reason;
+  return mergeWithRRF(keyword.value, semantic.value, limit);
 };

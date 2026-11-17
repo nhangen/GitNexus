@@ -6,15 +6,19 @@
  * All Dart pipeline features are covered: Property nodes, HAS_PROPERTY edges,
  * CALLS chain resolution, IMPORTS, call attribution, and ACCESSES field reads.
  */
-import { describe, it, expect, beforeAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'path';
 import {
   FIXTURES,
   getRelationships,
   getNodesByLabel,
   getNodesByLabelFull,
+  getResolutionOutcomes,
   edgeSet,
   runPipelineFromRepo,
+  writeFixtureRepo,
   type PipelineResult,
 } from './helpers.js';
 import {
@@ -23,6 +27,7 @@ import {
   loadLanguage,
 } from '../../../src/core/tree-sitter/parser-loader.js';
 import { SupportedLanguages } from '../../../src/config/supported-languages.js';
+import { dartScopeResolver } from '../../../src/core/ingestion/languages/dart/scope-resolver.js';
 
 // isLanguageAvailable only checks whether the module loaded — it does NOT verify
 // that the native binary works at runtime (tree-sitter-dart can fail on setLanguage).
@@ -36,6 +41,56 @@ if (dartAvailable) {
     dartAvailable = false;
   }
 }
+
+describe.skipIf(!dartAvailable)('Dart pubspec package identity (#2963)', () => {
+  let result: PipelineResult;
+  let captureCount = 0;
+  let reloadCount = 0;
+
+  beforeAll(async () => {
+    const capture = vi.spyOn(dartScopeResolver, 'captureResolutionConfig');
+    const reload = vi.spyOn(dartScopeResolver, 'loadResolutionConfig');
+    try {
+      result = await runPipelineFromRepo(path.join(FIXTURES, 'dart-package-imports'), () => {});
+      captureCount = capture.mock.calls.length;
+      reloadCount = reload.mock.calls.length;
+    } finally {
+      capture.mockRestore();
+      reload.mockRestore();
+    }
+  }, 60000);
+
+  it('captures package metadata once and reuses it through parsing and resolution', () => {
+    expect(captureCount).toBe(1);
+    expect(reloadCount).toBe(0);
+  });
+
+  it('emits declared imports and their package identity dependencies', () => {
+    const imports = getRelationships(result, 'IMPORTS')
+      .filter((edge) => edge.sourceFilePath === 'lib/main.dart')
+      .map((edge) => edge.targetFilePath)
+      .sort();
+    expect(imports).toEqual([
+      'lib/models.dart',
+      'lib/relative.dart',
+      'packages/data/lib/models.dart',
+      'packages/data/pubspec.yaml',
+      'pubspec.yaml',
+    ]);
+  });
+
+  it.each([
+    ['loadOwn', 'lib/models.dart'],
+    ['loadData', 'packages/data/lib/models.dart'],
+    ['loadRelative', 'lib/relative.dart'],
+  ])('resolves %s in the correct library', (name, file) => {
+    const calls = getRelationships(result, 'CALLS').filter(
+      (edge) => edge.sourceFilePath === 'lib/main.dart' && edge.target === name,
+    );
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.targetFilePath).toBe(file);
+  });
+});
 
 // ── Phase 8: Field-type resolution ──────────────────────────────────────
 
@@ -95,6 +150,137 @@ describe.skipIf(!dartAvailable)('Dart field-type resolution', () => {
     expect(addressReads.length).toBe(1);
     expect(addressReads[0]!.source).toBe('processUser');
     expect(addressReads[0]!.targetLabel).toBe('Property');
+  });
+});
+
+// ── Prefixed-import factory results (#3498) ─────────────────────────────
+
+describe.skipIf(!dartAvailable)('Dart prefixed-import factory result types (#3498)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'dart-prefixed-factory-return'),
+      () => {},
+    );
+  }, 60000);
+
+  const methodCalls = (source: string) =>
+    getRelationships(result, 'CALLS')
+      .filter((edge) => edge.source === source && edge.target === 'm')
+      .map((edge) => edge.rel.targetId);
+
+  // `awaitedCall` (`final x = await rp.makeAsync()`, `Future<C> makeAsync()`):
+  // the binding carries `@type-binding.awaited`, the return binding carries
+  // `Future<C>` whole, and the post-finalize chain follow takes what the
+  // Dart await route says the Future yields — `C` (DART-04). The exact owner
+  // matters: `Other.m` is the same-named decoy.
+  it.each(['finalCall', 'varCall', 'inlineCall', 'awaitedCall'])(
+    'resolves %s to the exact C.m',
+    (source) => {
+      expect(methodCalls(source)).toEqual(['Method:lib/mod.dart:C.m#0']);
+    },
+  );
+
+  it('does not guess a receiver type for untypedCall', () => {
+    expect(methodCalls('untypedCall')).toEqual([]);
+  });
+
+  // `import 'mod.dart' deferred as dp;` is a namespace import like `as rp`:
+  // the deferred branch of the grammar must be captured, or the file has no
+  // IMPORTS edge and `dp.make()` never binds its result to C.
+  it('captures a deferred prefixed import as an IMPORTS edge', () => {
+    const imports = getRelationships(result, 'IMPORTS')
+      .filter((edge) => edge.sourceFilePath === 'lib/deferred_callers.dart')
+      .map((edge) => edge.targetFilePath);
+    expect(imports).toEqual(['lib/mod.dart']);
+  });
+
+  it.each(['deferredFinalCall', 'deferredInlineCall'])(
+    'resolves %s to C.m through the deferred prefix',
+    (source) => {
+      expect(methodCalls(source)).toEqual(['Method:lib/mod.dart:C.m#0']);
+    },
+  );
+
+  it('records the untyped factory result as a dropped site (and the awaited one no longer)', () => {
+    expect(
+      getResolutionOutcomes(result)
+        .filter((outcome) => outcome.kind === 'suppressed')
+        .filter(
+          (outcome) =>
+            outcome.reason === 'receiver-unresolved' && outcome.filePath === 'lib/callers.dart',
+        )
+        .map((outcome) => `${outcome.range.startLine}:${outcome.name}`)
+        .sort(),
+    ).toEqual(['17:m']);
+  });
+});
+
+// ── Deferred-prefix `loadLibrary` ───────────────────────────────────────
+
+describe.skipIf(!dartAvailable)('Dart deferred-prefix loadLibrary', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'dart-deferred-load-library'), () => {});
+  }, 60000);
+
+  const DEFERRED = 'lib/deferred_callers.dart';
+  const IMMEDIATE = 'lib/immediate_callers.dart';
+  const LOAD = 'Function:lib/mod.dart:loadLibrary';
+  const TIMEOUT = 'Method:lib/mod.dart:Pending.timeout#1';
+
+  const targets = (type: string, file: string, source: string) => [
+    ...new Set(
+      getRelationships(result, type)
+        .filter((edge) => edge.sourceFilePath === file && edge.source === source)
+        .map((edge) => edge.rel.targetId)
+        .sort(),
+    ),
+  ];
+
+  // A deferred prefix gets an implicit `loadLibrary()` and the library loads
+  // with `hide loadLibrary`, so `dp.loadLibrary` never names mod.dart's own
+  // `loadLibrary`. In the `as ip` control it is an ordinary namespace member.
+  it('binds no dp.loadLibrary() call to the library declaration, unlike ip.loadLibrary()', () => {
+    expect(targets('CALLS', DEFERRED, 'deferredLoad')).toEqual([]);
+    expect(targets('CALLS', IMMEDIATE, 'immediateLoad')).toEqual([LOAD]);
+  });
+
+  it('binds no dp.loadLibrary tear-off to the library declaration, unlike ip.loadLibrary', () => {
+    expect(targets('ACCESSES', DEFERRED, 'deferredLoadTearOff')).toEqual([]);
+    expect(targets('ACCESSES', IMMEDIATE, 'immediateLoadTearOff')).toEqual([LOAD]);
+  });
+
+  // The library's `Pending loadLibrary()` annotation must not type the result:
+  // through the deferred prefix it is the SDK Future, whose `timeout` is not
+  // Pending.timeout. `dp.feature()` in the same body still resolves.
+  it('does not type a dp.loadLibrary() result from the library return annotation', () => {
+    expect(targets('CALLS', DEFERRED, 'deferredLoadResult')).toEqual([
+      'Function:lib/mod.dart:feature',
+    ]);
+    expect(targets('CALLS', IMMEDIATE, 'immediateLoadResult')).toEqual([LOAD, TIMEOUT]);
+  });
+
+  it('does not type a member called on dp.loadLibrary() inline', () => {
+    expect(targets('CALLS', DEFERRED, 'deferredLoadChain')).toEqual([]);
+    expect(targets('CALLS', IMMEDIATE, 'immediateLoadChain')).toEqual([LOAD, TIMEOUT]);
+  });
+
+  // Constructors and static members reach mod.dart through the deferred prefix
+  // as they do through `as ip`. decoy.dart declares a second `C`, so no
+  // unique-name match can supply these edges.
+  it('resolves constructors and static members through the deferred prefix like as ip', () => {
+    const members = (file: string, source: string) => ({
+      calls: targets('CALLS', file, source),
+      reads: targets('ACCESSES', file, source),
+    });
+    expect(members(DEFERRED, 'deferredMembers')).toEqual({
+      calls: ['Class:lib/mod.dart:C', 'Method:lib/mod.dart:C.sm#0'],
+      reads: ['Class:lib/mod.dart:C', 'Property:lib/mod.dart:C.sf'],
+    });
+    expect(members(IMMEDIATE, 'immediateMembers')).toEqual(members(DEFERRED, 'deferredMembers'));
   });
 });
 
@@ -192,13 +378,6 @@ describe.skipIf(!dartAvailable)('Dart method enrichment', () => {
     );
     expect(speak).toBeDefined();
     expect(speak!.properties.isAbstract).toBe(true);
-  });
-
-  it('marks breathe as NOT isAbstract', () => {
-    const methods = getNodesByLabelFull(result, 'Method');
-    const breathe = methods.find((n) => n.name === 'breathe');
-    expect(breathe).toBeDefined();
-    expect(breathe!.properties.isAbstract).toBe(false);
   });
 
   it('marks classify as isStatic', () => {
@@ -476,7 +655,7 @@ describe.skipIf(!dartAvailable)('Dart interface dispatch (METHOD_IMPLEMENTS)', (
 });
 
 // ---------------------------------------------------------------------------
-// SM-9/SM-10: lookupMethodByOwnerWithMRO + D0 fast path — Dart first-wins
+// SM-9/SM-10: inherited method resolution — Dart first-wins inheritance walk
 // ---------------------------------------------------------------------------
 
 describe.skipIf(!dartAvailable)(
@@ -579,3 +758,471 @@ describe.skipIf(!dartAvailable)('Dart widget-tree call resolution', () => {
     expect(edge).toBeDefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Implicit-constructor construction edge (PR #1970 review regression)
+// build() { return Widget(); } where Widget has only an implicit constructor.
+// Both the legacy DAG and the registry-primary path must emit a CALLS edge
+// from the enclosing function to the constructed Class.
+// ---------------------------------------------------------------------------
+
+describe.skipIf(!dartAvailable)('Dart implicit-constructor construction', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'dart-construct-cascade'), () => {});
+  }, 60000);
+
+  it('detects the Widget class and the build function', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('Widget');
+    expect(getNodesByLabel(result, 'Function')).toContain('build');
+  });
+
+  it('emits a CALLS edge build → Widget for the implicit-constructor call', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const ctorCall = calls.find((c) => c.source === 'build' && c.target === 'Widget');
+    expect(ctorCall).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F24 (issue #1926): member calls (obj.method()) in return / list-literal /
+// named-argument / arrow-body contexts. The legacy DAG (removed in #942) only
+// captured member calls under expression_statement /
+// initialized_variable_definition; scope-resolution now owns and resolves these
+// broader contexts.
+// ---------------------------------------------------------------------------
+
+describe.skipIf(!dartAvailable)('Dart member-call contexts (F24)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'dart-member-call-contexts'), () => {});
+  }, 60000);
+
+  it('resolves a member call in a return statement (svc.compute())', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const edge = calls.find((c) => c.source === 'inReturn' && c.target === 'compute');
+    expect(edge).toBeDefined();
+    expect(edge!.targetFilePath).toContain('models.dart');
+  });
+
+  it('resolves member calls inside a list literal', () => {
+    const calls = getRelationships(result, 'CALLS');
+    expect(calls.find((c) => c.source === 'inList' && c.target === 'first')).toBeDefined();
+    expect(calls.find((c) => c.source === 'inList' && c.target === 'second')).toBeDefined();
+  });
+
+  it('resolves a member call in a named argument', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const edge = calls.find((c) => c.source === 'inNamedArg' && c.target === 'load');
+    expect(edge).toBeDefined();
+  });
+
+  it('resolves a member call in an arrow body', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const edge = calls.find((c) => c.source === 'inArrow' && c.target === 'run');
+    expect(edge).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F25 (issue #1926): calls inside a constructor body are mis-attributed by the
+// legacy enclosing-function finder (it only unwraps function_signature, not the
+// constructor_signature whose body is a sibling of the wrapping method_signature).
+// The registry-primary scope path synthesizes a Function scope for the
+// constructor body, and the Constructor def is a valid caller anchor, so the
+// call attributes to the constructor. Registry-primary-only win.
+// (Getter/setter and operator bodies are out of scope: Property is not a caller
+// anchor, and the structure phase emits no Method node for operators — see the
+// helpers.ts expected-failures comment.)
+// ---------------------------------------------------------------------------
+
+describe.skipIf(!dartAvailable)('Dart constructor body call attribution (F25)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'dart-constructor-body'), () => {});
+  }, 60000);
+
+  it('attributes a call inside a constructor body to the constructor', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const edge = calls.find((c) => c.target === 'setup' && c.sourceLabel === 'Constructor');
+    expect(edge).toBeDefined();
+    expect(edge!.source).toBe('Vector');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Named constructor with a body (PR #1970 tri-review P0 regression).
+// `class A { A.named() { ... } }` parses as a constructor_signature with
+// multiple name: fields, double-matching the scope query. Without dedup, two
+// identical-range Function scopes throw ScopeTreeInvariantError and the WHOLE
+// file is dropped from registry-primary resolution. Test 1 (parity) guards
+// against the file-drop in both modes; test 2 is the F25 constructor-attribution
+// win (registry-only, like the dart-constructor-body case).
+// ---------------------------------------------------------------------------
+
+describe.skipIf(!dartAvailable)('Dart named-constructor body (no file drop)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'dart-named-constructor-body'),
+      () => {},
+    );
+  }, 60000);
+
+  it('still resolves other calls in a class that has a named constructor with a body', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const greetCall = calls.find((c) => c.source === 'greet' && c.target === 'setup');
+    expect(greetCall).toBeDefined();
+  });
+
+  it('attributes a call inside a named-constructor body to the constructor', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const ctorCall = calls.find((c) => c.target === 'setup' && c.sourceLabel === 'Constructor');
+    expect(ctorCall).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F26 (issue #1919): static const / static final class fields.
+// `static const`/`static final` fields parse with a static_final_declaration_list
+// (not initialized_identifier_list), so the legacy field rules missed them and
+// no Property node was created end-to-end. They must surface as Property nodes
+// marked static + readonly, one per name in a multi-name declaration.
+// ---------------------------------------------------------------------------
+
+describe.skipIf(!dartAvailable)('Dart static const/final fields (F26)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'dart-static-fields'), () => {});
+  }, 60000);
+
+  it('captures static const and static final fields as Properties', () => {
+    const properties = getNodesByLabel(result, 'Property');
+    expect(properties).toContain('maxRetries'); // static const
+    expect(properties).toContain('host'); // static final, name 1 of 2
+    expect(properties).toContain('scheme'); // static final, name 2 of 2
+    expect(properties).toContain('port'); // instance field (regression)
+    expect(properties).toContain('_secret'); // private static const
+  });
+
+  it('emits HAS_PROPERTY edges for static fields', () => {
+    const propEdges = getRelationships(result, 'HAS_PROPERTY');
+    expect(edgeSet(propEdges)).toEqual(
+      expect.arrayContaining([
+        'Config → maxRetries',
+        'Config → host',
+        'Config → scheme',
+        'Config → port',
+        'Config → _secret',
+      ]),
+    );
+  });
+
+  it('marks static const/final fields as static + readonly', () => {
+    const props = getNodesByLabelFull(result, 'Property');
+    for (const name of ['maxRetries', 'host', 'scheme', '_secret']) {
+      const p = props.find((n) => n.name === name);
+      expect(p, name).toBeDefined();
+      expect(p!.properties.isStatic, name).toBe(true);
+      expect(p!.properties.isReadonly, name).toBe(true);
+    }
+  });
+
+  it('keeps the instance field non-static, non-readonly (regression)', () => {
+    const props = getNodesByLabelFull(result, 'Property');
+    const port = props.find((n) => n.name === 'port');
+    expect(port).toBeDefined();
+    expect(port!.properties.isStatic).toBe(false);
+    expect(port!.properties.isReadonly).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F29 (issue #1919): top-level Dart variables. Top-level vars are loose
+// siblings under `program` (no `declaration` wrapper), so the structure query
+// never captured them and no Variable node existed end-to-end. They must now
+// surface as Variable nodes with the real type/const metadata read from the
+// captured container's leading siblings (not a phantom `type` field).
+// ---------------------------------------------------------------------------
+
+describe.skipIf(!dartAvailable)('Dart top-level variables (F29)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'dart-toplevel-vars'), () => {});
+  }, 60000);
+
+  it('captures top-level variables (typed final, inferred var, multi-name const)', () => {
+    const vars = getNodesByLabel(result, 'Variable');
+    expect(vars).toContain('count'); // final int count = 3; (covers F29)
+    expect(vars).toContain('name'); // var name = 'x';
+    expect(vars).toContain('a'); // const a = 1, b = 2;
+    expect(vars).toContain('b');
+  });
+
+  it('reads the real type for a typed final and leaves an inferred var untyped', () => {
+    const vars = getNodesByLabelFull(result, 'Variable');
+    const count = vars.find((n) => n.name === 'count');
+    expect(count).toBeDefined();
+    expect(count!.properties.declaredType).toBe('int');
+    expect(count!.properties.isConst).toBe(true);
+
+    const name = vars.find((n) => n.name === 'name');
+    expect(name).toBeDefined();
+    // inferred `var` → no declaredType from a phantom field; mutable.
+    expect(name!.properties.declaredType).toBeUndefined();
+    expect(name!.properties.isMutable).toBe(true);
+  });
+
+  it('keeps the class instance field as a Property, not a Variable (regression)', () => {
+    const vars = getNodesByLabel(result, 'Variable');
+    expect(vars).not.toContain('z');
+    const props = getNodesByLabel(result, 'Property');
+    expect(props).toContain('z');
+  });
+
+  it('does NOT emit top-level vars as Property nodes (#1919 review CF4)', () => {
+    // Guards the `(program …)` vs `(declaration …)` anchor split: top-level
+    // siblings under `program` must surface as Variable, never Property. If the
+    // top-level anchor regressed to the class-field `(declaration …)` rule, these
+    // names would mis-classify as class Properties.
+    const props = getNodesByLabel(result, 'Property');
+    for (const name of ['count', 'a', 'b', 'name']) {
+      expect(props).not.toContain(name);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Heritage cross-file simple-name collision (PR #1970 tri-review P2).
+// console_logger.dart and file_logger.dart each declare `class Logger`; each
+// file's service `implements Logger`. emitDartHeritageEdges resolves the base
+// with same-file affinity, so each IMPLEMENTS edge must target its OWN file's
+// Logger (not a globally last-written one). Parity — both modes resolve same-file.
+// ---------------------------------------------------------------------------
+
+describe.skipIf(!dartAvailable)('Dart heritage cross-file name collision', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'dart-heritage-name-collision'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves implements to the same-file class on a name collision', () => {
+    const impl = getRelationships(result, 'IMPLEMENTS');
+    const consoleEdge = impl.find((e) => e.source === 'ConsoleService' && e.target === 'Logger');
+    expect(consoleEdge).toBeDefined();
+    expect(consoleEdge!.targetFilePath).toContain('console_logger.dart');
+
+    const fileEdge = impl.find((e) => e.source === 'FileService' && e.target === 'Logger');
+    expect(fileEdge).toBeDefined();
+    expect(fileEdge!.targetFilePath).toContain('file_logger.dart');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CF3 (#1919 review): Dart class getters/setters keep their class owner edge.
+// ---------------------------------------------------------------------------
+// A Dart accessor's name lives under `method_signature`; the CF3 owner-strip
+// guard must NOT treat that signature as an executable body and strip the
+// HAS_PROPERTY owner (the over-strip regression this guards against).
+describe('CF3 — Dart class accessors keep their class owner', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'dart-accessor-owner'), () => {});
+  }, 60000);
+
+  it('owns the getter/setter property `answer` and the stored field under Box', () => {
+    const owned = getRelationships(result, 'HAS_PROPERTY')
+      .filter((e) => e.source === 'Box')
+      .map((e) => e.target)
+      .sort();
+    expect(owned).toContain('answer');
+    expect(owned).toContain('normalField');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #3498 RC2: `dartBindingScopeFor` hoists every method's return-type binding
+// onto the Module scope, so `svc.getUser().save()` types its receiver only if
+// the receiver cascade walks up there (`hoistTypeBindingsToModule`). The
+// hoisted entries are keyed by bare method name, so the walk must also refuse
+// a same-named method of ANOTHER class — the second describe pins that.
+// ---------------------------------------------------------------------------
+
+/** Every CALLS target id emitted by `source` in `filePath`, sorted. */
+function dartCallTargets(result: PipelineResult, filePath: string, source: string): string[] {
+  return getRelationships(result, 'CALLS')
+    .filter((edge) => edge.source === source && edge.sourceFilePath === filePath)
+    .map((edge) => edge.rel.targetId)
+    .sort();
+}
+
+describe.skipIf(!dartAvailable)(
+  'Dart chained receivers through hoisted return types (#3498)',
+  () => {
+    let root: string;
+    let result: PipelineResult;
+
+    beforeAll(async () => {
+      root = fs.mkdtempSync(path.join(os.tmpdir(), 'gitnexus-dart-hoisted-return-'));
+      writeFixtureRepo(root, {
+        'models.dart': `class Address {
+  void save() {}
+}
+
+class User {
+  Address address = Address();
+  void save() {}
+}
+
+class Service {
+  User getUser() => User();
+}
+
+class ChildService extends Service {}
+`,
+        'callers.dart': `import 'models.dart';
+
+void plainChain(Service svc) {
+  svc.getUser().save();
+}
+
+void plainDeepChain(Service svc) {
+  svc.getUser().address.save();
+}
+
+void optionalChain(Service svc) {
+  svc.getUser().address?.save();
+}
+
+void inheritedChain(ChildService child) {
+  child.getUser().save();
+}
+`,
+      });
+      result = await runPipelineFromRepo(root, () => {});
+    }, 60000);
+
+    afterAll(() => {
+      fs.rmSync(root, { recursive: true, force: true });
+    });
+
+    it.each([
+      {
+        source: 'plainChain',
+        targets: ['Method:models.dart:Service.getUser#0', 'Method:models.dart:User.save#0'],
+      },
+      {
+        source: 'plainDeepChain',
+        targets: ['Method:models.dart:Address.save#0', 'Method:models.dart:Service.getUser#0'],
+      },
+      {
+        source: 'optionalChain',
+        targets: ['Method:models.dart:Address.save#0', 'Method:models.dart:Service.getUser#0'],
+      },
+      {
+        // The owner itself declares nothing; the walk refuses the binding for
+        // `ChildService` and accepts it for the `Service` it inherits from.
+        source: 'inheritedChain',
+        targets: ['Method:models.dart:Service.getUser#0', 'Method:models.dart:User.save#0'],
+      },
+    ])('resolves every call in $source to $targets', ({ source, targets }) => {
+      expect(dartCallTargets(result, 'callers.dart', source)).toEqual(targets);
+    });
+  },
+);
+
+describe.skipIf(!dartAvailable)(
+  'Dart same-named methods on two classes do not share a hoisted return type (#3498)',
+  () => {
+    let root: string;
+    let result: PipelineResult;
+
+    beforeAll(async () => {
+      root = fs.mkdtempSync(path.join(os.tmpdir(), 'gitnexus-dart-hoisted-collision-'));
+      // One Module-scope entry per method NAME: in each file the later class's
+      // `getUser` overwrites the earlier one's. Both orders are covered so the
+      // test does not depend on which one happens to win.
+      writeFixtureRepo(root, {
+        'accounts.dart': `class User {
+  void save() {}
+}
+
+class Admin {
+  void save() {}
+}
+
+class A {
+  User getUser() => User();
+}
+
+class B {
+  Admin getUser() => Admin();
+}
+`,
+        'reversed.dart': `import 'accounts.dart';
+
+class C {
+  Admin getUser() => Admin();
+}
+
+class D {
+  User getUser() => User();
+}
+`,
+        'callers.dart': `import 'accounts.dart';
+import 'reversed.dart';
+
+void viaA(A a) {
+  a.getUser().save();
+}
+
+void viaB(B b) {
+  b.getUser().save();
+}
+
+void viaC(C c) {
+  c.getUser().save();
+}
+
+void viaD(D d) {
+  d.getUser().save();
+}
+`,
+      });
+      result = await runPipelineFromRepo(root, () => {});
+    }, 60000);
+
+    afterAll(() => {
+      fs.rmSync(root, { recursive: true, force: true });
+    });
+
+    // `viaA` and `viaC` are the guard: their class's own binding was overwritten
+    // by the other class's, so the walk finds a binding it must refuse. The safe
+    // answer is no `save` edge at all — never the other class's return type.
+    it.each([
+      { source: 'viaA', targets: ['Method:accounts.dart:A.getUser#0'] },
+      {
+        source: 'viaB',
+        targets: ['Method:accounts.dart:Admin.save#0', 'Method:accounts.dart:B.getUser#0'],
+      },
+      { source: 'viaC', targets: ['Method:reversed.dart:C.getUser#0'] },
+      {
+        source: 'viaD',
+        targets: ['Method:accounts.dart:User.save#0', 'Method:reversed.dart:D.getUser#0'],
+      },
+    ])('resolves every call in $source to $targets', ({ source, targets }) => {
+      expect(dartCallTargets(result, 'callers.dart', source)).toEqual(targets);
+    });
+  },
+);

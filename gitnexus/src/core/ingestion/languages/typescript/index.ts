@@ -39,10 +39,9 @@
  * The TypeScript registry-primary path intentionally does NOT resolve
  * the following. Each is a conscious trade-off at migration time.
  *
- *   1. **Type-only import / export separation** — `import type { X }`
- *      and `import { X }` produce the same `ParsedImport` shape today;
- *      `def.type` on the resolved symbol is the only discriminator.
- *      Parity with the legacy path is preserved. Tracking in #927.
+ *   1. **Indirect local loaders** — literal require and immediately awaited
+ *      import bindings are supported. Computed sources, promise chains and
+ *      default/rest destructuring do not establish imported aliases.
  *   2. **Declaration merging for imports** — when `import { Foo }`
  *      brings in a symbol that is BOTH a class and a namespace in the
  *      source module, we currently surface a single binding per the
@@ -80,10 +79,9 @@
  *      identifiers are narrowed (`user instanceof User`). Member paths
  *      such as `user.address instanceof Address` remain unresolved.
  *
- * Shadow-harness corpus parity on `test/integration/resolvers/
- * typescript.test.ts` is the authoritative signal for which of these
- * matter in practice. The CI parity gate blocks any PR that regresses
- * either the legacy or registry-primary run.
+ * The `test/integration/resolvers/typescript.test.ts` resolver suite is
+ * the authoritative signal for which of these matter in practice; it runs
+ * in the standard CI test workflow, so a regression blocks the merge.
  */
 
 export { emitTsScopeCaptures } from './captures.js';

@@ -83,7 +83,7 @@ Shared execution flows: {{CROSS_PROCESSES}}
 
 ---
 
-Write a concise overview of this module group. Explain its purpose, how the sub-modules fit together, and the key workflows that span them. Link to sub-module pages (e.g. \`[Sub-module Name](sub-module-slug.md)\`) rather than repeating their content. Use whatever structure fits best.`;
+Write a concise overview of this module group. Explain its purpose, how the sub-modules fit together, and the key workflows that span them. Link to sub-module pages using the exact file names given (e.g. \`[Sub-module Name](sub-module-slug.md)\`) rather than repeating their content. Use whatever structure fits best.`;
 
 // ─── Overview Prompt ──────────────────────────────────────────────────
 
@@ -115,7 +115,7 @@ Key system flows: {{TOP_PROCESSES}}
 
 ---
 
-Write a clear overview of this project: what it does, how it's architected, and the key end-to-end flows. Include a simple Mermaid architecture diagram (max 10 nodes, big-picture only). Link to module pages (e.g. \`[Module Name](module-slug.md)\`) naturally in the text rather than listing them in a table. If project config was provided, include brief setup instructions. Structure the page however reads best.`;
+Write a clear overview of this project: what it does, how it's architected, and the key end-to-end flows. Include a simple Mermaid architecture diagram (max 10 nodes, big-picture only). Link to module pages naturally in the text using the exact file names given (e.g. \`[Module Name](module-slug.md)\`) rather than listing them in a table. If project config was provided, include brief setup instructions. Structure the page however reads best.`;
 
 // ─── Template Substitution Helper ─────────────────────────────────────
 
@@ -171,6 +171,26 @@ export function formatDirectoryTree(filePaths: string[]): string {
 }
 
 /**
+ * Call edges kept on a page. Declared here because this is where the
+ * requirement is: a limit exists at all only because `formatCallEdges` renders
+ * these lists into a prompt, and every such list reaches the LLM through it.
+ *
+ * The call-edge queries in `graph-queries.ts` import this value for their
+ * Cypher `LIMIT`s rather than restate it. That is the same cut moved earlier —
+ * fetching rows the slice below would discard is pure waste, and at module
+ * scale it is most of the query (#2787) — so fetch and display must agree, and
+ * a second number could only ever drift from this one.
+ *
+ * The import runs that way and not the other because this module has no
+ * imports of its own. `graph-queries.ts` may read this; sending it back the
+ * other way would give a pure template module a transitive dependency on the
+ * LadybugDB pool adapter, and would make the cap vanish under the tests that
+ * `vi.mock` `graph-queries.js` — a mock factory omitting the constant leaves
+ * `slice(0, undefined)`, which keeps every edge.
+ */
+export const CALL_EDGE_LIMIT = 30;
+
+/**
  * Format call edges as readable text.
  */
 export function formatCallEdges(
@@ -178,7 +198,7 @@ export function formatCallEdges(
 ): string {
   if (edges.length === 0) return 'None';
   return edges
-    .slice(0, 30)
+    .slice(0, CALL_EDGE_LIMIT)
     .map((e) => `${e.fromName} (${shortPath(e.fromFile)}) → ${e.toName} (${shortPath(e.toFile)})`)
     .join('\n');
 }

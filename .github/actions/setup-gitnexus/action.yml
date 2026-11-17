@@ -6,47 +6,46 @@ inputs:
     description: Whether to run npm run build after install
     required: false
     default: 'false'
+  lifecycle-scripts:
+    description: >
+      Run npm lifecycle scripts (prepare/postinstall) during gitnexus npm ci.
+      Typecheck-only and pack-only jobs should set this to false: they do not
+      need dist/ or native grammar builds.
+    required: false
+    default: 'true'
 
 runs:
   using: composite
   steps:
-    - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+    - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
       with:
         node-version: 22
         cache: npm
         cache-dependency-path: gitnexus/package-lock.json
 
-    - name: Build gitnexus-shared
-      run: npm ci && npm run build
-      shell: bash
-      working-directory: gitnexus-shared
-
-    # npm 10's bundled node-gyp 11 can't find Visual Studio 2026 (18.x) on
-    # windows-latest. A failed native build makes npm silently drop the
-    # optionalDependency tree-sitter-kotlin, and every Kotlin test then fails.
-    # node-gyp 12.1.0 added VS 2026 support, and npm 11.6.3 is the first npm
-    # to bundle it. Pointing npm 10 at a global node-gyp via
-    # npm_config_node_gyp did not reach the install script.
-    - name: Use an npm whose node-gyp supports Visual Studio 2026
-      if: runner.os == 'Windows'
-      run: npm install -g npm@11.8.0
-      shell: bash
-
+    # Do not npm-ci gitnexus-shared. Its TypeScript 7 install is a 7-minute
+    # stall (optional platform packages) and is not in the CLI npm cache.
+    # prepare/build.js compiles shared with gitnexus's tsc; typecheck does
+    # the same below after an ignore-scripts install.
     - name: Install dependencies
-      run: |
-        npm ci
-        # Optional grammars degrade silently at install, and their tests skip
-        # or fail far from the cause. CI expects all of them, so fail here.
-        missing=0
-        for g in tree-sitter-kotlin tree-sitter-dart tree-sitter-proto tree-sitter-swift; do
-          if ! node -e "require('$g')"; then
-            echo "::error::$g failed to load after npm ci; its native binding is missing or broken"
-            missing=1
-          fi
-        done
-        [ "$missing" -eq 0 ]
+      if: ${{ inputs.lifecycle-scripts != 'false' }}
+      run: npm ci
       shell: bash
       working-directory: gitnexus
+
+    - name: Install dependencies
+      if: ${{ inputs.lifecycle-scripts == 'false' }}
+      run: npm ci --ignore-scripts
+      shell: bash
+      working-directory: gitnexus
+
+    - name: Build gitnexus-shared
+      if: ${{ inputs.lifecycle-scripts == 'false' }}
+      # node + lib/tsc.js — same on Windows/macOS/Linux. Do not use .bin/tsc
+      # (tsc.cmd on Windows; execFileSync cannot launch .cmd without a shell).
+      run: node ../gitnexus/node_modules/typescript/lib/tsc.js
+      shell: bash
+      working-directory: gitnexus-shared
 
     - name: Build
       if: ${{ inputs.build == 'true' }}

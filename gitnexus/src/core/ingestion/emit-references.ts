@@ -28,8 +28,8 @@
  *   - `Scope` nodes for every `Scope` in the tree
  *   - `CONTAINS` edges from parent scope to child scope
  *   - `DEFINES` edges from scope to its `ownedDefs` members
- *   - `IMPORTS` edges from scope to `targetModuleScope` of each finalized
- *     `ImportEdge` that carries one
+ *   - `IMPORTS` edges from scope to each imported module, including targets
+ *     stored in shared wildcard groups
  *
  * Off by default — existing queries that don't know about `Scope` nodes
  * continue to work, and the storage cost is opt-in.
@@ -55,8 +55,11 @@ import type {
   ScopeId,
   SymbolDefinition,
 } from 'gitnexus-shared';
+import { isSelectableImport } from 'gitnexus-shared';
 import type { KnowledgeGraph } from '../graph/types.js';
 import type { ScopeResolutionIndexes } from './model/scope-resolution-indexes.js';
+import { toZeroBasedLine } from './utils/line-base.js';
+import { referenceEdgeKey } from './scope-resolution/graph-bridge/edges.js';
 
 // ─── Public API ─────────────────────────────────────────────────────────────
 
@@ -140,8 +143,8 @@ export function emitScopeGraph(input: {
       properties: {
         name: scope.kind,
         filePath: scope.filePath,
-        startLine: scope.range.startLine,
-        endLine: scope.range.endLine,
+        startLine: toZeroBasedLine(scope.range.startLine),
+        endLine: toZeroBasedLine(scope.range.endLine),
         description: `Scope: ${scope.kind}`,
       } as unknown as Parameters<KnowledgeGraph['addNode']>[0]['properties'],
     });
@@ -172,19 +175,26 @@ export function emitScopeGraph(input: {
     }
   }
 
-  for (const [scopeId, edges] of scopes.imports) {
-    for (const edge of edges) {
-      if (edge.targetModuleScope === undefined) continue;
+  for (const scopeId of scopes.imports.scopes()) {
+    scopes.imports.forEachTarget(scopeId, (targetFile, edge) => {
+      // A group's metadata describes the statement; resolve each target's
+      // module through the shared index without retaining per-file edges.
+      const targetModuleScope =
+        edge.targetModuleScope ??
+        (!isSelectableImport(edge) && edge.linkStatus !== 'unresolved'
+          ? scopes.moduleScopes.get(targetFile)
+          : undefined);
+      if (targetModuleScope === undefined) return;
       graph.addRelationship({
-        id: `rel:imports:${scopeId}->${edge.targetModuleScope}:${edge.localName}`,
+        id: `rel:imports:${scopeId}->${targetModuleScope}:${edge.localName}`,
         sourceId: scopeId,
-        targetId: edge.targetModuleScope,
+        targetId: targetModuleScope,
         type: 'IMPORTS',
         confidence: edge.linkStatus === 'unresolved' ? 0.5 : 1,
         reason: `import ${edge.kind} ${edge.localName}`,
       });
       scopeEdgesEmitted++;
-    }
+    });
   }
 
   return { scopeNodesEmitted, scopeEdgesEmitted };
@@ -254,7 +264,7 @@ function buildRelationship(
   // Other kinds omit `step`.
   const step = ref.kind === 'read' ? 1 : ref.kind === 'write' ? 2 : undefined;
   return {
-    id: `rel:${type}:${callerId}->${targetDef.nodeId}:${ref.atRange.startLine}:${ref.atRange.startCol}`,
+    id: `rel:${referenceEdgeKey(type, callerId, targetDef.nodeId, ref)}`,
     sourceId: callerId,
     targetId: targetDef.nodeId,
     type,
@@ -267,9 +277,14 @@ function buildRelationship(
 
 /**
  * Map a `Reference.kind` to an existing `RelationshipType`. Read/write
- * both fold into `ACCESSES`; `type-reference` + `import-use` both fold
- * into `USES`. This keeps the graph schema additive — no new
+ * both fold into `ACCESSES`; `type-reference`, `import-use`, and `macro`
+ * all fold into `USES`. This keeps the graph schema additive — no new
  * RelationshipType values are introduced by this module.
+ *
+ * `macro` folds into `USES` (not `CALLS`) deliberately: a macro
+ * invocation targets a `Macro` node, not a callable function, so keeping
+ * it out of the `CALLS` keyspace preserves the invariant that `CALLS`
+ * edges denote function/method dispatch.
  */
 function mapKindToType(kind: Reference['kind']): RelationshipType {
   switch (kind) {
@@ -282,6 +297,11 @@ function mapKindToType(kind: Reference['kind']): RelationshipType {
       return 'INHERITS';
     case 'type-reference':
     case 'import-use':
+    case 'macro':
+    // value-ref: function registered as an object-literal property value —
+    // a reference, not an invocation; CALLS are synthesized separately by
+    // the property-dispatch pass (#2437).
+    case 'value-ref':
       return 'USES';
   }
 }

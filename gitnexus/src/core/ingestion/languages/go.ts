@@ -1,3 +1,4 @@
+import { goRenameProvider } from './go/rename.js';
 /**
  * Go Language Provider
  *
@@ -5,18 +6,17 @@
  * LanguageProvider, following the Strategy pattern used by the pipeline.
  *
  * Key Go traits:
- *   - importSemantics: 'wildcard-leaf' (Go imports entire packages)
  *   - callRouter: present (Go method calls may need routing)
  */
 
 import { SupportedLanguages } from 'gitnexus-shared';
 import { createClassExtractor } from '../class-extractors/generic.js';
 import { goClassConfig } from '../class-extractors/configs/go.js';
+import { createLeadingDocDescriptionExtractor } from '../utils/ast-helpers.js';
+import { createGoCfgVisitor } from '../cfg/visitors/go.js';
 import { defineLanguage } from '../language-provider.js';
 import { typeConfig as goConfig } from '../type-extractors/go.js';
 import { goExportChecker } from '../export-detection.js';
-import { createImportResolver } from '../import-resolvers/resolver-factory.js';
-import { goImportConfig } from '../import-resolvers/configs/go.js';
 import { GO_QUERIES } from '../tree-sitter-queries.js';
 import type { AstFrameworkPatternConfig } from '../language-provider.js';
 import { createFieldExtractor } from '../field-extractors/generic.js';
@@ -25,10 +25,11 @@ import { createMethodExtractor } from '../method-extractors/generic.js';
 import { goMethodConfig } from '../method-extractors/configs/go.js';
 import { createVariableExtractor } from '../variable-extractors/generic.js';
 import { goVariableConfig } from '../variable-extractors/configs/go.js';
+import { resolveGoRouteHandler } from './go/route-handler.js';
+import { extractGoRouteFacts, resolveGoRouteFacts } from './go/route-facts.js';
+import { goPackageDir } from './go/package-clause.js';
 import { createCallExtractor } from '../call-extractors/generic.js';
 import { goCallConfig } from '../call-extractors/configs/go.js';
-import { createHeritageExtractor } from '../heritage-extractors/generic.js';
-import { goHeritageConfig } from '../heritage-extractors/configs/go.js';
 import {
   emitGoScopeCaptures,
   goArityCompatibility,
@@ -39,9 +40,63 @@ import {
   interpretGoTypeBinding,
 } from './go/index.js';
 
+const GO_BUILT_INS: ReadonlySet<string> = new Set([
+  // built-in functions
+  'make',
+  'new',
+  'len',
+  'cap',
+  'append',
+  'copy',
+  'delete',
+  'close',
+  'panic',
+  'recover',
+  'print',
+  'println',
+  'complex',
+  'real',
+  'imag',
+  'clear',
+  'min',
+  'max',
+  // built-in types
+  'error',
+  'bool',
+  'string',
+  'int',
+  'int8',
+  'int16',
+  'int32',
+  'int64',
+  'uint',
+  'uint8',
+  'uint16',
+  'uint32',
+  'uint64',
+  'uintptr',
+  'float32',
+  'float64',
+  'complex64',
+  'complex128',
+  'byte',
+  'rune',
+  'any',
+  'comparable',
+  // built-in values
+  'true',
+  'false',
+  'nil',
+  'iota',
+]);
+
 export const goProvider = defineLanguage({
+  rename: goRenameProvider,
   id: SupportedLanguages.Go,
   extensions: ['.go'],
+  // Package members resolve without imports. Include internal/external test
+  // packages conservatively for invalidation, including when a file is gone.
+  incrementalResolutionGroup: goPackageDir,
   entryPointPatterns: [/Handler$/, /^Serve/, /^New[A-Z]/, /^Make[A-Z]/],
   astFrameworkPatterns: [
     {
@@ -84,17 +139,37 @@ export const goProvider = defineLanguage({
   treeSitterQueries: GO_QUERIES,
   typeConfig: goConfig,
   exportChecker: goExportChecker,
-  importResolver: createImportResolver(goImportConfig),
-  importSemantics: 'wildcard-leaf',
   callExtractor: createCallExtractor(goCallConfig),
   fieldExtractor: createFieldExtractor(goFieldConfig),
   methodExtractor: createMethodExtractor(goMethodConfig),
+  resolveDetachedOwnerName: (node) =>
+    node.type === 'method_declaration' ? goMethodConfig.extractOwnerName?.(node) : undefined,
   variableExtractor: createVariableExtractor(goVariableConfig),
   classExtractor: createClassExtractor(goClassConfig),
-  heritageExtractor: createHeritageExtractor(goHeritageConfig),
+  // ── godoc (`//` leading comments) → description (issue #2270). Build/tool
+  //    directives (//go:…, // +build, //nolint, //line) are not documentation. ──
+  descriptionExtractor: createLeadingDocDescriptionExtractor({
+    lineCommentPrefixes: ['//'],
+    lineDirectivePrefixes: ['//go:', '// +build', '//nolint', '//line'],
+    // #2837: Go type declarations anchor on the `type_spec`, whose
+    // `previousNamedSibling` is null for the ordinary `type T struct{…}` form —
+    // the godoc comment is a sibling of the enclosing `type_declaration`, one
+    // level up. Without this the doc silently vanished for EVERY Go struct and
+    // interface (measured: pre-#2837 `desc=YES`, post `none`), taking #2270's
+    // description out of both the embedding header and the FTS column.
+    // Functions/methods are unaffected — they anchor on their own declaration
+    // node, which does carry the comment as a previous sibling.
+    wrapperNodeTypes: ['type_declaration'],
+  }),
+  builtInNames: GO_BUILT_INS,
+  resolveRouteHandler: resolveGoRouteHandler,
+  // One config-free collection for direct engines and wrapper-package roots.
+  extractRouteFacts: extractGoRouteFacts,
+  resolveRouteFacts: resolveGoRouteFacts,
 
   // ── RFC #909 Ring 3: scope-based resolution hooks ──────────
   emitScopeCaptures: emitGoScopeCaptures,
+  cfgVisitor: createGoCfgVisitor(),
   interpretImport: interpretGoImport,
   interpretTypeBinding: interpretGoTypeBinding,
   bindingScopeFor: goBindingScopeFor,

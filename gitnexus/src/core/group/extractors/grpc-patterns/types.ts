@@ -36,6 +36,18 @@ export interface GrpcDetection {
   confidenceWithProto: number;
   /** Confidence when the proto map has no entry. */
   confidenceWithoutProto: number;
+  /**
+   * Optional. Fully-qualified proto package the detection's service
+   * belongs to (e.g. `cn.unipus.ucf.admin.proto.client.service`),
+   * derived directly from the source file's import statements when
+   * available. When set, the orchestrator uses this package to build
+   * the contract id INSTEAD of consulting the per-repo proto map —
+   * letting consumer repos that don't carry `.proto` files (the
+   * client-jar architecture used by most Java gRPC microservices)
+   * still emit a fully-qualified contract id that matches the
+   * provider repo's contract id verbatim.
+   */
+  protoPackage?: string;
 }
 
 /**
@@ -44,11 +56,10 @@ export interface GrpcDetection {
  * `GrpcDetection`s. The plugin is free to run multiple compiled query
  * bundles and walk the AST to cross-reference captures.
  *
- * `language` is typed `unknown` for the same reason as in
- * `tree-sitter-scanner.ts`.
+ * `language` is the concrete grammar selected from its package exports.
  */
 export interface GrpcLanguagePlugin {
   name: string;
-  language: unknown;
+  language: Parser.Language;
   scan(tree: Parser.Tree): GrpcDetection[];
 }

@@ -6,7 +6,7 @@
  *
  * Covers:
  * - extractPattern: pattern extraction from Grep/Read/Shell tool inputs
- * - findGitNexusDir: .gitnexus directory discovery (shared with Claude hook)
+ * - findRegisteredRepo: registry-backed repository discovery
  * - cwd validation: rejects relative paths
  * - shell injection: verifies no `shell: true` in spawnSync calls
  * - cross-platform: Windows .cmd extension handling
@@ -17,12 +17,15 @@
  * repo, so behavior tests stick to early-exit paths to avoid spawning
  * `npx gitnexus`.
  */
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
 import { spawnSync } from 'child_process';
+import { createRequire } from 'module';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { runHook } from '../utils/hook-test-helpers.js';
+import { createContext, runInContext } from 'vm';
+import { runHook as spawnHook } from '../utils/hook-test-helpers.js';
+import { commitAll, initGitRepo } from '../helpers/temp-git-repo.js';
 
 // ─── Path to the Cursor hook + manifest ─────────────────────────────
 
@@ -35,6 +38,15 @@ const CURSOR_HOOK = path.resolve(
   'hooks',
   'gitnexus-hook.cjs',
 );
+const CURSOR_HOOK_LOCK = path.resolve(
+  __dirname,
+  '..',
+  '..',
+  '..',
+  'gitnexus-cursor-integration',
+  'hooks',
+  'hook-lock.cjs',
+);
 const CURSOR_HOOKS_JSON = path.resolve(
   __dirname,
   '..',
@@ -44,6 +56,12 @@ const CURSOR_HOOKS_JSON = path.resolve(
   'hooks',
   'hooks.json',
 );
+
+const require = createRequire(import.meta.url);
+const { parseRgGrepPattern, tokenizeShellWords } = require(CURSOR_HOOK) as {
+  parseRgGrepPattern: (command: string) => string | null;
+  tokenizeShellWords: (command: string) => string[];
+};
 
 // ─── Cursor-specific output parser ──────────────────────────────────
 // Cursor postToolUse output shape: { "additional_context": "..." }
@@ -60,17 +78,54 @@ function parseCursorOutput(stdout: string): { additional_context?: string } | nu
 // ─── Test fixtures ──────────────────────────────────────────────────
 
 let tmpDir: string;
+// Separate fixture for the concurrency guard tests: this one has a real
+// `.gitnexus/` so the hook reaches acquireHookSlot. The base tmpDir above
+// deliberately has no .gitnexus so unrelated early-exit tests stay cheap.
+let guardTmpDir: string;
+let guardGitNexusDir: string;
+let hookHome: string;
 
 beforeAll(() => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gitnexus-cursor-hook-test-'));
-  spawnSync('git', ['init'], { cwd: tmpDir, stdio: 'pipe' });
-  spawnSync('git', ['config', 'user.email', 'test@test.com'], { cwd: tmpDir, stdio: 'pipe' });
-  spawnSync('git', ['config', 'user.name', 'Test'], { cwd: tmpDir, stdio: 'pipe' });
+  initGitRepo(tmpDir, { name: 'Test', email: 'test@test.com' });
+
+  guardTmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gitnexus-cursor-hook-guard-'));
+  guardGitNexusDir = path.join(guardTmpDir, '.gitnexus');
+  fs.mkdirSync(guardGitNexusDir, { recursive: true });
+  initGitRepo(guardTmpDir, { name: 'Test', email: 'test@test.com' });
+  fs.writeFileSync(path.join(guardTmpDir, 'dummy.txt'), 'hello');
+  commitAll(guardTmpDir, 'init');
+
+  hookHome = fs.mkdtempSync(path.join(os.tmpdir(), 'gitnexus-cursor-hook-home-'));
+  fs.writeFileSync(
+    path.join(hookHome, 'registry.json'),
+    JSON.stringify([
+      {
+        name: 'cursor-guard',
+        path: guardTmpDir,
+        storagePath: guardGitNexusDir,
+      },
+    ]),
+  );
 });
 
 afterAll(() => {
+  fs.rmSync(hookHome, { recursive: true, force: true });
   fs.rmSync(tmpDir, { recursive: true, force: true });
+  fs.rmSync(guardTmpDir, { recursive: true, force: true });
 });
+
+function runHook(
+  hookPath: string,
+  input: Record<string, any>,
+  cwd?: string,
+  options: { env?: NodeJS.ProcessEnv } = {},
+) {
+  return spawnHook(hookPath, input, cwd, {
+    ...options,
+    env: { ...(options.env ?? process.env), GITNEXUS_HOME: hookHome },
+  });
+}
 
 // ─── Manifest + hook file presence ───────────────────────────────────
 
@@ -180,13 +235,25 @@ describe('Cursor hook source regressions', () => {
     expect(source).toMatch(/'augment',\s*'--',\s*pattern/);
   });
 
-  it('gates on a non-global .gitnexus directory before invoking the CLI', () => {
-    expect(source).toContain('findGitNexusDir');
-    expect(source).toContain('isGlobalRegistryDir');
+  it('gates on a registry entry before invoking the CLI', () => {
+    expect(source).toContain('resolveHookRepo');
+    expect(source).toContain('registry-query.cjs');
   });
 
   it('handles linked git worktrees via git rev-parse --git-common-dir', () => {
-    expect(source).toContain('--git-common-dir');
+    const resolver = fs.readFileSync(
+      path.resolve(
+        __dirname,
+        '..',
+        '..',
+        '..',
+        'gitnexus-cursor-integration',
+        'hooks',
+        'registry-query.cjs',
+      ),
+      'utf-8',
+    );
+    expect(resolver).toContain('--git-common-dir');
   });
 });
 
@@ -375,37 +442,757 @@ describe('Cursor hook debug logging', () => {
   });
 });
 
-// ─── Documented contract behavior (extractPattern via the live hook) ─
+// ─── Source code regression: npx fallback stays under the host budget ─────
 
-describe('Shell quoted-pattern parser limitations (documented)', () => {
-  // The Shell parser cannot reconstruct shell quoting. These tests pin the
-  // current behavior so a future "fix" doesn't silently change extraction
-  // — and so users diagnosing a noisy/missed pattern can find the behavior
-  // documented in tests.
-  //
-  // We can't observe the extracted pattern directly without an indexed
-  // repo, but we *can* confirm the hook reaches the augment-call path
-  // (vs. early-exiting) by checking exit status + clean stdout for cases
-  // where parseRgGrepPattern would yield a >=3-char token.
+describe('Cursor hook npx fallback host budget', () => {
+  const source = fs.readFileSync(CURSOR_HOOK, 'utf-8');
+  const manifest = JSON.parse(
+    fs.readFileSync(path.join(path.dirname(CURSOR_HOOK), 'hooks.json'), 'utf-8'),
+  );
 
-  it('quoted multi-word `rg "User Service"` extracts the first word only', () => {
-    const result = runHook(CURSOR_HOOK, {
-      tool_name: 'Shell',
-      tool_input: { command: 'rg "User Service" src/' },
-      cwd: tmpDir, // no .gitnexus → exits early after extract
-    });
-    expect(result.status).toBe(0);
-    expect(result.stdout.trim()).toBe('');
+  it('ships a postToolUse timeout with room for a cold npx install', () => {
+    // Cold `npx -y gitnexus` has to download + install the package; the
+    // original 10s budget killed the hook before the child could ever
+    // finish. The existing manifest test only pins (0, 120).
+    const seconds = manifest.hooks.postToolUse[0].timeout;
+    expect(seconds).toBeGreaterThanOrEqual(30);
+    expect(seconds).toBeLessThan(120);
   });
 
-  it('single-token quoted `rg "validateUser"` works as expected', () => {
-    const result = runHook(CURSOR_HOOK, {
-      tool_name: 'Shell',
-      tool_input: { command: 'rg "validateUser"' },
-      cwd: tmpDir,
+  it('sizes the npx timeout from the host budget with headroom', () => {
+    // Extract runGitNexusCli so the assertions are tied to the actual
+    // spawn wiring, not just to unrelated substrings elsewhere.
+    const fnStart = source.indexOf('function runGitNexusCli');
+    const fnBody = source.slice(fnStart, source.indexOf('\n}\n', fnStart));
+
+    // budget comes from hooks.json (seconds → ms) and the elapsed hook time
+    // is handed to the pure resolver, which owns the headroom arithmetic
+    expect(fnBody).toContain(
+      'resolveNpxTimeoutMs(hostBudgetMs, Date.now() - CURSOR_HOOK_START_MS)',
+    );
+    // the computed budget is what reaches spawnSync (not a bare +5000)
+    expect(fnBody).toContain('timeout: npxTimeout');
+    expect(fnBody).not.toMatch(/timeout:\s*timeout\s*\+\s*5000/);
+    // npx grandchild is killed outright so it cannot keep the DB lock
+    expect(fnBody).toMatch(/['"]-s['"]/);
+    expect(fnBody).toMatch(/['"]KILL['"]/);
+  });
+
+  it('reads the shipped timeout value, not a detached literal', () => {
+    // resolveCursorHostBudgetMs must parse the manifest so changing it
+    // cannot silently desync from the hook budget. It must NOT assume
+    // entry zero: the hook's own entry is selected by command, because a
+    // merged manifest can hold other postToolUse entries.
+    expect(source).toContain('return seconds * 1000;');
+    expect(source).not.toContain('postToolUse[0].timeout');
+    expect(source).toContain('gitnexus-hook.cjs');
+  });
+});
+
+// ─── Host budget: the manifest of the INSTALLED Cursor layout ──────
+//
+// The documented install puts this script at <project>/hooks/ and the
+// ACTIVE manifest at <project>/.cursor/hooks.json — the manifest is NOT
+// next to the script. Reading only the adjacent hooks.json therefore
+// failed after installation and silently used the 60s default, which
+// happened to match the shipped manifest and hid the bug.
+
+describe('Cursor hook host budget from the installed manifest', () => {
+  const hook = require(CURSOR_HOOK) as {
+    resolveCursorHostBudgetMs: (scriptDir?: string) => number;
+  };
+
+  let projectRoot: string;
+  let installedHooksDir: string;
+
+  beforeEach(() => {
+    projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'gitnexus-cursor-layout-'));
+    installedHooksDir = path.join(projectRoot, 'hooks');
+    fs.mkdirSync(installedHooksDir, { recursive: true });
+    fs.mkdirSync(path.join(projectRoot, '.cursor'), { recursive: true });
+  });
+
+  afterEach(() => {
+    fs.rmSync(projectRoot, { recursive: true, force: true });
+  });
+
+  function writeManifest(manifest: unknown) {
+    fs.writeFileSync(
+      path.join(projectRoot, '.cursor', 'hooks.json'),
+      JSON.stringify(manifest, null, 2),
+    );
+  }
+
+  it('reads the timeout from <project>/.cursor/hooks.json, not from beside the script', () => {
+    // 30s — deliberately NOT the 60s default, so a silent fallback to the
+    // default cannot pass this test.
+    writeManifest({
+      version: 1,
+      hooks: {
+        postToolUse: [
+          { matcher: 'Shell|Read|Grep', command: 'node ./hooks/gitnexus-hook.cjs', timeout: 30 },
+        ],
+      },
     });
-    expect(result.status).toBe(0);
-    expect(result.stdout.trim()).toBe('');
+    expect(hook.resolveCursorHostBudgetMs(installedHooksDir)).toBe(30_000);
+  });
+
+  it("selects this hook's own entry instead of assuming entry zero", () => {
+    writeManifest({
+      version: 1,
+      hooks: {
+        postToolUse: [
+          { matcher: 'Bash', command: 'node ./hooks/some-other-hook.cjs', timeout: 5 },
+          {
+            matcher: 'Shell|Read|Grep',
+            command: 'node ./hooks/gitnexus-hook.cjs',
+            timeout: 45,
+          },
+        ],
+      },
+    });
+    expect(hook.resolveCursorHostBudgetMs(installedHooksDir)).toBe(45_000);
+  });
+
+  it('keeps the adjacent manifest working for source-tree execution', () => {
+    // The repo ships the manifest next to the script, so that layout must
+    // still resolve — it is how the hook runs straight out of a checkout.
+    fs.writeFileSync(
+      path.join(installedHooksDir, 'hooks.json'),
+      JSON.stringify({
+        version: 1,
+        hooks: {
+          postToolUse: [
+            { matcher: 'Shell|Read|Grep', command: 'node ./hooks/gitnexus-hook.cjs', timeout: 25 },
+          ],
+        },
+      }),
+    );
+    expect(hook.resolveCursorHostBudgetMs(installedHooksDir)).toBe(25_000);
+  });
+
+  it('falls back to the shipped default when no manifest declares a timeout', () => {
+    expect(hook.resolveCursorHostBudgetMs(installedHooksDir)).toBe(60_000);
+  });
+});
+
+// ─── The npx budget must fit inside the shared lock's stale bound ──
+//
+// The hook holds its per-repo slot for the whole npx fallback, and every
+// adapter shares one `.hook-locks` directory: a slot must stay valid for
+// the hook's ENTIRE execution, or a concurrent hook evicts a live owner
+// and the per-repo concurrency cap is defeated.
+
+describe('Cursor hook slot lifetime vs the shared lock stale bound', () => {
+  it('keeps the whole npx fallback inside the lock stale threshold', () => {
+    const hook = require(CURSOR_HOOK) as { CURSOR_NPX_MAX_BUDGET_MS: number };
+    const lock = require(CURSOR_HOOK_LOCK) as { HOOK_LOCK_STALE_MS: number };
+    // Worst-case slot hold: the clamped npx budget + the spawnSync teardown
+    // allowance + the one-shot guard self-test.
+    const maxHoldMs = hook.CURSOR_NPX_MAX_BUDGET_MS + 2_000 + 3_000;
+    expect(lock.HOOK_LOCK_STALE_MS).toBeGreaterThan(maxHoldMs);
+  });
+});
+
+// ─── Behavioral: npx fallback budget arithmetic ─────────────────────
+// resolveNpxTimeoutMs is the whole decision, pure and exported, so these
+// assert the real numbers rather than grepping the hook for substrings.
+
+describe('Cursor hook npx fallback budget', () => {
+  const hook = require(CURSOR_HOOK) as {
+    resolveNpxTimeoutMs: (hostBudgetMs: number, elapsedMs: number) => number | null;
+  };
+  const manifest = JSON.parse(
+    fs.readFileSync(path.join(path.dirname(CURSOR_HOOK), 'hooks.json'), 'utf-8'),
+  );
+  const hostBudgetMs: number = manifest.hooks.postToolUse[0].timeout * 1000;
+  const source = fs.readFileSync(CURSOR_HOOK, 'utf-8');
+  // Same reason as below: the budget comments quote `timeout + 5000` to
+  // explain what was removed, so strip `//` comments before matching code.
+  const sourceCode = source
+    .split('\n')
+    .map((line) => line.replace(/\/\/.*$/, ''))
+    .join('\n');
+
+  it('is no longer hard-capped at the old inner+5s budget', () => {
+    // main() calls runGitNexusCli(..., 7000), so the previous
+    // `Math.min(timeout + 5000, ...)` ceiling pinned every npx fallback at
+    // 12000ms — exactly the cold `npx -y gitnexus` download the 60s manifest
+    // was raised to accommodate. The budget must now follow the host window.
+    const fresh = hook.resolveNpxTimeoutMs(hostBudgetMs, 0);
+    expect(fresh).not.toBeNull();
+    expect(fresh as number).toBeGreaterThan(7000 + 5000);
+  });
+
+  it('shrinks as the hook burns its host window', () => {
+    // Past the MAX clamp the budget tracks the remaining window one-for-one:
+    // each elapsed millisecond is one less millisecond for npx.
+    const early = hook.resolveNpxTimeoutMs(hostBudgetMs, 20_000) as number;
+    const later = hook.resolveNpxTimeoutMs(hostBudgetMs, 30_000) as number;
+    expect(later).toBeLessThan(early);
+    expect(early - later).toBe(10_000);
+  });
+
+  it('returns null once no usable budget remains, instead of a 1s floor', () => {
+    // `Math.max(1000, ...)` used to hand the guard 1000ms of an ALREADY
+    // EXPIRED window (plus a 2000ms spawnSync allowance), so the host killed
+    // the hook before the guard could return or the final stdout write could
+    // land. Exhausted must mean "do not start npx", never "start it anyway".
+    expect(hook.resolveNpxTimeoutMs(hostBudgetMs, hostBudgetMs)).toBeNull();
+    expect(hook.resolveNpxTimeoutMs(hostBudgetMs, hostBudgetMs + 5_000)).toBeNull();
+    // 1ms of window left after CURSOR_NPX_HEADROOM_MS — still unusable
+    expect(hook.resolveNpxTimeoutMs(hostBudgetMs, hostBudgetMs - 5_000 - 1)).toBeNull();
+  });
+
+  it('still allows a real budget right at the documented floor', () => {
+    // Floor is CURSOR_NPX_MIN_BUDGET_MS (5000ms of window left after
+    // CURSOR_NPX_HEADROOM_MS); one millisecond less skips. Pins the boundary
+    // so the skip cannot drift into rejecting a budget that could actually
+    // have completed.
+    const windowLeft = hostBudgetMs - 5_000; // after headroom
+    expect(hook.resolveNpxTimeoutMs(hostBudgetMs, windowLeft - 5_000)).toBe(5_000);
+    expect(hook.resolveNpxTimeoutMs(hostBudgetMs, windowLeft - 4_999)).toBeNull();
+  });
+
+  it('clamps to a sane upper bound rather than the whole host window', () => {
+    // One pathological install must not hold a per-repo hook slot for the
+    // full 60s window and starve concurrent edits in the same repo.
+    expect(hook.resolveNpxTimeoutMs(hostBudgetMs, 0)).toBe(45_000);
+    // ...and the clamp only binds once the remaining window exceeds it
+    expect(hook.resolveNpxTimeoutMs(hostBudgetMs, 15_000)).toBe(40_000);
+  });
+
+  it('no longer mentions the removed inner+5s ceiling anywhere', () => {
+    expect(sourceCode).not.toMatch(/timeout\s*\+\s*5000/);
+  });
+
+  it('skips the npx spawn before resolving a guard when the budget is gone', () => {
+    // Wiring check (the decision itself is covered behaviourally above):
+    // the null return has to happen BEFORE the guard self-test spawn and
+    // before any npx spawnSync, otherwise an exhausted window would still
+    // pay for a self-test it has no budget to use.
+    const fnStart = source.indexOf('function runGitNexusCli');
+    const fnBody = source.slice(fnStart, source.indexOf('\n}\n', fnStart));
+    const skipAt = fnBody.indexOf('if (npxTimeout === null)');
+    expect(skipAt).toBeGreaterThan(-1);
+    expect(fnBody.indexOf('resolveUnixGuardTimeout()')).toBeGreaterThan(skipAt);
+    expect(fnBody.indexOf('npx.cmd')).toBeGreaterThan(skipAt);
+  });
+});
+
+describe('Cursor npx spawn deadline', () => {
+  function runFallback({
+    hostSeconds = 30,
+    elapsedMs = 0,
+    probes = [{ elapsedMs: 2500, status: 42 }],
+    platform = 'linux',
+  }: {
+    hostSeconds?: number;
+    elapsedMs?: number;
+    probes?: { elapsedMs: number; status: number }[];
+    platform?: string;
+  } = {}) {
+    let now = 0;
+    let probeIndex = 0;
+    const calls: {
+      command: string;
+      args: string[];
+      at: number;
+      options: { timeout: number; killSignal?: string };
+    }[] = [];
+    const context = createContext({
+      module: { exports: {} },
+      __dirname: path.dirname(CURSOR_HOOK),
+      Date: { now: () => now },
+      process: { platform, env: {} },
+      require: (name: string) => {
+        if (name === 'path') return path;
+        if (name === 'fs') {
+          return {
+            existsSync: () => true,
+            readFileSync: () =>
+              JSON.stringify({
+                hooks: {
+                  postToolUse: [{ command: 'node gitnexus-hook.cjs', timeout: hostSeconds }],
+                },
+              }),
+          };
+        }
+        if (name === 'child_process') {
+          return {
+            spawnSync: (
+              command: string,
+              args: string[],
+              options: { timeout: number; killSignal?: string },
+            ) => {
+              calls.push({ command, args, at: now, options });
+              if (args.includes('exit 42')) {
+                const probe = probes[probeIndex++] ?? { elapsedMs: 3000, status: 1 };
+                now += Math.min(probe.elapsedMs, options.timeout);
+                if (probe.elapsedMs > options.timeout) return { error: { code: 'ETIMEDOUT' } };
+                return { status: probe.status };
+              }
+              return { status: 0, stderr: 'context' };
+            },
+          };
+        }
+        return {};
+      },
+    });
+    // Execute the shipped module, replacing only the clock and OS boundaries.
+    // No npx process or package download is launched by this test.
+    runInContext(fs.readFileSync(CURSOR_HOOK, 'utf-8'), context);
+    now = elapsedMs;
+    const result = runInContext(
+      "runGitNexusCli(null, ['augment', '--', 'needle'], '/project', 7000)",
+      context,
+    );
+    return { calls, result };
+  }
+
+  it('subtracts guard discovery time before starting the wrapped child', () => {
+    const { calls } = runFallback();
+    expect(calls).toHaveLength(2);
+    expect(calls[1].at).toBe(2500);
+    expect(calls[1].options.timeout).toBe(24_500);
+    expect(calls[1].args).toEqual([
+      '-s',
+      'KILL',
+      '-k',
+      '1',
+      '24',
+      'npx',
+      '-y',
+      'gitnexus',
+      'augment',
+      '--',
+      'needle',
+    ]);
+  });
+
+  it('skips npx when guard discovery consumes the minimum usable window', () => {
+    const { calls, result } = runFallback({ hostSeconds: 10 });
+    expect(calls).toHaveLength(1);
+    expect(calls[0].args).toContain('exit 42');
+    expect(result.status).toBeNull();
+  });
+
+  it('bounds all failed probes together and budgets the unwrapped fallback afterwards', () => {
+    const { calls } = runFallback({
+      probes: [
+        { elapsedMs: 2000, status: 1 },
+        { elapsedMs: 2000, status: 1 },
+      ],
+    });
+    expect(calls).toHaveLength(3);
+    expect(calls[0].options).toMatchObject({ timeout: 3000, killSignal: 'SIGKILL' });
+    expect(calls[1].options).toMatchObject({ timeout: 1000, killSignal: 'SIGKILL' });
+    expect(calls[2]).toMatchObject({ command: 'npx', at: 3000, options: { timeout: 22_000 } });
+  });
+
+  it('does no subprocess work when the hook deadline has already passed', () => {
+    const { calls, result } = runFallback({ elapsedMs: 30_000 });
+    expect(calls).toEqual([]);
+    expect(result.status).toBeNull();
+  });
+
+  it('keeps Windows on the unwrapped npx.cmd path', () => {
+    const { calls } = runFallback({ platform: 'win32' });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({ command: 'npx.cmd', options: { timeout: 25_000 } });
+  });
+});
+
+// ─── Behavioral: guard timeout resolution (F1 + F2) ────────────────
+// resolveUnixGuardTimeout memoizes per module instance, so each case loads
+// a FRESH copy of the hook rather than reusing the top-of-file require.
+
+describe('Cursor hook guard timeout resolution', () => {
+  const isUnix = process.platform !== 'win32';
+  const source = fs.readFileSync(CURSOR_HOOK, 'utf-8');
+
+  // This hook is deliberately dense with explanatory comments — several of
+  // them quote the very paths being asserted on (to explain what an earlier
+  // revision got wrong). Strip `//` comments so these source assertions
+  // describe CODE, and cannot pass or fail on the prose around it.
+  function codeOf(fnSignature: string): string {
+    const start = source.indexOf(fnSignature);
+    expect(start).toBeGreaterThan(-1);
+    const body = source.slice(start, source.indexOf('\n}\n', start));
+    return body
+      .split('\n')
+      .map((line) => line.replace(/\/\/.*$/, ''))
+      .join('\n');
+  }
+
+  function freshHook(): {
+    resolveUnixGuardTimeout: () => string | null;
+  } {
+    delete require.cache[require.resolve(CURSOR_HOOK)];
+    return require(CURSOR_HOOK) as { resolveUnixGuardTimeout: () => string | null };
+  }
+
+  function withTimeoutPath<T>(value: string | undefined, fn: () => T): T {
+    const prior = process.env.GITNEXUS_HOOK_TIMEOUT_PATH;
+    if (value === undefined) delete process.env.GITNEXUS_HOOK_TIMEOUT_PATH;
+    else process.env.GITNEXUS_HOOK_TIMEOUT_PATH = value;
+    try {
+      return fn();
+    } finally {
+      if (prior === undefined) delete process.env.GITNEXUS_HOOK_TIMEOUT_PATH;
+      else process.env.GITNEXUS_HOOK_TIMEOUT_PATH = prior;
+    }
+  }
+
+  it('looks for Homebrew gtimeout, not a Homebrew timeout', () => {
+    // Homebrew's coreutils keg installs the GNU binary as `gtimeout`. Listing
+    // `/opt/homebrew/bin/timeout` (as an earlier revision did) meant the
+    // `-s KILL` orphan-containment wrap silently never engaged on Apple
+    // Silicon, because every candidate is an absolute path and so the old
+    // `which` fallback could never discover `gtimeout` either.
+    const fnBody = codeOf('function resolveUnixGuardTimeout');
+    expect(fnBody).toContain('/opt/homebrew/bin/gtimeout');
+    expect(fnBody).toContain('/usr/local/bin/gtimeout');
+    expect(fnBody).toContain('/usr/bin/timeout');
+    expect(fnBody).toContain('/bin/timeout');
+    expect(fnBody).not.toContain('/opt/homebrew/bin/timeout');
+    expect(fnBody).not.toContain('/usr/local/bin/timeout');
+    // The `which` probe is gone: it could never fire for absolute paths and
+    // would only re-introduce PATH-dependent, unvalidated adoption.
+    expect(fnBody).not.toContain('which');
+  });
+
+  it.skipIf(!isUnix)('does not adopt an always-exit-0 stub as the guard', () => {
+    // GITNEXUS_HOOK_TIMEOUT_PATH=/bin/true passes a bare existsSync
+    // check. The wrapped spawn then "succeeded" instantly without ever
+    // running npx, and status 0 + empty stderr satisfies main()'s
+    // `!child.error && child.status === 0` check — so the hook emitted NO
+    // augmentation at all: a silently dead hook, not a visible failure.
+    // Hermetic stub (not /bin/true, which macOS 15+ no longer ships).
+    const stubDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gitnexus-guard-stub-'));
+    const stub = path.join(stubDir, 'stub-timeout');
+    try {
+      fs.writeFileSync(stub, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+      const resolved = withTimeoutPath(stub, () => freshHook().resolveUnixGuardTimeout());
+      expect(resolved).not.toBe(stub);
+    } finally {
+      fs.rmSync(stubDir, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(!isUnix)('resolves a relative override against this process, not the tool cwd', () => {
+    // runGitNexusCli spawns with the tool request's cwd, so a relative
+    // override would ENOENT there — or, slashless, silently become a PATH
+    // lookup. path.resolve makes the adopted path absolute.
+    const stubDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gitnexus-guard-relative-'));
+    const stub = path.join(stubDir, 'timeout');
+    try {
+      fs.writeFileSync(stub, '#!/bin/sh\nexit 42\n', { mode: 0o755 });
+      const relative = path.relative(process.cwd(), stub);
+      const resolved = withTimeoutPath(relative, () => freshHook().resolveUnixGuardTimeout());
+      expect(resolved).toBe(stub);
+    } finally {
+      fs.rmSync(stubDir, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(!isUnix)('honours the disabled sentinel', () => {
+    expect(withTimeoutPath('disabled', () => freshHook().resolveUnixGuardTimeout())).toBeNull();
+  });
+
+  it.skipIf(!isUnix)(
+    'returns when an override ignores SIGTERM',
+    () => {
+      const stubDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gitnexus-guard-hung-'));
+      const stub = path.join(stubDir, 'timeout');
+      const pidFile = path.join(stubDir, 'pid');
+      try {
+        fs.writeFileSync(
+          stub,
+          `#!${process.execPath}\n` +
+            `require('fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));\n` +
+            "process.on('SIGTERM', () => {});\nsetInterval(() => {}, 1000);\n",
+          { mode: 0o755 },
+        );
+        const result = spawnSync(
+          process.execPath,
+          [
+            '-e',
+            `console.log(JSON.stringify(require(${JSON.stringify(CURSOR_HOOK)}).resolveUnixGuardTimeout()))`,
+          ],
+          {
+            env: { ...process.env, GITNEXUS_HOOK_TIMEOUT_PATH: stub },
+            encoding: 'utf-8',
+            timeout: 8000,
+            killSignal: 'SIGKILL',
+          },
+        );
+        expect(fs.existsSync(pidFile)).toBe(true);
+        expect(result.error).toBeUndefined();
+        expect(result.status).toBe(0);
+        expect(result.stdout.trim()).toBe('null');
+      } finally {
+        if (fs.existsSync(pidFile)) {
+          try {
+            process.kill(Number(fs.readFileSync(pidFile, 'utf-8')), 'SIGKILL');
+          } catch {
+            // The resolver normally already killed the probe.
+          }
+        }
+        fs.rmSync(stubDir, { recursive: true, force: true });
+      }
+    },
+    12_000,
+  );
+
+  it.skipIf(!isUnix)(
+    'only ever adopts a guard that runs the command AND propagates its exit status',
+    () => {
+      // Independent re-derivation of the contract: whatever the resolver
+      // returns must be a real coreutils timeout/gtimeout AND must actually
+      // propagate a non-zero exit. null is also a valid answer (no wrapper
+      // installed here), but never a silently-dead substitute.
+      const resolved = withTimeoutPath(undefined, () => freshHook().resolveUnixGuardTimeout());
+      if (resolved === null) return; // nothing installed to validate
+      expect(path.basename(resolved)).toMatch(/^g?timeout$/);
+      const probe = spawnSync(resolved, ['-k', '1', '1', '/bin/sh', '-c', 'exit 42'], {
+        encoding: 'utf-8',
+        timeout: 5000,
+        stdio: ['ignore', 'ignore', 'ignore'],
+      });
+      expect(probe.error).toBeUndefined();
+      expect(probe.status).toBe(42);
+    },
+  );
+
+  it.skipIf(!isUnix)('self-tests candidates with the -k exit-propagation probe', () => {
+    // The adoption test itself, pinned so it cannot be weakened back to an
+    // existence check: it must run a wrapped /bin/sh and observe exit 42.
+    expect(source).toContain("['-k', '1', '1', '/bin/sh', '-c', 'exit 42']");
+    expect(source).toContain('!selfTest.error && selfTest.status === 42');
+  });
+});
+
+// ─── Source code regression: concurrency guard (#1486) ─────────────
+
+describe('Cursor hook concurrency guard', () => {
+  const source = fs.readFileSync(CURSOR_HOOK, 'utf-8');
+  const lockSource = fs.readFileSync(CURSOR_HOOK_LOCK, 'utf-8');
+
+  it('loads acquireHookSlot helper module', () => {
+    expect(source).toContain('acquireHookSlot');
+    expect(source).toContain('hook-lock.cjs');
+  });
+
+  it('helper defines acquireHookSlot with MAX_INFLIGHT constant', () => {
+    expect(lockSource).toContain('function acquireHookSlot');
+    expect(lockSource).toContain('HOOK_LOCK_MAX_INFLIGHT');
+  });
+
+  it('calls acquireHookSlot in main() and releases via finally', () => {
+    // The Cursor hook uses a flat main() dispatcher rather than a separate
+    // handlePreToolUse — assert the guard call + finally release wiring is
+    // present so a future refactor cannot accidentally skip it.
+    expect(source).toContain('acquireHookSlot(');
+    expect(source).toMatch(/finally\s*\{[^}]*release\(\)/s);
+  });
+
+  it('uses atomic fixed-name slot files (hard cap, not soft TOCTOU cap)', () => {
+    expect(lockSource).toMatch(/slot-\$\{slot\}\.lock|`slot-/);
+    const slotFn = lockSource.slice(
+      lockSource.indexOf('function acquireHookSlot'),
+      lockSource.indexOf('function', lockSource.indexOf('function acquireHookSlot') + 1),
+    );
+    expect(slotFn).not.toContain('readdirSync');
+  });
+
+  it('fails closed when lock dir cannot be created', () => {
+    // Regression: see hooks.test.ts. The mkdirSync catch must return null
+    // (skip augment) rather than `() => {}` (proceed unguarded), so that
+    // a read-only or cross-user `.gitnexus/` cannot reintroduce #1486.
+    const slotFn = lockSource.slice(
+      lockSource.indexOf('function acquireHookSlot'),
+      lockSource.indexOf('function', lockSource.indexOf('function acquireHookSlot') + 1),
+    );
+    const mkdirCatch = slotFn.slice(
+      slotFn.indexOf('fs.mkdirSync(lockDir'),
+      slotFn.indexOf('const myPidStr'),
+    );
+    expect(mkdirCatch).toContain('return null');
+    expect(mkdirCatch).not.toMatch(/return\s*\(\s*\)\s*=>\s*\{\s*\}/);
+  });
+
+  // Note: the 10-concurrent-spawner burst test that validates `wx`
+  // (O_CREAT|O_EXCL) under simultaneous contention lives in
+  // hooks.test.ts. The Cursor hook uses byte-for-byte the same
+  // acquireHookSlot, so duplicating the burst test here would only test
+  // the OS primitive, not Cursor-specific wiring. The source-level checks
+  // above guarantee the Cursor hook keeps calling that same algorithm.
+});
+
+// ─── Integration: concurrency guard skips when slots are full ──────
+
+describe('Cursor hook concurrency guard (integration)', () => {
+  it('exits silently when all MAX_INFLIGHT slots hold live pids', async () => {
+    const { spawn } = await import('child_process');
+    const lockDir = path.join(guardGitNexusDir, '.hook-locks');
+    fs.mkdirSync(lockDir, { recursive: true });
+
+    const sleepers = [0, 1, 2].map(() =>
+      spawn(process.execPath, ['-e', 'setTimeout(()=>{},60000)'], {
+        stdio: 'ignore',
+        detached: false,
+      }),
+    );
+    const writtenLocks: string[] = [];
+    try {
+      for (let i = 0; i < sleepers.length; i++) {
+        const p = path.join(lockDir, `slot-${i}.lock`);
+        fs.writeFileSync(p, String(sleepers[i].pid));
+        writtenLocks.push(p);
+      }
+
+      const result = runHook(CURSOR_HOOK, {
+        tool_name: 'Grep',
+        tool_input: { query: 'validateUser' },
+        cwd: guardTmpDir,
+      });
+
+      expect(result.stdout.trim()).toBe('');
+      for (let i = 0; i < sleepers.length; i++) {
+        const p = path.join(lockDir, `slot-${i}.lock`);
+        expect(fs.existsSync(p)).toBe(true);
+        expect(fs.readFileSync(p, 'utf-8').trim()).toBe(String(sleepers[i].pid));
+      }
+    } finally {
+      for (const child of sleepers) {
+        try {
+          child.kill();
+        } catch {
+          /* ignore */
+        }
+      }
+      for (const p of writtenLocks) {
+        try {
+          fs.unlinkSync(p);
+        } catch {
+          /* ignore */
+        }
+      }
+      try {
+        fs.rmdirSync(lockDir);
+      } catch {
+        /* ignore */
+      }
+    }
+  });
+
+  it('reclaims a slot held by a dead pid', () => {
+    const lockDir = path.join(guardGitNexusDir, '.hook-locks');
+    fs.mkdirSync(lockDir, { recursive: true });
+    const deadPid = 2_147_483_640;
+    const stalePath = path.join(lockDir, 'slot-0.lock');
+    try {
+      fs.writeFileSync(stalePath, String(deadPid));
+      expect(fs.readFileSync(stalePath, 'utf-8').trim()).toBe(String(deadPid));
+
+      runHook(CURSOR_HOOK, {
+        tool_name: 'Grep',
+        tool_input: { query: 'validateUser' },
+        cwd: guardTmpDir,
+      });
+
+      // The hook reclaimed and then released slot-0 — either gone (released)
+      // or no longer owned by the dead pid.
+      if (fs.existsSync(stalePath)) {
+        expect(fs.readFileSync(stalePath, 'utf-8').trim()).not.toBe(String(deadPid));
+      }
+    } finally {
+      try {
+        fs.unlinkSync(stalePath);
+      } catch {
+        /* already pruned */
+      }
+      try {
+        fs.rmdirSync(lockDir);
+      } catch {
+        /* ignore */
+      }
+    }
+  });
+});
+
+// ─── Shell pattern parsing ──────────────────────────────────────────
+
+describe('Shell quoted-pattern parser', () => {
+  it.each([
+    ['rg "User Service" src/', 'User Service'],
+    ["grep 'error boundary' -- src/", 'error boundary'],
+    ['rg User\\ Service src/', 'User Service'],
+    [String.raw`rg "C:\Users" src/`, String.raw`C:\Users`],
+    ['rg -e "User Service" src/', 'User Service'],
+    ['rg --regexp=UserService src/', 'UserService'],
+    ['grep -eUserService src/', 'UserService'],
+    ['rg -e x -e LongPattern src/', 'LongPattern'],
+    ['rg -ex -eLongPattern src/', 'LongPattern'],
+    ['rg --regexp=x --regexp=LongPattern src/', 'LongPattern'],
+    ['/usr/bin/rg -- "User Service" src/', 'User Service'],
+    ['rg -- -error src/', '-error'],
+    [String.raw`C:\Users\me\bin\rg.exe UserService src/`, 'UserService'],
+    ['rg.exe "validateUser" src/', 'validateUser'],
+    ['grep.cmd -e LongPattern src/', 'LongPattern'],
+    ['cd grep && rg LongPattern src/', 'LongPattern'],
+    ['npx rg "User Service" src/', 'User Service'],
+    ['npx --yes rg UserService src/', 'UserService'],
+    ['npx --package rg grep LongPattern src/', 'LongPattern'],
+    ['rg UserService; echo done', 'UserService'],
+    ['rg UserService&& echo done', 'UserService'],
+    ['rg --max-count 100 UserService src/', 'UserService'],
+    ['grep -r UserService src/', 'UserService'],
+    ['rg --replace x UserService src/', 'UserService'],
+    ['git grep UserService src/', 'UserService'],
+  ])('extracts %j from %j', (command, expected) => {
+    expect(parseRgGrepPattern(command)).toBe(expected);
+  });
+
+  it.each([
+    ['rg --regexp= src/'],
+    ['rg --regexp="" src/'],
+    ['rg -e x -- LongPattern src/'],
+    ['rg -f patterns.txt src/'],
+    ['rg --file=patterns.txt src/'],
+    ['rg -eab src/'],
+    ['sudo echo rg UserService src/'],
+  ])('extracts no pattern from %j', (command) => {
+    expect(parseRgGrepPattern(command)).toBeNull();
+  });
+
+  it('does not treat a path after a short explicit pattern as the pattern', () => {
+    expect(parseRgGrepPattern('rg -e x src/')).toBeNull();
+  });
+
+  it('keeps single-token quoted patterns intact', () => {
+    expect(parseRgGrepPattern('rg "validateUser"')).toBe('validateUser');
+  });
+
+  it('keeps backslashes in unquoted Windows paths but honours escaped spaces', () => {
+    expect(tokenizeShellWords(String.raw`C:\foo\bar`)).toEqual([String.raw`C:\foo\bar`]);
+    expect(tokenizeShellWords('User\\ Service')).toEqual(['User Service']);
+    expect(tokenizeShellWords('trailing\\')).toEqual(['trailing\\']);
+  });
+
+  it('splits unquoted shell operators from adjacent arguments', () => {
+    expect(tokenizeShellWords('rg UserService; echo done')).toEqual([
+      'rg',
+      'UserService',
+      ';',
+      'echo',
+      'done',
+    ]);
+    expect(tokenizeShellWords("rg 'UserService; echo done'")).toEqual([
+      'rg',
+      'UserService; echo done',
+    ]);
   });
 });
 
@@ -429,6 +1216,7 @@ describe('Cursor integration install docs', () => {
     const body = fs.readFileSync(integrationReadme, 'utf-8');
     expect(body).toContain('.cursor/hooks.json');
     expect(body).toContain('hooks/gitnexus-hook.cjs');
+    expect(body).toContain('hooks/hook-lock.cjs');
     expect(body).toContain('Hook install');
   });
 

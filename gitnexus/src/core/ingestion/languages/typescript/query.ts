@@ -33,9 +33,8 @@
  *     same identifier also binds as a parameter in the constructor scope
  *     via the normal `required_parameter` → `@type-binding.parameter` path.
  *   - **Enum** — dual type+value. Emits `@scope.class` (enum body contains
- *     member declarations) + `@declaration.enum`. Members are captured as
- *     `@declaration.property` via the generic property_identifier pattern
- *     inside enum_body.
+ *     member declarations) + `@declaration.enum`. Enum member names
+ *     are captured via `enum_assignment` (see below).
  *
  * Node types pinned via `scripts/_probe_typescript_grammar.ts`:
  *   internal_module, namespace_export, namespace_import, import_specifier,
@@ -52,7 +51,12 @@
  */
 
 import Parser from 'tree-sitter';
+import { unboundCallableQuery } from './unbound-callables.js';
 import TS from 'tree-sitter-typescript';
+import {
+  ARRAY_METHOD_NOT_ANY_OF_PREDICATE,
+  DEFAULT_EXPORT_IDENTIFIER_NOT_ANY_OF_PREDICATE,
+} from '../../ts-js-hoc-utils.js';
 
 // tree-sitter-typescript exports both `typescript` and `tsx` grammars on
 // the default export. The package's `.d.ts` types the default export
@@ -75,7 +79,8 @@ function isTsxFile(filePath: string): boolean {
   return filePath.endsWith('.tsx');
 }
 
-const TYPESCRIPT_SCOPE_QUERY = `
+export const TYPESCRIPT_SCOPE_QUERY = `
+${unboundCallableQuery('declaration.function')}
 ;; Scopes — module / namespace / class-likes / function-likes
 (program) @scope.module
 
@@ -85,15 +90,59 @@ const TYPESCRIPT_SCOPE_QUERY = `
 (abstract_class_declaration) @scope.class
 (interface_declaration) @scope.class
 (enum_declaration) @scope.class
+;; Class expressions: const Foo = class { ... } / const Foo = class Named { ... }.
+;; tree-sitter-typescript uses (class) (NOT class_expression) -- same node
+;; name as tree-sitter-javascript. The name field is optional (anonymous
+;; class expressions omit it); ScopeExtractor tolerates missing names.
+(class) @scope.class
 
-(function_declaration) @scope.function
-(generator_function_declaration) @scope.function
-(function_signature) @scope.function
-(method_definition) @scope.function
-(method_signature) @scope.function
-(abstract_method_signature) @scope.function
+;; \`@receiver-owner.this\` marks a scope that BINDS its own \`this\` rather
+;; than inheriting one (#2701) — see \`Scope.ownsReceivers\`. Every function
+;; form except \`arrow_function\` carries it: ECMA-262 gives an arrow
+;; \`[[ThisMode]] = lexical\` (no \`this\` in its environment record, so the
+;; lookup passes through), while every other form binds \`this\` at call time.
+;; \`method_definition\` is marked too and is unaffected — it also carries a
+;; synthesized \`this\` typeBinding, which the walk consults first.
+;; The marker rides on the same node as \`@scope.function\`; it is outside the
+;; \`@scope.\` namespace so \`anchorCaptureFor\` cannot mistake it for the anchor.
+(function_declaration) @scope.function @receiver-owner.this
+(generator_function_declaration) @scope.function @receiver-owner.this
+(function_signature) @scope.function @receiver-owner.this
+(method_definition) @scope.function @receiver-owner.this
+(method_signature) @scope.function @receiver-owner.this
+(abstract_method_signature) @scope.function @receiver-owner.this
 (arrow_function) @scope.function
-(function_expression) @scope.function
+(function_expression) @scope.function @receiver-owner.this
+;; \`function*(){}\` as an EXPRESSION. Absent from this list before #2701, so it
+;; was not a scope at all and \`this\` inside one read as the enclosing method's.
+(generator_function) @scope.function @receiver-owner.this
+
+;; Object literals (the { ... } value expression, NOT object_type or
+;; object_pattern) get their own scope boundary. Without it, a
+;; method_definition/property-arrow's auto-hoist (scope-extractor.ts)
+;; has nowhere to stop and leaks the name past the literal into whatever
+;; lexically encloses it -- e.g. 'export default { async fetch(req) {} }'
+;; would bind fetch at Module scope, letting an unrelated same-file
+;; fetch(...) call (the platform global) incorrectly resolve to it
+;; (#2545). Object (not Block or Class): object-literal members are
+;; reachable only via property access, never as bare identifiers -- not
+;; even by a SIBLING property's function body, unlike a real Block
+;; (if/for/while, where a nested closure legitimately sees a sibling
+;; let/const) or a Class (implicit-this sibling dispatch). Scope-chain
+;; walkers (scope-resolution/scope/walkers.ts) skip an Object scope's
+;; own bindings entirely while still treating it as a hoist boundary
+;; (#2551).
+(object) @scope.object
+
+;; Statement blocks are BINDING scopes (#2699). ECMAScript gives every block its
+;; own environment record, so \`let\`/\`const\`/\`class\`/\`function\` declared in
+;; sibling blocks of one function are DIFFERENT bindings — without this the
+;; resolver sees both as function-level and a call in one branch resolves to
+;; both. \`tsBindingScopeFor\` already implements the other half of the rule:
+;; \`var\` hoists past blocks to the enclosing Function/Module, \`let\`/\`const\`
+;; take the innermost scope, which is now the block.
+(statement_block) @scope.block
+
 
 ;; Type aliases that contain an object_type are structurally class-like —
 ;; they define a shape with named members. Emit @scope.class so the
@@ -103,30 +152,49 @@ const TYPESCRIPT_SCOPE_QUERY = `
   value: (object_type)) @scope.class
 
 ;; Declarations — types
+;; The type-parameter list is captured with \`?\` rather than as a second
+;; pattern: a separate rule would make a GENERIC declaration match twice, and
+;; both matches mint the same def id (filePath+range+type+name), so which one
+;; survived — the one carrying the parameters or the one without — would be
+;; decided by match order. An optional child keeps it at one match either way.
 (class_declaration
-  name: (type_identifier) @declaration.name) @declaration.class
+  name: (type_identifier) @declaration.name
+  type_parameters: (type_parameters)? @declaration.type-parameters) @declaration.class
+
+(class
+  name: (type_identifier) @declaration.name
+  type_parameters: (type_parameters)? @declaration.type-parameters) @declaration.class @class.expression
 
 (abstract_class_declaration
-  name: (type_identifier) @declaration.name) @declaration.class
+  name: (type_identifier) @declaration.name
+  type_parameters: (type_parameters)? @declaration.type-parameters) @declaration.class
 
 (interface_declaration
-  name: (type_identifier) @declaration.name) @declaration.interface
+  name: (type_identifier) @declaration.name
+  type_parameters: (type_parameters)? @declaration.type-parameters) @declaration.interface
 
 (enum_declaration
   name: (identifier) @declaration.name) @declaration.enum
 
+;; Tagged @declaration.type_alias, NOT @declaration.type: normalizeNodeLabel
+;; accepts typealias / type_alias and has no "type" case, so the old tag mapped
+;; to no label and TypeScript aliases produced NO scope-resolution def at all.
+;; Kotlin and Dart already spell it this way.
 (type_alias_declaration
-  name: (type_identifier) @declaration.name) @declaration.type
+  name: (type_identifier) @declaration.name
+  type_parameters: (type_parameters)? @declaration.type-parameters) @declaration.type_alias
 
 (internal_module
   name: (identifier) @declaration.name) @declaration.namespace
 
 ;; Declarations — methods / functions / constructors
 (function_declaration
-  name: (identifier) @declaration.name) @declaration.function
+  name: (identifier) @declaration.name
+  type_parameters: (type_parameters)? @declaration.type-parameters) @declaration.function
 
 (generator_function_declaration
-  name: (identifier) @declaration.name) @declaration.function
+  name: (identifier) @declaration.name
+  type_parameters: (type_parameters)? @declaration.type-parameters) @declaration.function
 
 ;; Function overload signatures (declaration-only; body in a separate
 ;; function_declaration). Extractors dedup by (name, parameterTypes).
@@ -158,6 +226,12 @@ const TYPESCRIPT_SCOPE_QUERY = `
     name: (identifier) @declaration.name
     value: (function_expression) @declaration.function))
 
+;; Generator expressions have the same callable binding and scope anchor.
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @declaration.name
+    value: (generator_function) @declaration.function))
+
 (variable_declaration
   (variable_declarator
     name: (identifier) @declaration.name
@@ -167,6 +241,56 @@ const TYPESCRIPT_SCOPE_QUERY = `
   (variable_declarator
     name: (identifier) @declaration.name
     value: (function_expression) @declaration.function))
+
+(variable_declaration
+  (variable_declarator
+    name: (identifier) @declaration.name
+    value: (generator_function) @declaration.function))
+
+;; CJS property-assignment exports (#2723) — see the matching block in
+;; \`languages/javascript/query.ts\` for the rationale. Mirrored here because
+;; \`.ts\` files in a CommonJS package use the same form, and because the JS
+;; provider delegates several hooks to these TypeScript counterparts.
+;; One pattern per receiver form, RHS forms folded into an inner LEAF
+;; alternation — see the matching note in \`languages/javascript/query.ts\` for
+;; why that shape is safe under the tree-sitter 0.21.1 alternation hazard.
+(assignment_expression
+  left: (member_expression
+    object: (identifier) @_cjs.receiver
+    property: (property_identifier) @declaration.name)
+  right: [
+    (arrow_function)
+    (function_expression)
+    (generator_function)
+  ] @declaration.function)
+
+;; \`this.X = fn\` at MODULE level of a CommonJS file — there \`this\` IS
+;; \`module.exports\`, so this declares an export. Pruned emit-side for ESM
+;; files (where top-level \`this\` is undefined) and for a \`this\` inside a
+;; function, which is an instance member rather than an export.
+(assignment_expression
+  left: (member_expression
+    object: (this)
+    property: (property_identifier) @declaration.name)
+  right: [
+    (arrow_function)
+    (function_expression)
+    (generator_function)
+  ] @declaration.function)
+
+(assignment_expression
+  left: (member_expression
+    object: (member_expression
+      object: (identifier) @_cjs.module
+      property: (property_identifier) @_cjs.exports)
+    property: (property_identifier) @declaration.name)
+  right: [
+    (arrow_function)
+    (function_expression)
+    (generator_function)
+  ] @declaration.function
+  (#eq? @_cjs.module "module")
+  (#eq? @_cjs.exports "exports"))
 
 ;; Object-property arrows / function expressions named by their pair key:
 ;; \`{ addItem: (item) => ..., removeItem: (item) => ... }\`. The legacy
@@ -214,6 +338,211 @@ const TYPESCRIPT_SCOPE_QUERY = `
   key: (string (string_fragment) @declaration.name)
   value: (function_expression) @declaration.function)
 
+;; HOC-wrapped pair values: create: procedure.mutation(async ({ input }) => { ... }).
+;; tRPC, Express route definitions, and similar frameworks use this pattern where
+;; an object property's value is a call_expression (like .mutation()/.query()) that
+;; wraps an arrow_function or function_expression as a callback argument.
+;; Without these patterns, tRPC procedures are invisible — the arrow registers as
+;; anonymous and all calls inside fall back to file-level attribution.
+;;
+;; AST shape:
+;;   pair
+;;     key: property_identifier "create"
+;;     value: call_expression
+;;       function: identifier | member_expression
+;;       arguments: arguments
+;;         arrow_function | function_expression
+;;
+;; Anchor discipline: same as direct pairs — on the inner arrow/function, not
+;; the outer call_expression. The arrow's range matches its @scope.function range,
+;; so pass2AttachDeclarations auto-hoists the binding to the parent scope.
+((pair
+  key: (property_identifier) @declaration.name
+  value: (call_expression
+    function: (identifier) @hoc
+    arguments: (arguments
+      (arrow_function) @declaration.function)))
+  ${DEFAULT_EXPORT_IDENTIFIER_NOT_ANY_OF_PREDICATE})
+
+((pair
+  key: (property_identifier) @declaration.name
+  value: (call_expression
+    function: (identifier) @hoc
+    arguments: (arguments
+      (function_expression) @declaration.function)))
+  ${DEFAULT_EXPORT_IDENTIFIER_NOT_ANY_OF_PREDICATE})
+
+; Member-expression variants exclude callback-taking array methods —
+; '{ visible: items.filter(item => item.active) }' is a value holding an
+; array, not a Function — same exclusion as the HOC variable rules below.
+((pair
+  key: (property_identifier) @declaration.name
+  value: (call_expression
+    function: (member_expression
+      property: (property_identifier) @callee)
+    arguments: (arguments
+      (arrow_function) @declaration.function)))
+  ${ARRAY_METHOD_NOT_ANY_OF_PREDICATE})
+
+((pair
+  key: (property_identifier) @declaration.name
+  value: (call_expression
+    function: (member_expression
+      property: (property_identifier) @callee)
+    arguments: (arguments
+      (function_expression) @declaration.function)))
+  ${ARRAY_METHOD_NOT_ANY_OF_PREDICATE})
+
+;; String-key pair variants: { 'create': procedure.mutation(async () => ...) }.
+;; Quoted object keys are identical shapes to the identifier-key pairs above —
+;; a tRPC router that quotes its keys (lint-enforced or JSON-ish style) would
+;; otherwise leave its procedures anonymous and file-level attributed.
+;; Quoted-key identifier callees ({ 'handler': wrap(() => {}) }) match these
+;; string-key rules, not the identifier-key block above; member-expression
+;; callees keep the array-method exclusion.
+((pair
+  key: (string (string_fragment) @declaration.name)
+  value: (call_expression
+    function: (identifier) @hoc
+    arguments: (arguments
+      (arrow_function) @declaration.function)))
+  ${DEFAULT_EXPORT_IDENTIFIER_NOT_ANY_OF_PREDICATE})
+
+((pair
+  key: (string (string_fragment) @declaration.name)
+  value: (call_expression
+    function: (identifier) @hoc
+    arguments: (arguments
+      (function_expression) @declaration.function)))
+  ${DEFAULT_EXPORT_IDENTIFIER_NOT_ANY_OF_PREDICATE})
+
+((pair
+  key: (string (string_fragment) @declaration.name)
+  value: (call_expression
+    function: (member_expression
+      property: (property_identifier) @callee)
+    arguments: (arguments
+      (arrow_function) @declaration.function)))
+  ${ARRAY_METHOD_NOT_ANY_OF_PREDICATE})
+
+((pair
+  key: (string (string_fragment) @declaration.name)
+  value: (call_expression
+    function: (member_expression
+      property: (property_identifier) @callee)
+    arguments: (arguments
+      (function_expression) @declaration.function)))
+  ${ARRAY_METHOD_NOT_ANY_OF_PREDICATE})
+
+;; Curried pair HOC: create: publicProcedure.mutation(withAuth(async () => {})).
+;; Existing pair-HOC rules require the arrow to be a DIRECT argument of the
+;; pair's call_expression. They miss mutation's argument being another
+;; call_expression (withAuth(...)). Object-pair only — do NOT add a
+;; variable-level nested-HOC rule (\`const X = memo(forwardRef(...))\` must
+;; stay a Variable; see typescript-hoc-wrapped.test.ts).
+;;
+;; AST shape:
+;;   pair
+;;     key: property_identifier | string
+;;     value: call_expression
+;;       function: identifier | member_expression
+;;       arguments: arguments
+;;         call_expression
+;;           function: identifier
+;;           arguments: arguments
+;;             arrow_function | function_expression
+((pair
+  key: (property_identifier) @declaration.name
+  value: (call_expression
+    function: (identifier) @hoc
+    arguments: (arguments
+      (call_expression
+        function: (identifier)
+        arguments: (arguments
+          (arrow_function) @declaration.function)))))
+  ${DEFAULT_EXPORT_IDENTIFIER_NOT_ANY_OF_PREDICATE})
+
+((pair
+  key: (property_identifier) @declaration.name
+  value: (call_expression
+    function: (identifier) @hoc
+    arguments: (arguments
+      (call_expression
+        function: (identifier)
+        arguments: (arguments
+          (function_expression) @declaration.function)))))
+  ${DEFAULT_EXPORT_IDENTIFIER_NOT_ANY_OF_PREDICATE})
+
+((pair
+  key: (property_identifier) @declaration.name
+  value: (call_expression
+    function: (member_expression
+      property: (property_identifier) @callee)
+    arguments: (arguments
+      (call_expression
+        function: (identifier)
+        arguments: (arguments
+          (arrow_function) @declaration.function)))))
+  ${ARRAY_METHOD_NOT_ANY_OF_PREDICATE})
+
+((pair
+  key: (property_identifier) @declaration.name
+  value: (call_expression
+    function: (member_expression
+      property: (property_identifier) @callee)
+    arguments: (arguments
+      (call_expression
+        function: (identifier)
+        arguments: (arguments
+          (function_expression) @declaration.function)))))
+  ${ARRAY_METHOD_NOT_ANY_OF_PREDICATE})
+
+((pair
+  key: (string (string_fragment) @declaration.name)
+  value: (call_expression
+    function: (identifier) @hoc
+    arguments: (arguments
+      (call_expression
+        function: (identifier)
+        arguments: (arguments
+          (arrow_function) @declaration.function)))))
+  ${DEFAULT_EXPORT_IDENTIFIER_NOT_ANY_OF_PREDICATE})
+
+((pair
+  key: (string (string_fragment) @declaration.name)
+  value: (call_expression
+    function: (identifier) @hoc
+    arguments: (arguments
+      (call_expression
+        function: (identifier)
+        arguments: (arguments
+          (function_expression) @declaration.function)))))
+  ${DEFAULT_EXPORT_IDENTIFIER_NOT_ANY_OF_PREDICATE})
+
+((pair
+  key: (string (string_fragment) @declaration.name)
+  value: (call_expression
+    function: (member_expression
+      property: (property_identifier) @callee)
+    arguments: (arguments
+      (call_expression
+        function: (identifier)
+        arguments: (arguments
+          (arrow_function) @declaration.function)))))
+  ${ARRAY_METHOD_NOT_ANY_OF_PREDICATE})
+
+((pair
+  key: (string (string_fragment) @declaration.name)
+  value: (call_expression
+    function: (member_expression
+      property: (property_identifier) @callee)
+    arguments: (arguments
+      (call_expression
+        function: (identifier)
+        arguments: (arguments
+          (function_expression) @declaration.function)))))
+  ${ARRAY_METHOD_NOT_ANY_OF_PREDICATE})
+
 ;; HOC-wrapped variable declarations: \`const X = HOC((args) => { ... })\`.
 ;;
 ;; Covers the dominant React UI idiom (\`React.forwardRef\`, \`React.memo\`,
@@ -250,20 +579,22 @@ const TYPESCRIPT_SCOPE_QUERY = `
 ;; that promotes the binding to the parent scope (where \`const X\`
 ;; lives).
 ;;
-;; Trade-off — chained array-method form: \`const x = arr.find((y) => p(y))\`
-;; has the same syntactic shape and would also match, naming the
-;; \`.find\` callback as \`x\`. The resulting \`Function:x\` is mostly
-;; harmless: \`x\` is consumed as a value (\`if (x) { ... }\`), never
-;; invoked as a function, so it gets zero incoming \`CALLS\` edges. The
-;; one outgoing edge \`Function:x → p\` is a minor mis-attribution that
-;; could in principle be fixed by adding a \`function: [(identifier)
-;; (member_expression)]\` predicate that excludes property-identifiers
-;; matching a known array-method blocklist (\`map\` / \`filter\` / \`find\`
-;; / \`reduce\` / \`forEach\` / \`some\` / \`every\`). We don't do that here
-;; because (a) the false-positive cost is negligible, (b) the blocklist
-;; would need maintenance, and (c) any user-defined fluent-API method
-;; with a callback argument would still false-positive — there's no
-;; clean syntactic line.
+;; #1876 — chained array-method form: \`const x = arr.find((y) => p(y))\`
+;; has the same syntactic shape and matches here too, naming the
+;; \`.find\` callback as \`x\`. Because \`x\` holds a value (the method
+;; result), not a callable, the spurious \`Function:x\` def is dropped
+;; emit-side in captures.ts: \`isArrayMethodCallbackArrow\` skips any
+;; \`@declaration.function\` whose enclosing call has a member-expression
+;; callee with a known Array-method property (\`ARRAY_CALLBACK_METHODS\`:
+;; \`map\` / \`filter\` / \`find\` / \`reduce\` / \`forEach\` / \`some\` /
+;; \`every\` / …). Only the \`@declaration.variable\` survives, so the
+;; binding is a single value def and calls inside the callback attribute
+;; to the enclosing scope rather than \`Function:x\`.
+;;
+;; Residual (intentional): a user-defined fluent-API method with a
+;; callback (\`qb.where(x => …)\`) is NOT in the blocklist and still
+;; classifies as \`Function\` — there's no clean syntactic line beyond
+;; the well-known Array surface, so the set is closed and easy to extend.
 ;;
 ;; Trade-off — multi-arrow arguments: \`const x = call(arrow1, arrow2)\`
 ;; would emit TWO matches with the same name \`x\`. tree-sitter-query
@@ -275,10 +606,16 @@ const TYPESCRIPT_SCOPE_QUERY = `
 ;; via \`(filePath, type, qualifiedName)\` — second wins. Acceptable;
 ;; multi-arrow-callback APIs are rare (\`new Promise(executor)\` is the
 ;; main one and takes a single executor).
+;;
+;; NOTE: Split into identifier vs member_expression patterns. Member
+;; expressions are filtered with a blocklist of common array methods
+;; (map, filter, reduce, etc.) to avoid false positives like
+;; \`const x = arr.map(a => ...)\` being classified as Function.
 (lexical_declaration
   (variable_declarator
     name: (identifier) @declaration.name
     value: (call_expression
+      function: (identifier)
       arguments: (arguments
         (arrow_function) @declaration.function))))
 
@@ -286,13 +623,35 @@ const TYPESCRIPT_SCOPE_QUERY = `
   (variable_declarator
     name: (identifier) @declaration.name
     value: (call_expression
+      function: (identifier)
       arguments: (arguments
         (function_expression) @declaration.function))))
+
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @declaration.name
+    value: (call_expression
+      function: (member_expression
+        property: (property_identifier) @callee)
+      arguments: (arguments
+        (arrow_function) @declaration.function)))
+  ${ARRAY_METHOD_NOT_ANY_OF_PREDICATE})
+
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @declaration.name
+    value: (call_expression
+      function: (member_expression
+        property: (property_identifier) @callee)
+      arguments: (arguments
+        (function_expression) @declaration.function)))
+  ${ARRAY_METHOD_NOT_ANY_OF_PREDICATE})
 
 (variable_declaration
   (variable_declarator
     name: (identifier) @declaration.name
     value: (call_expression
+      function: (identifier)
       arguments: (arguments
         (arrow_function) @declaration.function))))
 
@@ -300,10 +659,68 @@ const TYPESCRIPT_SCOPE_QUERY = `
   (variable_declarator
     name: (identifier) @declaration.name
     value: (call_expression
+      function: (identifier)
       arguments: (arguments
         (function_expression) @declaration.function))))
+
+(variable_declaration
+  (variable_declarator
+    name: (identifier) @declaration.name
+    value: (call_expression
+      function: (member_expression
+        property: (property_identifier) @callee)
+      arguments: (arguments
+        (arrow_function) @declaration.function)))
+  ${ARRAY_METHOD_NOT_ANY_OF_PREDICATE})
+
+(variable_declaration
+  (variable_declarator
+    name: (identifier) @declaration.name
+    value: (call_expression
+      function: (member_expression
+        property: (property_identifier) @callee)
+      arguments: (arguments
+        (function_expression) @declaration.function)))
+  ${ARRAY_METHOD_NOT_ANY_OF_PREDICATE})
+
+;; HOC-wrapped default exports: \`export default defineEventHandler(async (e) => { ... })\`.
+;; The emit phase rewrites @declaration.name to a file-derived name so
+;; wrappers like \`defineEventHandler\` / \`React.memo\` do not collapse
+;; unrelated modules onto the same symbol name.
+((export_statement
+  value: (call_expression
+    function: (identifier) @hoc
+    arguments: (arguments
+      (arrow_function) @declaration.function)))
+  ${DEFAULT_EXPORT_IDENTIFIER_NOT_ANY_OF_PREDICATE})
+
+((export_statement
+  value: (call_expression
+    function: (identifier) @hoc
+    arguments: (arguments
+      (function_expression) @declaration.function)))
+  ${DEFAULT_EXPORT_IDENTIFIER_NOT_ANY_OF_PREDICATE})
+
+((export_statement
+  value: (call_expression
+    function: (member_expression
+      property: (property_identifier) @callee)
+    arguments: (arguments
+      (arrow_function) @declaration.function)))
+  ${ARRAY_METHOD_NOT_ANY_OF_PREDICATE})
+
+((export_statement
+  value: (call_expression
+    function: (member_expression
+      property: (property_identifier) @callee)
+    arguments: (arguments
+      (function_expression) @declaration.function)))
+  ${ARRAY_METHOD_NOT_ANY_OF_PREDICATE})
 
 ;; Method definitions — regular + private (#field) methods.
+;; These match inside both class_declaration and class (class expression)
+;; bodies. The @scope.class for class expressions (see (class) above)
+;; ensures methods inside class expressions get the correct Class scope parent.
 (method_definition
   name: (property_identifier) @declaration.name) @declaration.method
 
@@ -318,12 +735,63 @@ const TYPESCRIPT_SCOPE_QUERY = `
 (method_signature
   name: (property_identifier) @declaration.name) @declaration.method
 
+;; Members of a declared SHAPE — interface bodies and object-type aliases both
+;; spell them as property_signature (A4). The sibling method_signature rule
+;; above declared interface METHODS, so only properties were missing: a typed
+;; receiver resolved to the shape's scope and then found no member there, and
+;; the field's consumers were unreachable. TypeScript sets
+;; fieldFallbackOnMethodLookup:false, so there is no name-based safety net
+;; here — the precise path is the only one, and it needs the declaration.
+;; ANCHORED to declared shapes — see the matching rule in TYPESCRIPT_QUERIES
+;; for why. Unanchored this matched inline parameter and return types and
+;; nested object types, whose members then collided onto the enclosing
+;; class/interface/alias.
+(interface_body
+  (property_signature
+    name: (property_identifier) @declaration.name) @declaration.property)
+
+;; Object-literal keys of a NAMED object — the scope-resolution half of the
+;; matching rule in TYPESCRIPT_QUERIES. The parse query mints the Property NODE;
+;; this mints the DEF a precise read can resolve to.
+(variable_declarator
+  name: (identifier)
+  value: (object
+    (pair
+      key: (property_identifier) @declaration.name) @declaration.property))
+
+(variable_declarator
+  name: (identifier)
+  value: (call_expression
+    function: (member_expression
+      object: (identifier) @_ts.identity.obj
+      property: (property_identifier) @_ts.identity.fn)
+    arguments: (arguments
+      (object
+        (pair
+          key: (property_identifier) @declaration.name) @declaration.property)))
+  (#eq? @_ts.identity.obj "Object")
+  (#match? @_ts.identity.fn "^(freeze|seal|preventExtensions)$"))
+
+(type_alias_declaration
+  value: (object_type
+    (property_signature
+      name: (property_identifier) @declaration.name) @declaration.property))
+
 ;; Declarations — class fields
 (public_field_definition
   name: (property_identifier) @declaration.name) @declaration.property
 
 (public_field_definition
   name: (private_property_identifier) @declaration.name) @declaration.property
+
+;; Enum members: enum Color { Red, Green = 1, Blue }.
+;; Bare members (no value): Red, Blue — property_identifier inside enum_body.
+;; Members with value: Green = 1 — enum_assignment with name field.
+(enum_body
+  (property_identifier) @declaration.name) @declaration.property
+
+(enum_assignment
+  name: (_) @declaration.name) @declaration.property
 
 ;; Declarations — parameter properties: \`constructor(public name: string)\`.
 ;; The accessibility_modifier presence distinguishes these from regular
@@ -445,6 +913,26 @@ const TYPESCRIPT_SCOPE_QUERY = `
   pattern: (identifier) @type-binding.name
   type: (type_annotation
     (generic_type) @type-binding.type)) @type-binding.parameter
+
+(optional_parameter
+  pattern: (identifier) @type-binding.name
+  type: (type_annotation
+    (predefined_type) @type-binding.type)) @type-binding.parameter
+
+(optional_parameter
+  pattern: (identifier) @type-binding.name
+  type: (type_annotation
+    (union_type) @type-binding.type)) @type-binding.parameter
+
+(optional_parameter
+  pattern: (identifier) @type-binding.name
+  type: (type_annotation
+    (array_type) @type-binding.type)) @type-binding.parameter
+
+(optional_parameter
+  pattern: (identifier) @type-binding.name
+  type: (type_annotation
+    (readonly_type) @type-binding.type)) @type-binding.parameter
 
 ;; Type bindings — variable annotations: \`let u: User = ...\` / \`const u: User\`.
 (variable_declarator
@@ -625,12 +1113,11 @@ const TYPESCRIPT_SCOPE_QUERY = `
     function: (member_expression) @type-binding.type)) @type-binding.alias
 
 ;; Type bindings — for-of member-access iterable: \`for (const u of this.users)\`.
-;; Bind u to \`users\` (the attribute name); chain-follow resolves users
-;; via the enclosing class's field binding.
+;; Preserve the explicit receiver so class fields are resolved as members,
+;; without treating them as lexical names visible in method bodies.
 (for_in_statement
   left: (identifier) @type-binding.name
-  right: (member_expression
-    property: (property_identifier) @type-binding.type)) @type-binding.alias
+  right: (member_expression) @type-binding.type) @type-binding.alias
 
 ;; Type bindings — class field annotation: \`private city: City\`.
 (public_field_definition
@@ -672,6 +1159,40 @@ const TYPESCRIPT_SCOPE_QUERY = `
   name: (private_property_identifier) @type-binding.name
   type: (type_annotation
     (type_identifier) @type-binding.type)) @type-binding.annotation
+
+;; Type bindings — class field constructor-inferred: \`private p = new Outer()\`.
+;; The annotation patterns above cover a field that DECLARES its type; a field
+;; whose type must be inferred from its initializer matched nothing, so it had
+;; no typeBinding, so \`this.p\` could not be typed and the receiver fold declined
+;; the whole chain — losing even the first, ordinary named link (#2807).
+;;
+;; Anchored on \`public_field_definition\` exactly like the annotation patterns,
+;; so the binding lands in the same (class body) scope with no bindingScopeFor
+;; override. \`annotation\` outranks \`constructor-inferred\` in
+;; typeBindingStrength, so \`private p: Outer = new Outer()\` still resolves
+;; through its annotation regardless of which pattern matches first.
+;;
+;; Kotlin and Swift express both a local and a stored property with ONE grammar
+;; node (property_declaration) and so needed no separate field pattern; the
+;; TypeScript grammar splits them (variable_declarator vs
+;; public_field_definition), which is why only the local form was ever covered.
+(public_field_definition
+  name: (property_identifier) @type-binding.name
+  value: (new_expression
+    constructor: (identifier) @type-binding.type)) @type-binding.constructor
+
+;; Qualified: \`private p = new models.Outer()\` — mirrors the local form above;
+;; the member_expression's text is resolved via QualifiedNameIndex.
+(public_field_definition
+  name: (property_identifier) @type-binding.name
+  value: (new_expression
+    constructor: (member_expression) @type-binding.type)) @type-binding.constructor
+
+;; Private-name field: \`#p = new Outer()\`.
+(public_field_definition
+  name: (private_property_identifier) @type-binding.name
+  value: (new_expression
+    constructor: (identifier) @type-binding.type)) @type-binding.constructor
 
 ;; Type bindings — method return type: \`save(): User { … }\` / \`function f(): User { … }\`.
 ;; Function/method return-type is the type_annotation that is a direct
@@ -801,6 +1322,78 @@ const TYPESCRIPT_SCOPE_QUERY = `
   right: (new_expression
     constructor: (identifier) @type-binding.type)) @type-binding.constructor
 
+;; Type bindings — field assigned through \`this\`: \`this.p = new Outer()\` on a
+;; field that declares no type (#2807). The rebind pattern above only matches a
+;; bare identifier LHS, so an unannotated field assigned in the constructor had
+;; no typeBinding at all. (An ANNOTATED field does not need this — its
+;; annotation already types it, which is why \`private p: Outer;\` + the same
+;; assignment always resolved.)
+;;
+;; The nesting is the whole safety property. \`this.x = new Y()\` is a legal
+;; statement ANYWHERE, and the binding it produces is hoisted onto the nearest
+;; enclosing Class — so a context-free version of this pattern typed a class's
+;; field from an assignment whose \`this\` was some OTHER object, overwriting the
+;; field's real type (pass4CollectTypeBindings resolves a same-source tie in
+;; favour of the LATER match). Requiring the chain
+;; \`class_body → method_definition → statement_block → expression_statement\`
+;; makes the marker fire only where \`this\` provably IS an instance of the class
+;; the binding lands on. It rejects, in order of how easily each was hit:
+;; a non-arrow callback inside a method (\`function () { this.x = new Y(); }\` —
+;; \`this\` is the call's receiver), an object-literal method (also a
+;; \`method_definition\`, but under \`object\`, not \`class_body\`), and module top
+;; level (no enclosing Class at all, where the hoist used to fall back to the
+;; innermost scope and could overwrite a module local of the same name).
+;;
+;; This mirrors \`synthesizeConstructorFieldBindings\` in
+;; \`languages/javascript/captures.ts\`, which walks only \`method_definition\`
+;; bodies and only their DIRECT \`expression_statement\` children — the two
+;; languages must not read the same source differently. TypeScript accepts any
+;; method rather than only \`constructor\` (a later \`setUp()\` assignment types
+;; the field just as well), which is the one intended divergence.
+;;
+;; Two shapes are deliberately NOT matched, both erring toward no binding:
+;; an assignment nested in a block (\`if (…) { this.p = new Outer(); }\`) and one
+;; inside an arrow (\`() => { this.p = new Outer(); }\`, where \`this\` IS the
+;; instance). Both are only ever a MISSING binding, never a wrong one, and JS
+;; declines them too.
+;;
+;; \`@type-binding.this-field\` is a MARKER, not the anchor: it sits on the narrow
+;; \`(this)\` node, so anchorCaptureFor's broadest-range rule keeps the whole
+;; assignment_expression (@type-binding.constructor) as the anchor and the
+;; source stays \`constructor-inferred\`. tsBindingScopeFor reads the marker to
+;; hoist the binding onto the enclosing Class scope — without that hoist the
+;; binding would land on the method's own Function scope, where
+;; typeOfMemberOnClass never looks. The marker must stay specific to THIS
+;; pattern: hoisting every constructor-inferred binding would move method-local
+;; \`const o = new Outer()\` out of its own scope.
+;;
+;; One constraint the grammar cannot carry: \`static\` is an ANONYMOUS token on
+;; \`method_definition\` with no field name, and tree-sitter patterns cannot
+;; negate one. \`this\` in a static method is the class object, so that last
+;; wrong receiver is dropped by \`emitTsScopeCaptures\` instead.
+(class_body
+  (method_definition
+    body: (statement_block
+      (expression_statement
+        (assignment_expression
+          left: (member_expression
+            object: (this) @type-binding.this-field
+            property: (property_identifier) @type-binding.name)
+          right: (new_expression
+            constructor: (identifier) @type-binding.type)) @type-binding.constructor))))
+
+;; Qualified form: \`this.p = new models.Outer()\`.
+(class_body
+  (method_definition
+    body: (statement_block
+      (expression_statement
+        (assignment_expression
+          left: (member_expression
+            object: (this) @type-binding.this-field
+            property: (property_identifier) @type-binding.name)
+          right: (new_expression
+            constructor: (member_expression) @type-binding.type)) @type-binding.constructor))))
+
 (assignment_expression
   left: (identifier) @type-binding.name
   right: (call_expression
@@ -822,6 +1415,12 @@ const TYPESCRIPT_SCOPE_QUERY = `
 (call_expression
   function: (await_expression
     (identifier) @reference.name)) @reference.call.free
+
+;; NOTE: Curried applications f(x)(y) are deliberately NOT anchored here. The
+;; inner f(x) call is captured by the plain free-call pattern above; anchoring
+;; the outer application would record f as called with (y) — wrong arity and
+;; argument types for overload resolution (see free-call-fallback's
+;; site.arity / site.argumentTypes filtering).
 
 ;; References — member calls: \`obj.method()\` (includes optional chain).
 ;; The (_) wildcard matches any named receiver including \`this\` /
@@ -845,7 +1444,8 @@ const TYPESCRIPT_SCOPE_QUERY = `
   constructor: (identifier) @reference.name) @reference.call.constructor
 
 (new_expression
-  constructor: (member_expression) @reference.call.constructor.qualified) @reference.call.constructor
+  constructor: (member_expression
+    property: (property_identifier) @reference.name) @reference.call.constructor.qualified) @reference.call.constructor
 
 ;; References — write access: \`obj.field = value\`.
 (assignment_expression
@@ -868,6 +1468,85 @@ const TYPESCRIPT_SCOPE_QUERY = `
 (member_expression
   object: (_) @reference.receiver
   property: (property_identifier) @reference.name) @reference.read.member
+
+;; References — value position (#2437): a function identifier assigned as an
+;; object-literal property value (\`{ emitScopeCaptures: emitCppScopeCaptures }\`)
+;; or shorthand (\`{ emitHook }\`). Resolution keeps only callable targets
+;; (MethodRegistry), so plain-value pairs (\`{ port: DEFAULT_PORT }\`) emit
+;; nothing; the emitted edge is a reference-class USES (registration ≠
+;; invocation). \`@reference.property-key\` records the key so the
+;; property-dispatch pass can synthesize CALLS at \`x.<key>()\` sites; for
+;; shorthand the key IS the name (both tags on one node). Two separate
+;; patterns — never combined in \`[...]\` (tree-sitter 0.21 drops alternation
+;; siblings around predicates). Destructuring shorthand is a different node
+;; (\`shorthand_property_identifier_pattern\`), so \`const { a } = o\` cannot
+;; match; string/computed keys carry no \`property_identifier\` and register
+;; without a dispatch key.
+(pair
+  key: (property_identifier) @reference.property-key
+  value: (identifier) @reference.name @reference.value-ref)
+
+(object
+  (shorthand_property_identifier) @reference.name @reference.property-key @reference.value-ref)
+
+;; Bare-identifier reads (A2), VALUE POSITIONS ONLY — a blanket \`(identifier)\`
+;; rule would mint a site for every token in the file.
+;;
+;; These existed only in the JavaScript query, so A2 did not work for
+;; TypeScript AT ALL: a \`.ts\` module reading its own \`const\` by bare name
+;; produced no reference site, and "who uses this constant?" answered a
+;; confident zero for an entire language. Found by writing the namespace
+;; fixture below and watching it fail for the wrong reason.
+(arguments
+  (identifier) @reference.name @reference.read.identifier)
+
+(assignment_pattern
+  right: (identifier) @reference.name @reference.read.identifier)
+
+(return_statement
+  (identifier) @reference.name @reference.read.identifier)
+
+;; \`const next = LIMIT\` and \`n > LIMIT\` — both plainly value reads, and both
+;; named in review as gaps between what A2 claimed and what it matched.
+(variable_declarator
+  value: (identifier) @reference.name @reference.read.identifier)
+
+(binary_expression
+  left: (identifier) @reference.name @reference.read.identifier)
+
+(binary_expression
+  right: (identifier) @reference.name @reference.read.identifier)
+
+;; References — TYPE POSITION (R2-2). An annotation naming a declared type is
+;; the only thing that makes that type's declaration reachable from the code
+;; that depends on it, and TypeScript captured none: only cpp and csharp emitted
+;; type references at all. So an exported API-contract type owned its members
+;; (round 1) but had \`incoming: {}\`, and "what breaks if I remove this field?"
+;; — the question a contract type exists to answer — had no edge to walk.
+;;
+;; The resolution path was already complete on the other side:
+;; \`type-reference\` routes to the ClassRegistry, whose CLASS_KINDS already
+;; lists TypeAlias, Interface and Enum, and \`edges.ts\` already maps the kind to
+;; USES. Only the capture was missing.
+;;
+;; Anchored to the CONTEXTS a type is used in — annotations, type arguments,
+;; and heritage \`implements\` — never a bare \`(type_identifier)\`. A blanket rule
+;; would also match the identifier in \`type X = …\` and \`interface X\`, making
+;; every declaration a consumer of itself.
+(type_annotation
+  (type_identifier) @reference.name @reference.type_reference)
+
+(type_annotation
+  (generic_type
+    name: (type_identifier) @reference.name @reference.type_reference))
+
+(type_arguments
+  (type_identifier) @reference.name @reference.type_reference)
+
+;; \`x as SomeType\` / \`satisfies SomeType\` — an assertion is a claim ABOUT a
+;; declared type, so the code making it depends on that declaration.
+(as_expression
+  (type_identifier) @reference.name @reference.type_reference)
 `;
 
 /**
@@ -894,7 +1573,13 @@ const TYPESCRIPT_SCOPE_QUERY = `
  * (\`<Foo>...</Foo>\`) emit; the closing tag is intentionally NOT captured —
  * each JSX element should emit exactly one CALLS edge per use site.
  */
-const TSX_JSX_QUERY_SUFFIX = `
+/**
+ * Exported alongside `TYPESCRIPT_SCOPE_QUERY` so
+ * `value-ref-dispatchability.test.ts` checks the whole query a `.tsx` file is
+ * analyzed with. Checking the base alone would miss a `value-ref` rule added
+ * here. Not part of the provider surface — use `getTsScopeQuery`.
+ */
+export const TSX_JSX_QUERY_SUFFIX = `
 ;; <Foo />
 ((jsx_self_closing_element
   name: (identifier) @reference.name) @reference.call.free
@@ -970,17 +1655,17 @@ export function getTsScopeQuery(filePath?: string): Parser.Query {
 
 /**
  * Validate that a cached `Tree` was produced by the grammar matching
- * `filePath` (TSX vs TypeScript). The runtime tree-sitter `Tree` exposes
- * `getLanguage()` (returning the grammar object the parser was bound
- * to); the .d.ts is incomplete, so we reach via a cast. Identity
+ * `filePath` (TSX vs TypeScript). Native tree-sitter exposes `language`;
+ * other Tree implementations expose `getLanguage()`. The .d.ts is
+ * incomplete, so we reach via a cast. Identity
  * comparison against `TSX_GRAMMAR` / `TS_GRAMMAR` is exact: the same
- * module instance produces both. If `getLanguage` is unavailable for
+ * module instance produces both. If neither grammar accessor is available for
  * any reason, return true to keep behavior backwards-compatible (the
  * original code never validated grammar at all).
  */
 export function tsCachedTreeMatchesGrammar(tree: unknown, filePath: string): boolean {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const lang = (tree as any)?.getLanguage?.();
+  const lang = (tree as any)?.getLanguage?.() ?? (tree as any)?.language;
   if (lang === undefined || lang === null) return true;
   return isTsxFile(filePath) ? lang === TSX_GRAMMAR : lang === TS_GRAMMAR;
 }

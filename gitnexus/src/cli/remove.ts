@@ -1,9 +1,12 @@
 /**
  * Remove Command (#664)
  *
- * Delete the `.gitnexus/` index for a registered repo and unregister it
- * from the global registry (~/.gitnexus/registry.json). The target is
- * identified by alias / basename-derived name / remote-inferred name /
+ * Delete the `.gitnexus/` index directory for a registered repo (including
+ * both metadata filenames — gitnexus.json and its legacy meta.json mirror —
+ * which live inside it) and unregister it from the global registry
+ * (~/.gitnexus/registry.json).
+ *
+ * The target is identified by alias / basename-derived name / remote-inferred name /
  * absolute path — no `--repo` flag, just a positional argument so the
  * destructive-command ergonomics match `clean` (which is also
  * destructive but scoped to `process.cwd()`).
@@ -26,18 +29,21 @@
  *     here there is no pipeline, so no conflation.)
  */
 
-import fs from 'fs/promises';
+import {
+  reclaimAfterSlotRemoval,
+  removeCheckoutStorage,
+} from '../storage/shared-store-lifecycle.js';
 import { logger } from '../core/logger.js';
 import { cliError } from './cli-message.js';
+import { t } from './i18n/index.js';
 import {
   readRegistry,
   resolveRegistryEntry,
-  assertSafeStoragePath,
   unregisterRepo,
   RegistryNotFoundError,
   RegistryAmbiguousTargetError,
-  UnsafeStoragePathError,
 } from '../storage/repo-manager.js';
+import { requireDeletableStoragePath, StorageDeletionError } from '../storage/storage-resolver.js';
 
 export const removeCommand = async (target: string, options?: { force?: boolean }) => {
   // Read the registry snapshot once and pass it to the resolver — this
@@ -53,14 +59,14 @@ export const removeCommand = async (target: string, options?: { force?: boolean 
       // Idempotent: missing target is a no-op warning, not an error.
       // The `availableNames` hint comes from the error itself so users
       // can see what they might have meant.
-      logger.warn(`Nothing to remove: ${err.message}`);
+      logger.warn(t('remove.nothingToRemove', { message: err.message }));
       return;
     }
     if (err instanceof RegistryAmbiguousTargetError) {
       // Duplicate aliases are allowed via --allow-duplicate-name (#829);
       // refuse to guess which one the user meant — surface the full list
       // and exit non-zero so scripts don't silently pick the wrong repo.
-      cliError(`Error: ${err.message}`);
+      cliError(t('common.error', { message: err.message }));
       process.exit(1);
     }
     throw err;
@@ -69,26 +75,21 @@ export const removeCommand = async (target: string, options?: { force?: boolean 
   // Confirmation gate — same shape as `clean`. Default is a dry-run
   // that describes what would be deleted; `--force` actually deletes.
   if (!options?.force) {
-    console.log(`This will delete the GitNexus index for: ${entry.name}`);
-    console.log(`   Path:    ${entry.path}`);
-    console.log(`   Storage: ${entry.storagePath}`);
-    console.log('\nRun with --force to confirm deletion.');
+    console.log(t('remove.deleteTarget', { name: entry.name }));
+    console.log(`   ${t('common.path')}:    ${entry.path}`);
+    console.log(`   ${t('common.storage')}: ${entry.storagePath}`);
+    console.log(`\n${t('common.runForceConfirm')}`);
     return;
   }
 
-  // Safety guard (#1003 review — @magyargergo): refuse to proceed if
-  // the registry entry's `storagePath` isn't the canonical
-  // `<entry.path>/.gitnexus` subfolder. `~/.gitnexus/registry.json` is
-  // user-writable, so a corrupted or hand-edited entry could point
-  // storagePath at the repo root, an empty string (→ cwd), a parent
-  // dir, or anywhere else; `fs.rm(recursive: true, force: true)` on
-  // any of those would be a runtime disaster. Bail before touching
-  // disk, with an actionable hint for recovering a broken registry.
+  // Validate immediately before deletion. `--force` skips confirmation only;
+  // it does not bypass the ownership and dangerous-path checks.
+  let storagePath: string;
   try {
-    assertSafeStoragePath(entry);
+    storagePath = await requireDeletableStoragePath(entry);
   } catch (err) {
-    if (err instanceof UnsafeStoragePathError) {
-      cliError(`Error: ${err.message}`);
+    if (err instanceof StorageDeletionError) {
+      cliError(t('common.error', { message: err.message }));
       process.exit(1);
     }
     throw err;
@@ -100,14 +101,14 @@ export const removeCommand = async (target: string, options?: { force?: boolean 
   // orphaned — `listRegisteredRepos({ validate: true })` prunes those on
   // next read, so the failure is self-healing.
   try {
-    await fs.rm(entry.storagePath, { recursive: true, force: true });
-    await unregisterRepo(entry.path);
-    console.log(`Removed: ${entry.name}`);
-    console.log(`   Path:    ${entry.path}`);
-    console.log(`   Storage: ${entry.storagePath}`);
+    await removeCheckoutStorage(storagePath, () => unregisterRepo(entry.path), entry.path);
+    await reclaimAfterSlotRemoval(storagePath);
+    console.log(t('remove.removed', { name: entry.name }));
+    console.log(`   ${t('common.path')}:    ${entry.path}`);
+    console.log(`   ${t('common.storage')}: ${entry.storagePath}`);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    cliError(`Failed to remove ${entry.name}: ${msg}`, { err });
+    cliError(t('remove.failed', { name: entry.name, message: msg }), { err });
     process.exit(1);
   }
 };

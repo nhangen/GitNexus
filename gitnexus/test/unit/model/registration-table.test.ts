@@ -9,6 +9,11 @@ import { createTypeRegistry } from '../../../src/core/ingestion/model/type-regis
 import { createMethodRegistry } from '../../../src/core/ingestion/model/method-registry.js';
 import { createFieldRegistry } from '../../../src/core/ingestion/model/field-registry.js';
 import { ALL_NODE_LABELS } from '../../../src/core/ingestion/model/index.js';
+import {
+  CLASS_TYPES_TUPLE,
+  FREE_CALLABLE_TUPLE,
+} from '../../../src/core/ingestion/model/symbol-table.js';
+import { EMBEDDABLE_LABELS } from '../../../src/core/embeddings/types.js';
 import type { SymbolDefinition } from 'gitnexus-shared';
 import { makeDef as makeBaseDef } from './helpers.js';
 
@@ -73,9 +78,11 @@ describe('NodeLabel taxonomy coverage', () => {
     expect(CALLABLE_ONLY_LABELS.has('Delegate')).toBe(true);
   });
 
-  it('DISPATCH_LABELS includes all 10 routed kinds', () => {
+  it('DISPATCH_LABELS includes all 12 routed kinds', () => {
     const expected = [
       'Class',
+      'Protocol',
+      'Category',
       'Struct',
       'Interface',
       'Enum',
@@ -102,6 +109,30 @@ describe('NodeLabel taxonomy coverage', () => {
 });
 
 // ---------------------------------------------------------------------------
+// BasicBlock — taint/PDG substrate node (issue #2080). It is a control-flow
+// node, never a symbol-resolution or embedding target (KTD4). These guards
+// fail if a future change accidentally promotes it into a dispatch/callable
+// tuple or the embeddable set.
+// ---------------------------------------------------------------------------
+
+describe('BasicBlock taint/PDG substrate label (issue #2080)', () => {
+  it('is classified inert — not a dispatch or callable resolution target', () => {
+    expect(INERT_LABELS.has('BasicBlock')).toBe(true);
+    expect(DISPATCH_LABELS.has('BasicBlock')).toBe(false);
+    expect(CALLABLE_ONLY_LABELS.has('BasicBlock')).toBe(false);
+  });
+
+  it('is excluded from the class-like and free-callable tuples', () => {
+    expect((CLASS_TYPES_TUPLE as readonly string[]).includes('BasicBlock')).toBe(false);
+    expect((FREE_CALLABLE_TUPLE as readonly string[]).includes('BasicBlock')).toBe(false);
+  });
+
+  it('is not embeddable', () => {
+    expect((EMBEDDABLE_LABELS as readonly string[]).includes('BasicBlock')).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Behavior group coverage — every label in a behavior group routes to the
 // group's registry write, regardless of how hooks are implemented (shared
 // closure, per-label closure, etc.). These tests survive an internal
@@ -109,8 +140,17 @@ describe('NodeLabel taxonomy coverage', () => {
 // reference-equality assertions on the hook functions themselves.
 // ---------------------------------------------------------------------------
 
-describe('class-like behavior group — all 6 labels route to types.registerClass', () => {
-  const CLASS_LIKE_LABELS = ['Class', 'Struct', 'Interface', 'Enum', 'Record', 'Trait'] as const;
+describe('class-like behavior group — all 8 labels route to types.registerClass', () => {
+  const CLASS_LIKE_LABELS = [
+    'Class',
+    'Protocol',
+    'Category',
+    'Struct',
+    'Interface',
+    'Enum',
+    'Record',
+    'Trait',
+  ] as const;
 
   for (const label of CLASS_LIKE_LABELS) {
     it(`${label} writes to types.registerClass`, () => {
@@ -160,13 +200,16 @@ describe('behavior group isolation', () => {
     expect(deps.fields.lookupFieldByOwner('unrelated', 'User')).toBeUndefined();
   });
 
-  it('Impl hooks write to types.registerImpl, never to types.registerClass', () => {
+  it('keeps an existing Class separate from a same-name Impl', () => {
     const deps = makeDeps();
     const table = createRegistrationTable(deps);
-    const def = makeDef({ nodeId: 'impl:User', type: 'Impl' });
-    table.get('Impl')!('User', def);
-    expect(deps.types.lookupImplByName('User')).toHaveLength(1);
-    expect(deps.types.lookupClassByName('User')).toHaveLength(0);
+    const classDef = makeDef({ nodeId: 'class:User', type: 'Class', qualifiedName: 'app.User' });
+    const implDef = makeDef({ nodeId: 'impl:User', type: 'Impl' });
+    table.get('Class')!('User', classDef);
+    table.get('Impl')!('User', implDef);
+    expect(deps.types.lookupClassByName('User')).toEqual([classDef]);
+    expect(deps.types.lookupClassByQualifiedName('app.User')).toEqual([classDef]);
+    expect(deps.types.lookupImplByName('User')).toEqual([implDef]);
   });
 });
 

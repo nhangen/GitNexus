@@ -1,4 +1,5 @@
 import type { FTSIndexDef } from '../helpers/test-indexed-db.js';
+import { FTS_INDEXES } from '../../src/core/search/fts-schema.js';
 
 export const LOCAL_BACKEND_SEED_DATA = [
   // Files
@@ -35,6 +36,12 @@ export const LOCAL_BACKEND_SEED_DATA = [
    CREATE (a)-[:CodeRelation {type: 'STEP_IN_PROCESS', confidence: 1.0, reason: '', step: 1}]->(p)`,
   `MATCH (a:Function), (p:Process) WHERE a.id = 'func:validate' AND p.id = 'proc:login-flow'
    CREATE (a)-[:CodeRelation {type: 'STEP_IN_PROCESS', confidence: 1.0, reason: '', step: 2}]->(p)`,
+  // func:validate is the terminalId of proc:beta-flow too — wiring its second
+  // STEP_IN_PROCESS edge makes it a genuine MULTI-process symbol, which the
+  // batched-query test uses to exercise the full row[1..6] positional shift
+  // (a single-process symbol can't expose an off-by-one in those fallbacks).
+  `MATCH (a:Function), (p:Process) WHERE a.id = 'func:validate' AND p.id = 'proc:beta-flow'
+   CREATE (a)-[:CodeRelation {type: 'STEP_IN_PROCESS', confidence: 1.0, reason: '', step: 3}]->(p)`,
   `MATCH (h:Function), (t:Tool) WHERE h.id = 'func:alpha' AND t.id = 'Tool:alpha'
    CREATE (h)-[:CodeRelation {type: 'HANDLES_TOOL', confidence: 1.0, reason: 'tool-definition', step: 0}]->(t)`,
   `MATCH (h:Function), (t:Tool) WHERE h.id = 'func:beta' AND t.id = 'Tool:beta'
@@ -54,9 +61,8 @@ export const LOCAL_BACKEND_SEED_DATA = [
    CREATE (c)-[:CodeRelation {type: 'HAS_METHOD', confidence: 1.0, reason: 'class-method', step: 0}]->(m)`,
 ];
 
-export const LOCAL_BACKEND_FTS_INDEXES: FTSIndexDef[] = [
-  { table: 'Function', indexName: 'function_fts', columns: ['name', 'content', 'description'] },
-  { table: 'Class', indexName: 'class_fts', columns: ['name', 'content', 'description'] },
-  { table: 'Method', indexName: 'method_fts', columns: ['name', 'content', 'description'] },
-  { table: 'File', indexName: 'file_fts', columns: ['name', 'content'] },
-];
+// Healthy-backend fixtures must mirror the complete configured search index set.
+// The old four-table subset is now correctly reported as partial FTS coverage.
+export const LOCAL_BACKEND_FTS_INDEXES: FTSIndexDef[] = FTS_INDEXES.map(
+  ({ table, indexName, properties }) => ({ table, indexName, columns: [...properties] }),
+);

@@ -3,11 +3,14 @@
  *
  * Type definitions for the embedding generation and semantic search system.
  */
+import type { AnalysisPhaseProgress } from '../analysis-progress.js';
 
 export const LABEL_FUNCTION = 'Function' as const;
 export const LABEL_METHOD = 'Method' as const;
 export const LABEL_CONSTRUCTOR = 'Constructor' as const;
 export const LABEL_CLASS = 'Class' as const;
+export const LABEL_PROTOCOL = 'Protocol' as const;
+export const LABEL_CATEGORY = 'Category' as const;
 export const LABEL_INTERFACE = 'Interface' as const;
 export const LABEL_STRUCT = 'Struct' as const;
 export const LABEL_ENUM = 'Enum' as const;
@@ -53,6 +56,8 @@ export const CHUNKABLE_LABELS = [
   LABEL_METHOD,
   LABEL_CONSTRUCTOR,
   LABEL_CLASS,
+  LABEL_PROTOCOL,
+  LABEL_CATEGORY,
   LABEL_INTERFACE,
   LABEL_STRUCT,
   LABEL_ENUM,
@@ -165,6 +170,20 @@ export const CHUNKING_RULES: Readonly<Partial<Record<ChunkableLabel, ChunkingRul
     groupFields: false,
     structuralTextMode: STRUCTURAL_TEXT_MODE_DECLARATION,
   },
+  [LABEL_PROTOCOL]: {
+    mode: CHUNK_MODE_AST_DECLARATION,
+    includePrefix: true,
+    includeSuffix: false,
+    groupFields: false,
+    structuralTextMode: STRUCTURAL_TEXT_MODE_NONE,
+  },
+  [LABEL_CATEGORY]: {
+    mode: CHUNK_MODE_AST_DECLARATION,
+    includePrefix: true,
+    includeSuffix: false,
+    groupFields: true,
+    structuralTextMode: STRUCTURAL_TEXT_MODE_NONE,
+  },
   [LABEL_STRUCT]: {
     mode: CHUNK_MODE_AST_DECLARATION,
     includePrefix: true,
@@ -188,7 +207,7 @@ export type EmbeddingPhase =
 /**
  * Progress information for the embedding pipeline
  */
-export interface EmbeddingProgress {
+export interface EmbeddingProgress extends AnalysisPhaseProgress {
   phase: EmbeddingPhase;
   percent: number;
   modelDownloadPercent?: number;
@@ -209,6 +228,8 @@ export interface EmbeddingConfig {
   batchSize: number;
   /** Number of chunks passed to one local/HTTP embedding call */
   subBatchSize: number;
+  /** Maximum UTF-16 characters in each fully generated embedding input. */
+  maxInputChars: number;
   /** Maximum ONNX Runtime CPU threads for local inference */
   threads: number;
   /** Embedding vector dimensions */
@@ -219,6 +240,8 @@ export interface EmbeddingConfig {
   maxSnippetLength: number;
   /** Maximum code chunk size in characters (for chunking long code) */
   chunkSize: number;
+  /** AST statement boundaries (default), or fixed character windows. */
+  chunkStrategy: 'ast' | 'fixed';
   /** Overlap between chunks in characters */
   overlap: number;
   /** Maximum description length in characters */
@@ -234,11 +257,13 @@ export const DEFAULT_EMBEDDING_CONFIG: EmbeddingConfig = {
   modelId: 'Snowflake/snowflake-arctic-embed-xs',
   batchSize: 16,
   subBatchSize: 8,
+  maxInputChars: 4096,
   threads: 2,
   dimensions: 384,
   device: 'auto',
   maxSnippetLength: 500,
   chunkSize: 1200,
+  chunkStrategy: 'ast',
   overlap: 120,
   maxDescriptionLength: 150,
 };
@@ -275,6 +300,8 @@ export interface EmbeddableNode {
   serverName?: string;
   methodNames?: string[];
   fieldNames?: string[];
+  /** Safe Class header, set only by structural projection; never raw source. */
+  classDeclaration?: string;
 }
 
 /**
@@ -290,14 +317,6 @@ export interface CachedEmbedding {
 }
 
 /**
- * Context info for embedding pipeline (repo/server metadata enrichment)
- */
-export interface EmbeddingContext {
-  repoName?: string;
-  serverName?: string;
-}
-
-/**
  * Model download progress from transformers.js
  */
 export interface ModelProgress {
@@ -307,6 +326,8 @@ export interface ModelProgress {
   loaded?: number;
   total?: number;
 }
+
+export type ModelProgressCallback = (progress: ModelProgress) => void;
 
 export interface ChunkSearchRow {
   nodeId: string;
