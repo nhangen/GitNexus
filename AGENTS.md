@@ -209,6 +209,7 @@ This repo is a fork of `abhigyanpatwari/GitNexus` (upstream). The global `gitnex
 2. **Check upstream before fixing.** Before implementing any ticket, verify the bug still exists upstream (or in the installed 1.6.12) and that no upstream PR already fixes it: `gh api repos/abhigyanpatwari/GitNexus/contents/<path>?ref=main` and `gh pr list -R abhigyanpatwari/GitNexus --search <keyword>`.
 3. **Merge, never reset.** Fork-only commits are fixes upstream lacks. Reconcile with `.github/scripts/check-fork-sync.sh --merge` (or `gh repo sync` only when `ahead=0`). Never `reset --hard` onto `upstream/main`.
 4. **Upstreamable fixes go upstream.** When a fix applies to code that exists upstream (not fork-local harness), prepare a draft PR against upstream and get the user's rendered-draft approval before posting.
+5. **Track the divergence.** Every intentional fork-vs-upstream difference gets a row in the README's "Fork vs upstream" table the moment it is created — with why and upstreamability — and stale rows are updated the same session either side changes.
 
 ### Gotchas
 
